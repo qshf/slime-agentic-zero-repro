@@ -23,7 +23,7 @@
 
 | 版本 | 标题 | 跑在哪 | 状态 |
 |------|------|--------|------|
-| V0 | 硬编码单样本 + fake trainer | 本地 | 计划中（下一步）|
+| V0 | 硬编码单样本 + fake trainer | 本地 | ✅ 完成（5/5 验证通过）|
 | V1 | 极简 calculator agent + Qwen3-0.6B | 服务器 | 计划中 |
 | V2 | custom generate/reward hook 化 | 服务器 | 计划中 |
 | V3 | mini_slime 最小闭环 | 服务器 | 计划中 |
@@ -68,9 +68,15 @@ ls /Users/qshf/my-project/slime-agentic/train.py /Users/qshf/my-project/slime-ag
 - **V1 起接 Qwen3-0.6B 真模型**：用户要求；因此 V1 起都需 GPU，都在服务器验证。
 - **砍 critic/PPO**：见 system-roadmap 重启条件。
 
+### V0（2026-07-20）详见 docs/decisions/v0.md
+- Sample 砍到 6 字段（不照搬源项目 30+）；用词级假 token 让 loss_mask 肉眼可读；fake_train_step 只统计不算 loss。
+- loss_mask 规则：agent=1 / prompt=0 / tool 返回=0。
+- 踩坑：直接跑脚本 ModuleNotFoundError → train_loop.py 顶部插 sys.path。
+
 ## 7. 待办 / 已知问题
 
-- [ ] 与用户对齐 system-roadmap 三主线结构（阶段一检查点）。
-- [ ] 对齐后写主线一 V0-V3 的 iteration-plan（数据契约+闭环可合并成一份）。
-- [ ] 确认 Qwen3-0.6B 在服务器 9934 的部署方式（SGLang 起服务？transformers 直接加载？）。
-- [ ] 确认本地→服务器的代码同步方式（git push/pull 还是 rsync）。
+- [x] 与用户对齐 system-roadmap 三主线结构。
+- [x] 写主线一 V0-V5 的 iteration-plan。
+- [ ] **V1 前置**：确认 Qwen3-0.6B 在服务器 9934 的部署方式（SGLang 起服务？transformers 直接加载？）。
+- [ ] **V1 前置**：确认本地→服务器的代码同步方式（git push/pull 还是 rsync）。
+- [ ] 远端仓库尚未配置（git remote）——需要时再加。
