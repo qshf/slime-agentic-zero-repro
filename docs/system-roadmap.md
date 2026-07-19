@@ -2,7 +2,7 @@
 
 > 受众：未来的自己 / 协作 LLM。每开新版本前 review；新增子系统插入对应位置。
 > 目的：从 0 复现一个最小 Agentic RL 训练系统，**在复现中学习** slime-agentic 的系统设计。
-> 本文件是项目级活文档（决定"做哪个子系统、什么顺序"）。单系统内部拆分见 `docs/<system>-system/iteration-plan.md`。
+> 本文件是项目级活文档（决定"做哪条主线、什么顺序"）。单主线内部拆分见 `docs/<line>/iteration-plan.md`。
 
 ## 核心原则（来自源项目 README，被反复验证）
 
@@ -10,13 +10,14 @@
 先复现数据如何流动，再学习系统如何加速。
 ```
 
-一切排序都服从这条：先把 `Sample → generate → reward → trainer → update_weights → rollout engine` 这条数据链跑通（纯 CPU / fake trainer 即可），再逐层换上真实的分布式部件（Ray → SGLang → FSDP → Megatron）。
+一切排序都服从这条：先把 `Sample → generate → reward → trainer → update_weights → rollout engine` 这条数据链跑通，再逐层换上真实的分布式部件（Ray → SGLang → FSDP → Megatron），再逐个复现越来越复杂的真实 agent。
 
-## 硬件与复现深度（已与用户对齐）
+## 硬件、模型与工作流（已与用户对齐 2026-07-20）
 
-- **硬件**：多卡服务器。工作流 = 本地开发 → 推 git → 服务器拉取运行/调试。
-- **深度**：全部尽量复现。因此没有"只能读源码"的死档 —— SGLang / FSDP / Megatron 都在服务器上真跑。
-- **推论**：每个版本本地能跑的部分（数据契约、Ray 单机、fake trainer）在本地验证；需要 GPU 的部分（真 SGLang engine、真 FSDP step、Megatron 并行）在服务器验证。CLAUDE.md 的验活 cheatsheet 分"本地档 / 服务器档"两栏。
+- **工作流**：本地只负责**开发**（写代码、推 git）；所有**跑通/验证/调试**在 **SSH 9934 多卡服务器**上进行。
+- **模型桩**：从 V1 起接 **Qwen3-0.6B** 真推理（不再用规则桩）。因此 V1 及以后都需要 GPU → 都在服务器验证。V0（纯 fake）可本地验证。
+- **深度**：主线一 V0-V5 + 主线二三个 agent **做扎实**；主线三 V6-V9（分布式后端）**先记录设计、后续复现**。
+- **推论**：CLAUDE.md 验活 cheatsheet 分"本地开发"和"服务器 9934 运行"两栏；每版验证脚本在服务器上跑。
 
 ---
 
@@ -24,129 +25,171 @@
 
 已核对，路径与行数均真实存在于 `/Users/qshf/my-project/slime-agentic`。
 
-| 候选子系统 | 源项目位置 | 规模 | 定位 | 教学价值 | 复现档位 |
-|-----------|-----------|------|------|---------|---------|
-| **RL 数据契约** | `slime/utils/types.py:8` (Sample) | 175 行 | tokens/loss_mask/reward 的载体，连接 agent 与 trainer | 最高（一切的地基）| 本地可跑 |
-| **Agent rollout** | `agentic/agentflow/rollout.py:104` (generate) | 22 文件 | 多轮 agent 交互 → 一条训练样本 | 最高 | 本地可跑 |
-| **custom hook 接口** | `slime/utils/arguments.py` (三个 `--custom-*-path`) | — | generate/reward/eval 的可插拔契约 | 高（对齐源项目的扩展方式）| 本地可跑 |
-| **最小训练闭环** | `train.py` (100 行主循环) | 100 行 | rollout→train→update_weights 编排 | 最高 | 本地可跑(fake trainer) |
-| **Ray 调度层** | `slime/ray/{rollout,actor_group,placement_group}.py` | rollout.py 1260 行 | 进程/GPU 资源分配，rollout 与 train 分进程 | 高 | 本地单机可跑 |
-| **同步 vs 异步循环** | `train.py` vs `train_async.py:31,39,62` | 100/77 行 | 提前发起下一轮 rollout，overlap train | 高（吞吐叙事的核心）| 本地可跑(fake) |
-| **SGLang rollout 引擎** | `slime/backends/sglang_utils/sglang_engine.py` | 21.9K | 独立推理服务 + update_weights 权重同步 | 高 | 服务器 GPU 真跑 |
-| **FSDP 训练后端** | `slime/backends/fsdp_utils/actor.py` | 42K | 包模型/offload/packing/一步真训练 | 中高 | 服务器 GPU 真跑 |
-| **Megatron 并行** | `slime/backends/megatron_utils/{actor,model}.py` | 26K+31K | TP/PP/CP/EP 多维并行 | 中（概念为主，配置成本大）| 服务器多卡真跑 |
-| **吞吐率实验** | `docs/zh/developer_guide/profiling.md` | — | 系统扫参数，定位瓶颈 | 高（飞轮：一次搭好后续实验免费）| 服务器真跑 |
+### 主线一：最小训练流水线（系统骨架）
 
-**已主动放弃的方向**（写清"在什么条件下值得做"，未来不重复评估）：
+| 子系统 | 源项目位置 | 规模 | 定位 |
+|--------|-----------|------|------|
+| RL 数据契约 | `slime/utils/types.py:8` (Sample) | 175 行 | tokens/loss_mask/reward 载体 |
+| custom hook 接口 | `slime/utils/arguments.py` (三个 `--custom-*-path`) | — | generate/reward/eval 可插拔契约 |
+| 最小训练闭环 | `train.py` (100 行主循环) | 100 行 | rollout→train→update_weights 编排 |
+| Ray 调度层 | `slime/ray/{rollout,actor_group,placement_group}.py` | rollout.py 1260 行 | rollout 与 train 分进程 |
+| 同步 vs 异步 | `train.py` vs `train_async.py:31,39,62` | 100/77 行 | 提前发起下一轮 rollout overlap train |
 
-- **Critic / PPO value model**（`train.py` 里 `use_critic` 分支）—— 值得做的条件：主线跑通后想对比 GRPO vs PPO 的算法差异时。当前用无 critic 的 GRPO 式流程即可，砍掉 critic 减少一半编排复杂度。
-- **MemAgent / ToolOrchestra 两个 agentic 实现**（`agentic/memagent`、`agentic/ToolOrchestra`）—— 值得做的条件：AgentFlow 那条 calculator 主线跑通后，想理解"长上下文压缩"或"多 agent 路由"这两种不同的 rollout 形态时，各自独立开档。当前只复现最容易讲清 loss_mask 的 calculator agent。
-- **on-policy distillation / PD 分离**（`docs/zh/advanced/pd-disaggregation.md`）—— 值得做的条件：SGLang 主线跑通、想优化多轮 agent 的推理吞吐时。当前只需理解"为什么 rollout 要独立推理服务"，不需要 prefill/decode 分离。
-- **多机训练脚本 / MoE 配置** —— 源项目 README 明确列为避坑项，永不作为起点。值得做的条件：单机 Megatron 概念完全吃透后，且有真实多机需求时。
+### 主线二：三个真实 Agent（rollout 方法，按难度递增）
+
+难度已实测（见 `docs/decisions/` 附的 explore 报告），排序 **MemAgent < AgentFlow < ToolOrchestra**：
+
+| Agent | 源项目位置 | 规模 | 引擎 | 工具 | reward | loss_mask 特点 |
+|-------|-----------|------|------|------|--------|---------------|
+| **MemAgent** | `agentic/memagent/rollout.py` | 2.0K LOC | 1 | 无 | 纯规则(math 归一化) | 全 1（无工具边界，最简）|
+| **AgentFlow** | `agentic/agentflow/{rollout.py,core/}` | 2.5K LOC | 3-5 | 2-N | LLM-as-judge | **executor token=0**（工具边界精华课）|
+| **ToolOrchestra** | `agentic/ToolOrchestra/{orchestra_solver.py,reward.py,tau2/}` | 31K LOC | 1+N专家 | 4 | 规则+LLM+成本+延迟 | orchestrator=1，专家/工具=0 |
+
+### 主线三：分布式后端（V6-V9，记录设计后续复现）
+
+| 子系统 | 源项目位置 | 规模 | 定位 |
+|--------|-----------|------|------|
+| SGLang rollout 引擎 | `slime/backends/sglang_utils/sglang_engine.py` | 21.9K | 独立推理服务 + update_weights 权重同步 |
+| FSDP 训练后端 | `slime/backends/fsdp_utils/actor.py` | 42K | 包模型/offload/packing/真训练一步 |
+| Megatron 并行 | `slime/backends/megatron_utils/{actor,model}.py` | 26K+31K | TP/PP/CP/EP 多维并行 |
+| 吞吐率实验 | `docs/zh/developer_guide/profiling.md` | — | 扫参数定位瓶颈（飞轮档）|
+
+**已主动放弃 / 降级的方向**（写清"在什么条件下值得做"）：
+
+- **Critic / PPO value model**（`train.py` `use_critic` 分支）—— 主线一跑通后想对比 GRPO vs PPO 时再加。当前用无 critic 的 GRPO 式流程，减一半编排复杂度。
+- **ToolOrchestra 的 `func_call` 路径 + tau2 环境模拟器**（`agentic/ToolOrchestra/tau2/`，含 10+ 领域仿真、子进程文件协议）—— 忠实复现基本不可能。**只复现 QA 路径**（多轮检索+推理），func_call 记录设计不实现。值得做的条件：真需要 tool-calling 环境仿真训练时，直接 import 原 tau2 包而非重写。
+- **AgentFlow / MemAgent 的 math 答案归一化细节**（`_strip_string` LaTeX/分数处理）—— 复现主流程即可，边界 case 用最简版，不追平。
 
 ---
 
-## 2. 决策：版本排序
+## 2. 决策：主线顺序与版本排序
 
-### 2.1 候选 & 痛点起源
+### 2.1 为什么拆成三条主线（而不是一条 V0-V9）
 
-源项目是**一条紧耦合的训练流水线**，不是像 hermes 那样几个独立子系统。所以不按"独立系统"并列，而是用**一条全局版本链 V0→V9** 讲一个故事：每版解决上一版暴露的具体痛点，逐层从"写死的单样本 + fake trainer"演进到"真 SGLang + 真 FSDP + Megatron 多并行"。
+上一版路线图把所有东西塞进一条线，是错的。实际有**两个正交的演进轴**：
+- **系统轴**：闭环怎么从串行 fake 长成真分布式（主线一 + 主线三）。
+- **方法轴**：rollout 里的 agent 从最简长到最复杂（主线二）。
 
-### 2.2 为什么 V0 = 硬编码单样本闭环（不是先搭 Ray、不是先读 Megatron）
+强行拧成一条线会让"这一版到底在教系统还是教 agent"变模糊。拆开后每条主线内部才是干净的痛点驱动链。
 
-- **数据契约是一切的地基**：不先把 `Sample{tokens, loss_mask, reward}` 这个结构和"哪些 token 被训练"想清楚，后面 Ray/SGLang/FSDP 都是在搬运一个你还没理解的数据。源项目 README 的第一原则就是这个。
-- **V0 必须"能跑但痛苦"**：一个写死的数学题，手工构造 tokens/loss_mask，跑一次 fake trainer step 打印统计。痛点立刻暴露——样本只有一条、reward 写死、loss_mask 靠手搓。这些痛点正好牵引出 V1/V2。
-- **反例**：如果先搭 Ray，你会在还不理解 rollout_data_ref 里装什么的情况下就去调度它，属于"搬运不理解的数据"。
+### 2.2 主线执行顺序：一 → 二 → 三
 
-### 2.3 为什么不先做 Ray / 不先读 Megatron（反向决策成本）
+- **先主线一**：没有能消费样本的闭环，agent 生成的样本无处验证（先造上游不接下游是反模式）。主线一 V1 用一个**自造的极简 calculator agent** 打通"Qwen3-0.6B 真推理 → 样本 → 闭环"，controllable、最快见效。
+- **再主线二**：闭环跑通后，把自造 toy agent 逐步换成三个真实 agent，按难度 MemAgent → AgentFlow → ToolOrchestra，一次做完一个再下一个（用户明确要求）。
+- **最后主线三**：把 fake trainer / 假引擎换成真 SGLang + FSDP + Megatron。这些解决的痛点（大模型放不下、吞吐低）只有在前两条主线跑通后才可感知。
 
-- **先做 Ray 的代价**：Ray 是"把已有的串行闭环拆进程"的手段，没有闭环就没有可拆的东西。先做 Ray = 为空管道搭脚手架，V3 之前它无事可调度。
-- **先读 Megatron 的代价**：Megatron 是最后一档不是偶然——它解决的是"大模型单卡放不下"的痛点，而这个痛点只有在你已经有一个能真训练的小模型闭环（V7 FSDP）之后才可感知。跳过前面直接啃 Megatron 源码 = README 明确列出的头号大坑。
+### 2.3 为什么主线二内部是 MemAgent → AgentFlow → ToolOrchestra
+
+- **MemAgent 最先**：单引擎、无工具、loss_mask 全 1，是"真实 agent"里最接近主线一 toy 的，平滑过渡。痛点：loss_mask 太简单，教不了工具边界。
+- **AgentFlow 居中**：Planner→Executor→Verifier，**executor 的 token 不参与训练**——这正是 README 问题 #2（loss_mask 如何区分模型输出 vs 工具返回）的精华课。痛点：需要协调 3-5 个引擎。
+- **ToolOrchestra 最后**：最复杂（31K LOC、多专家、tau2）。**只复现 QA 路径**，func_call/tau2 记录不实现。放最后因为它暴露"多 agent 路由 + 多组件 reward（正确性+成本+延迟）"，是集大成。
+
+**难度避连击**：AgentFlow（协调多引擎，烧脑）之后如果直接上 ToolOrchestra 全量会崩，所以 ToolOrchestra 砍到只做 QA 路径，密度可控。
 
 ### 2.4 路线图总览
 
 ```text
-V0 硬编码单样本闭环 ──暴露: 样本写死/loss_mask手搓/reward写死
-  → V1 Sample契约 + calculator agent rollout ──暴露: reward规则化/generate同步阻塞
-  → V2 custom generate/reward hook 化 ──暴露: 单进程串行/rollout挤占train
-  → V3 mini_slime 最小闭环(rollout_manager+fake trainer+weight_sync) ──暴露: 全串行/trainer空转
-  → V4 Ray 化(actor 拆进程 + ray.get 同步点) ──暴露: ray.get强制等待
-  → V5 同步 vs 异步(提前发起 rollout N+1 overlap train N) ──暴露: rollout用假引擎/无真吞吐
-  ────────── 以上纯 CPU/fake，本地可跑；以下上服务器真跑 ──────────
-  → V6 SGLang rollout 引擎(真推理服务 + update_weights 同步) ──暴露: 训练侧仍fake
-  → V7 FSDP 训练后端(小模型真训一步 + offload/packing) ──暴露: 单并行维度/大模型放不下
-  → V8 Megatron 并行概念(TP/PP/CP, slime 如何调 Megatron)
-  → V9 吞吐率实验(扫参数定位瓶颈)  ← 飞轮档
+【主线一 · 系统骨架】本地开发 + 服务器验证
+  V0 硬编码单样本+fake trainer(本地可跑) ──暴露: 样本写死/loss_mask手搓
+   → V1 极简 calculator agent + Qwen3-0.6B 真推理(服务器) ──暴露: generate/reward 写死没对齐 slime
+   → V2 custom generate/reward hook 化 ──暴露: 单进程串行, rollout 挤占 train
+   → V3 mini_slime 闭环(rollout_manager+fake trainer+weight_sync) ──暴露: 全串行 trainer 空转
+   → V4 Ray 化(actor 拆进程+ray.get 同步点) ──暴露: ray.get 强制等待
+   → V5 同步 vs 异步(提前发起 rollout N+1 overlap train N)   ★主线一承诺终点
+
+【主线二 · 三个真实 Agent】插进主线一闭环, 按难度各自做完整
+   A1 MemAgent(单引擎/无工具/loss_mask全1) ──暴露: 教不了工具边界
+   → A2 AgentFlow(Planner→Executor→Verifier, executor token 不训练) ──暴露: 多引擎协调
+   → A3 ToolOrchestra 仅 QA 路径(多专家路由+多组件reward)   ★主线二承诺终点
+
+【主线三 · 分布式后端】先记录设计, 后续复现
+   V6 SGLang 真引擎+update_weights → V7 FSDP 真训一步 → V8 Megatron 并行概念 → V9 吞吐实验
 ```
 
-**承诺范围**：确定承诺到 **V5**（本地纯 CPU 可完整跑通的最小 Agentic RL 闭环，这是 nano 项目的核心价值）。V6-V9 标"上服务器后按精力追加"，因为它们依赖 GPU 环境且投入产出比逐档递减。
+**承诺范围**：主线一 V0-V5 + 主线二 A1-A3 **做扎实**。主线三 V6-V9 先在文档里记录设计与源项目对照，具备服务器大模型环境后按精力复现。
 
 ### 2.5 排序依据原则
 
-- **痛点驱动**（主逻辑）：每版标题后面那句"暴露:"就是下一版的存在理由。写不出暴露的新痛点 = 该档该合并或是终点档。
-- **依赖优先**：数据契约(V0-V2) 是闭环(V3) 的前置；闭环是 Ray(V4) 的前置；Ray 是异步(V5) 的前置。后做就要给前面打补丁。
-- **飞轮**：V3 的 fake trainer + 验证脚本一旦建好，V4-V9 每版回归测试免费；V9 的实验脚手架建好后所有调参实验自动产出对比。
-- **难度避连击**：V5(异步逻辑，烧脑) 之后是 V6(接 SGLang，偏工程配置)，密度中等，缓冲一下再进 V7/V8 的分布式深水区。
+- **痛点驱动**：每版"暴露:"那句就是下一版的存在理由。
+- **依赖优先**：数据契约→闭环→Ray→异步；闭环是三个 agent 的前置。
+- **飞轮**：V3 的 fake trainer + 验证脚本一旦建好，后续每版回归免费；A1 的 agent-loop 骨架被 A2/A3 复用。
+- **难度避连击**：AgentFlow 之后 ToolOrchestra 砍到只 QA。
 
-### 2.6 如果改主意先做 calculator agent（V1 提前到 V0）会怎样
+### 2.6 反向决策成本：如果先做主线二（跳过主线一直接复现 agent）会怎样
 
-诱惑：agent 多轮交互最直观、最有成就感。代价：你会在还没有"fake trainer 消费样本"的出口时就造了一个复杂的 agent，无法验证生成的 loss_mask 到底喂给训练对不对——等于先造上游不接下游。所以 V0 坚持用**写死的单样本**把"样本如何被 trainer 消费"跑通，V1 再换上真 agent 产生样本。先通链路，再增真实度。
+诱惑：真实 agent 最有成就感。代价：agent 生成的 tokens/loss_mask 没有 trainer 消费它、没有闭环验证它对不对，等于造了上游不接下游。所以坚持先用自造 toy agent 把闭环通了，再上真 agent。
 
 ---
 
 ## 3. 各档最小切片
 
-> V0-V5 是本地承诺范围，写详细；V6-V9 上服务器后再各自开 iteration-plan，这里只列骨架。
+> 主线一 V0-V5、主线二 A1-A3 写详细；主线三 V6-V9 只列骨架，服务器环境就绪后各自开 iteration-plan。
 
-### V0: 硬编码单样本闭环
-- **核心问题**：trainer 到底消费一个什么样的数据结构？哪些 token 被训练？
-- **切片**：写死一道 `2+3=?`，手工填 `tokens/loss_mask/reward`，`fake_train_step` 只打印 batch 统计（reward_mean、trainable_token 数）。
-- **验证**：`scripts/test_v0_contract.py` 断言 loss_mask 长度 == tokens 长度、trainable 数 == 预期。
-- **简化掉的**：真 tokenizer（用 char/word 级假 token）、真 loss、多样本。
-- **对应源项目**：`slime/utils/types.py:8` (Sample)、`train.py:80` (async_train 消费 rollout_data_ref)。
+### 主线一
 
-### V1: Sample 契约 + calculator agent rollout
-- **上一版痛点**：样本写死、loss_mask 手搓，不知道真实多轮交互怎么生成它。
-- **切片**：`toy_rl/agent/calculator_agent.py` 跑一个真 agent loop（模型生成工具调用 → python calculator 执行 → 结果拼回 → 继续生成 → 最终答案），程序化构造 loss_mask（agent token=1，tool 返回=0，final answer 按目标设）。模型可先用规则/桩代替。
-- **验证**：`test_v1_rollout.py` 打印完整 trajectory + 断言 tool 返回段 loss_mask 全 0。
-- **对应源项目**：`agentic/agentflow/rollout.py:104` (generate)、其 loss_mask 构造。
+**V0 硬编码单样本闭环**（本地）
+- 核心问题：trainer 消费什么数据结构？哪些 token 被训练？
+- 切片：写死 `2+3=?`，手工填 tokens/loss_mask/reward，`fake_train_step` 打印 batch 统计。
+- 验证：`scripts/test_v0_contract.py` 断言 loss_mask 长度==tokens 长度、trainable 数==预期。
+- 对应源项目：`slime/utils/types.py:8`、`train.py:80`。
 
-### V2: custom generate / reward hook 化
-- **上一版痛点**：generate/reward 是写死的函数，没对齐 slime 的可插拔契约。
-- **切片**：定义 `async def generate(args, sample, ...) -> sample` 和 `async def reward_func(args, sample) -> dict`，通过配置路径加载（模拟 `--custom-generate-function-path` / `--custom-rm-path`）。
-- **验证**：`test_v2_hooks.py` 从路径动态加载并跑通。
-- **对应源项目**：`slime/utils/arguments.py` 三个 hook flag、`agentic/agentflow/rollout.py:209` (reward_func)。
+**V1 极简 calculator agent + Qwen3-0.6B 真推理**（服务器）
+- 上一版痛点：样本写死，不知道真实交互怎么生成。
+- 切片：Qwen3-0.6B 生成工具调用 → python calculator 执行 → 结果拼回 → 继续 → 最终答案；程序化构造 loss_mask（agent=1, tool 返回=0）。
+- 验证：`scripts/test_v1_rollout.py`（服务器）打印完整 trajectory + 断言 tool 段 loss_mask 全 0。
+- 对应源项目：`agentic/agentflow/rollout.py:104`（generate 形态参考）。
 
-### V3: mini_slime 最小训练闭环
-- **上一版痛点**：generate/reward 有了，但没有编排它们的循环，rollout 和 train 挤在一起。
-- **切片**：`mini_slime/{rollout_manager,trainer,weight_sync}.py`，跑多轮 `rollout→fake train→fake update_weights`，输出 rollout_time/train_time/update_weights_time/reward_mean/tokens_per_rollout。
-- **验证**：`test_v3_loop.py` 跑 2 轮，断言日志含全部指标。
-- **对应源项目**：`train.py:65-93` 主循环。
+**V2 custom generate/reward hook 化**
+- 上一版痛点：generate/reward 写死，没对齐 slime 可插拔契约。
+- 切片：`async def generate(args, sample)->sample` / `async def reward_func(args, sample)->dict`，配置路径动态加载。
+- 验证：`test_v2_hooks.py` 从路径加载并跑通。
+- 对应源项目：`slime/utils/arguments.py` 三 hook、`agentic/agentflow/rollout.py:209`。
 
-### V4: Ray 化
-- **上一版痛点**：全串行，rollout 时 trainer 空转。
-- **切片**：RolloutManager / Trainer 改 `@ray.remote` actor，`ray.get` 做同步点，单机多进程。
-- **验证**：`test_v4_ray.py` 确认两 actor 在不同进程 + 闭环仍通过。
-- **对应源项目**：`slime/ray/{rollout.py:441 (RolloutManager), placement_group.py:181}`。
+**V3 mini_slime 最小闭环**
+- 上一版痛点：有 generate/reward 但无编排循环。
+- 切片：`mini_slime/{rollout_manager,trainer,weight_sync}.py`，多轮 rollout→fake train→fake update_weights，输出各阶段耗时+reward_mean+tokens_per_rollout。
+- 验证：`test_v3_loop.py` 跑 2 轮断言指标齐全。
+- 对应源项目：`train.py:65-93`。
 
-### V5: 同步 vs 异步循环
-- **上一版痛点**：`ray.get` 强制等待，rollout 和 train 串行。
-- **切片**：`mini_slime/train_sync.py`（严格串行）vs `train_async.py`（提前 `generate.remote(N+1)` overlap train N，update_weights 按 interval）。日志对比总耗时、互相等待时间。
-- **验证**：`test_v5_async.py` 断言异步版总耗时 < 同步版。
-- **对应源项目**：`train.py` vs `train_async.py:31,39,62`（提前发起 + interval 更新权重）。
+**V4 Ray 化**
+- 上一版痛点：全串行，rollout 时 trainer 空转。
+- 切片：RolloutManager/Trainer 改 `@ray.remote`，`ray.get` 做同步点，单机多进程。
+- 验证：`test_v4_ray.py` 确认两 actor 不同进程 + 闭环通过。
+- 对应源项目：`slime/ray/rollout.py:441`、`placement_group.py:181`。
 
-### V6-V9（服务器档，骨架）
-- **V6 SGLang rollout 引擎**：接真 SGLang，理解独立推理服务 + `update_weights` 把训练权重同步到引擎。源：`slime/backends/sglang_utils/sglang_engine.py`。
-- **V7 FSDP**：小模型真训一步，offload/gradient checkpointing/sequence packing/dynamic batch。源：`slime/backends/fsdp_utils/actor.py`。
-- **V8 Megatron 并行**：TP/PP/CP/EP 概念 + slime 如何调 Megatron。源：`slime/backends/megatron_utils/{actor,model}.py`。
-- **V9 吞吐实验**：扫 rollout_batch_size / n_samples_per_prompt / max_tokens_per_gpu / colocate / sync-vs-async，定位瓶颈。源：`docs/zh/developer_guide/profiling.md`。
+**V5 同步 vs 异步**（主线一承诺终点）
+- 上一版痛点：ray.get 强制等待。
+- 切片：`train_sync.py`（串行）vs `train_async.py`（提前 `generate.remote(N+1)` overlap train N，update_weights 按 interval）。
+- 验证：`test_v5_async.py` 断言异步版总耗时 < 同步版。
+- 对应源项目：`train.py` vs `train_async.py:31,39,62`。
+
+### 主线二
+
+**A1 MemAgent**
+- 引入：真实 agent 的 chunk 记忆更新循环（单引擎，无工具）。
+- 简化：math 归一化只做主流程。
+- 对应源项目：`agentic/memagent/rollout.py`（298 行，reward 内嵌 272-297）。
+
+**A2 AgentFlow**（工具边界精华课）
+- 上一版痛点：MemAgent loss_mask 全 1，教不了工具边界。
+- 引入：Planner→Executor→Verifier，executor token loss_mask=0；LLM-as-judge reward。
+- 简化：引擎数可从 3-5 降到能说清概念的最小数。
+- 对应源项目：`agentic/agentflow/core/{solver,planner,executor,verifier,rewarder}.py`。
+
+**A3 ToolOrchestra（仅 QA 路径）**（主线二承诺终点）
+- 上一版痛点：AgentFlow 单任务；缺多 agent 路由和多组件 reward。
+- 引入：orchestrator 路由到多专家（QA 路径），reward = 正确性+成本+延迟。
+- 简化：**func_call 路径 + tau2 环境模拟器不实现**（记录设计）。
+- 对应源项目：`agentic/ToolOrchestra/{orchestra_solver.py,reward.py}`（QA 分支）。
+
+### 主线三（骨架，服务器就绪后展开）
+- V6 SGLang 真引擎 + update_weights 权重同步；V7 FSDP 真训一步(offload/packing)；V8 Megatron TP/PP/CP/EP 概念；V9 扫参数吞吐实验。
 
 ---
 
 ## 4. 维护规则
 
 - 顺序变更必须留档（标日期 + 理由），旧决策只增不删。
-- 新候选按 教学价值×自包含度 插入对应位置。
 - 状态字段三处同步：本文档、`CLAUDE.md` 进度表、`docs/decisions/` 索引。
 - 每完成一版，进度打 ✅ 并在 CLAUDE.md 决策日志写"选了 X 不选 Y 的 why + 真实踩坑"。
-- V5 收尾后回到本文件，按场景 B 重审 V6-V9（那时已知服务器环境实况，排序可能调整）。
+- 主线一 V5 收尾后回到本文件，按场景 B 重审主线二细节；主线二收尾后重审主线三是否具备服务器条件。
