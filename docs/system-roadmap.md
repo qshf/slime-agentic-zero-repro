@@ -57,7 +57,7 @@
 **已主动放弃 / 降级的方向**（写清"在什么条件下值得做"）：
 
 - **Critic / PPO value model**（`train.py` `use_critic` 分支）—— 主线一跑通后想对比 GRPO vs PPO 时再加。当前用无 critic 的 GRPO 式流程，减一半编排复杂度。
-- **ToolOrchestra 的 `func_call` 路径 + tau2 环境模拟器**（`agentic/ToolOrchestra/tau2/`，含 10+ 领域仿真、子进程文件协议）—— 忠实复现基本不可能。**只复现 QA 路径**（多轮检索+推理），func_call 记录设计不实现。值得做的条件：真需要 tool-calling 环境仿真训练时，直接 import 原 tau2 包而非重写。
+- **ToolOrchestra 的 `func_call` 路径 + tau2 环境模拟器**（`agentic/ToolOrchestra/tau2/`，含 10+ 领域仿真、子进程文件协议）—— **主线二先只复现 QA 路径**（多轮检索+推理）。tau2 环境模拟器**延后处理**（非永久放弃）：A3 收尾后单独评估如何复现或学习其细节（子进程文件协议、领域状态机、reward_info 解析），可能的路径是"精读 + 画图理解"或"直接 import 原 tau2 包驱动一个最小 func_call rollout"，届时在本文件新开一节记录。
 - **AgentFlow / MemAgent 的 math 答案归一化细节**（`_strip_string` LaTeX/分数处理）—— 复现主流程即可，边界 case 用最简版，不追平。
 
 ---
