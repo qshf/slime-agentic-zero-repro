@@ -60,6 +60,12 @@ async def test_real_rollout() -> None:
     assert all(m == 0 for m in sample.loss_mask[:prompt_len]), "prompt 段应全 0"
     # 至少有一些 agent token 被训练
     assert sample.trainable_token_count() > 0, "应有 agent token 参与训练"
+
+    # 端到端闭环: agent 在真实轨迹里答对 -> reward=1.0
+    # （0.6B 小模型格式不稳，脏尾如 <answer>5</</answer> 也应被鲁棒解析出 "5"）
+    r = reward_func(sample.response, sample.label)
+    print(f"  reward: {r}")
+    assert r == 1.0, f"真实轨迹应答对得 1.0，实际 {r}（final_answer={final_answer!r}）"
     print("  real_rollout OK")
 
 

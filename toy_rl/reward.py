@@ -14,7 +14,8 @@ def extract_answer(text: str) -> str | None:
     """从模型输出里提取 <answer>...</answer> 中的数字。"""
     m = re.search(r"<answer>\s*(.+?)\s*(?:</answer>|$)", text, re.DOTALL)
     if m:
-        return m.group(1).strip()
+        # 小模型常吐出 <answer>5</</answer> 这种脏尾巴，答案不含 '<'，取其前段最鲁棒
+        return m.group(1).split("<")[0].strip()
     # 兜底：试着找最后一个独立数字
     nums = re.findall(r"-?\d+(?:\.\d+)?", text)
     return nums[-1] if nums else None

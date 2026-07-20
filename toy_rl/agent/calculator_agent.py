@@ -128,7 +128,9 @@ async def generate(prompt: str, label: str, max_turns: int = 5) -> Sample:
             # --- 最终答案轮 ---
             final_text = agent_text + "</answer>"
             response_parts.append((final_text, MASK_AGENT))   # 最终答案 -> 训练
-            final_answer = answer_match.group(1).strip()
+            # 模型可能吐出 <answer>5</</answer> 这类脏尾（0.6B 小模型格式不稳），
+            # 答案本身不含 '<'，截到第一个 '<' 之前最鲁棒。
+            final_answer = answer_match.group(1).split("<", 1)[0].strip()
             break
 
         else:
