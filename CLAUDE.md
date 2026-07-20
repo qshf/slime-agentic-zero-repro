@@ -13,7 +13,7 @@
 - **源项目**：`/Users/qshf/my-project/slime-agentic`（github: LMIS-ORG/slime-agentic，分支 main。只读，用于对照）
 - **nano 项目**：`/Users/qshf/my-project/slime-agentic-zero-repro`（git 已 init，主分支 main）
 - **当前活跃分支**：`main`（V0 开始时切 `v0` 分支）
-- **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/zj/slime-agentic-zero-repro`）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
+- **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/zj`）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
 - **git 远端**：`git@github.com:qshf/-slime-agentic-zero-repro.git`
 
 ## 3. 进度状态
@@ -60,7 +60,7 @@ git -C /Users/qshf/my-project/slime-agentic-zero-repro branch --show-current
 # 本地→服务器同步代码（服务器连不上 github，用 rsync 不用 git pull）
 rsync -az --exclude '.venv' --exclude '.git' \
   /Users/qshf/my-project/slime-agentic-zero-repro/ \
-  5090:/home/ubuntu/zj/slime-agentic-zero-repro/
+  5090:/home/ubuntu/zj/
 
 # 服务器 5090：起 SGLang 容器（4 卡都被占，必须调 mem-fraction-static 避免 OOM）
 # docker run -d --name sglang-qwen3 --gpus device=0 --network host \
@@ -72,7 +72,7 @@ rsync -az --exclude '.venv' --exclude '.git' \
 # 就绪判断：/health 会持续 503（warmup），改用真实 chat completion 探活
 
 # 服务器 5090：跑版本验证（uv 建的 .venv）
-# ssh 5090 'cd /home/ubuntu/zj/slime-agentic-zero-repro && uv run python scripts/test_v1_rollout.py'
+# ssh 5090 'cd /home/ubuntu/zj && uv run python scripts/test_v1_rollout.py'
 ```
 
 ## 6. 决策日志（按版本累加）
