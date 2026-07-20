@@ -3,10 +3,12 @@ name = "slime-agentic-zero-repro"
 version = "0.1.0"
 description = "从 0 复现 slime-agentic 的最小 Agentic RL 训练系统（教学用）"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "openai>=1.0",   # V1: 调 SGLang 的 OpenAI 兼容接口
+]
 
 # 各版本按需追加依赖:
-#   V1 起: qwen3-0.6b 推理相关(transformers / sglang, 在服务器 9934)
+#   V1 起: openai(调 SGLang); SGLang 本身用 docker 部署在服务器 5090
 #   V4 起: ray
 
 [tool.uv]

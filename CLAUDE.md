@@ -13,7 +13,8 @@
 - **源项目**：`/Users/qshf/my-project/slime-agentic`（github: LMIS-ORG/slime-agentic，分支 main。只读，用于对照）
 - **nano 项目**：`/Users/qshf/my-project/slime-agentic-zero-repro`（git 已 init，主分支 main）
 - **当前活跃分支**：`main`（V0 开始时切 `v0` 分支）
-- **工作流**：**本地只开发**（写码+推 git）→ **SSH 9934 多卡服务器**跑通/验证/调试。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B，都在服务器验证。
+- **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/zj/slime-agentic-zero-repro`）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
+- **git 远端**：`git@github.com:qshf/-slime-agentic-zero-repro.git`
 
 ## 3. 进度状态
 
@@ -24,7 +25,7 @@
 | 版本 | 标题 | 跑在哪 | 状态 |
 |------|------|--------|------|
 | V0 | 硬编码单样本 + fake trainer | 本地 | ✅ 完成（5/5 验证通过）|
-| V1 | 极简 calculator agent + Qwen3-0.6B | 服务器 | 计划中 |
+| V1 | 极简 calculator agent + Qwen3-0.6B | 服务器 | 🔶 代码完成，待服务器验证 |
 | V2 | custom generate/reward hook 化 | 服务器 | 计划中 |
 | V3 | mini_slime 最小闭环 | 服务器 | 计划中 |
 | V4 | Ray 化 | 服务器 | 计划中 |
@@ -52,10 +53,15 @@
 ```bash
 # 本地：当前分支
 git -C /Users/qshf/my-project/slime-agentic-zero-repro branch --show-current
-# 本地：源项目对照(只读)
-ls /Users/qshf/my-project/slime-agentic/train.py /Users/qshf/my-project/slime-agentic/train_async.py
-# 服务器 9934：跑当前版本回归(V1 起每版一个)
-# ssh -p 9934 <server> 'cd <repo> && python scripts/test_v1_rollout.py'
+
+# 服务器 5090：拉最新代码
+# ssh 5090 'cd /home/ubuntu/zj/slime-agentic-zero-repro && git pull'
+
+# 服务器 5090：查 SGLang 容器状态（V1 起）
+# ssh 5090 'docker ps --filter name=sglang-qwen3'
+
+# 服务器 5090：跑当前版本验证
+# ssh 5090 'cd /home/ubuntu/zj/slime-agentic-zero-repro && python scripts/test_v0_contract.py'
 ```
 
 ## 6. 决策日志（按版本累加）
@@ -72,6 +78,11 @@ ls /Users/qshf/my-project/slime-agentic/train.py /Users/qshf/my-project/slime-ag
 - Sample 砍到 6 字段（不照搬源项目 30+）；用词级假 token 让 loss_mask 肉眼可读；fake_train_step 只统计不算 loss。
 - loss_mask 规则：agent=1 / prompt=0 / tool 返回=0。
 - 踩坑：直接跑脚本 ModuleNotFoundError → train_loop.py 顶部插 sys.path。
+
+### V1（2026-07-20）详见 docs/decisions/v1.md
+- 推理引擎 SGLang（核对源项目 requirements 无 vllm）；Docker 部署走 OpenAI 接口端口 30000。
+- loss_mask 仍程序化按段打；reward 先规则匹配（LLM-judge 留 A2）。
+- 本地只过离线测；真实 rollout 待 5090：server_setup.sh → start_sglang.sh → test_v1_rollout.py。
 
 ## 7. 待办 / 已知问题
 
