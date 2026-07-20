@@ -26,7 +26,7 @@
 |------|------|--------|------|
 | V0 | 硬编码单样本 + fake trainer | 本地 | ✅ 完成（5/5 验证通过）|
 | V1 | 极简 calculator agent + Qwen3-0.6B | 服务器 | 🔶 代码完成，待服务器验证 |
-| V2 | custom generate/reward hook 化 | 服务器 | 计划中 |
+| V2 | custom generate/reward hook 化 | 服务器 | 🔶 代码完成+离线测过，待服务器端到端 |
 | V3 | mini_slime 最小闭环 | 服务器 | 计划中 |
 | V4 | Ray 化 | 服务器 | 计划中 |
 | V5 | 同步 vs 异步 | 服务器 | 计划中（**主线一终点**）|
