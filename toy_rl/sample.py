@@ -38,6 +38,12 @@ class Sample:
     # --- reward_func 产生的打分 ---
     reward: float | None = None   # 标量奖励; 源项目也支持 dict(多组件 reward), 主线二 A3 再引入
 
+    # --- 附带元信息 ---
+    metadata: dict = field(default_factory=dict)
+    #   对齐源项目 Sample.metadata: 放不进训练序列、但 reward/eval/日志需要的东西。
+    #   V1 用它承载 {"final_output": 最终答案, "turns": 每轮结构}，
+    #   对齐源项目 rollout.py 里 sample.metadata["final_output"] / train_metadata["turns"]。
+
     def trainable_token_count(self) -> int:
         """有多少 token 真正参与训练(loss_mask==1)。"""
         return sum(self.loss_mask)

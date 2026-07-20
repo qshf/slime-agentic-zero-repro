@@ -2,15 +2,23 @@
 
 从 V0 的"写死单样本"升级到"真实多轮交互生成样本"。
 Qwen3-0.6B 通过 SGLang 的 OpenAI 兼容接口运行，这和源项目的架构形态一致:
-  源项目: agentic/agentflow/rollout.py:104 generate() 调 SGLangEngine 生成 agent 轨迹
-  V1:    calculator_agent.py         调 http://localhost:30000/v1 生成 agent 轨迹
+  源项目: agentic/agentflow/rollout.py:104 generate() → core/solver.py:65 Solver.solve()
+  V1:    calculator_agent.py: generate() → run_agent_loop()
 
 V1 的核心教学点: 看清 tokens/loss_mask 如何从真实多轮对话里程序化生成——
   不再是手工填写，而是每轮交互结束后，按"谁生成的这段文字"来打 loss_mask。
+
+范式对齐（铁律）:
+  源项目把 agent loop 放在 Solver（一处），rollout.py 只是薄适配器调 solver.solve()。
+  这里同样把 loop 收在 run_agent_loop（一处）:
+    - V1 入口 generate(prompt, label)     —— 本文件下方，测试用
+    - V2 hook generate(args, sample)      —— calculator_hooks.py，薄适配器
+  两个入口都复用同一个 run_agent_loop，绝不各抄一份。
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 from pathlib import Path
@@ -31,11 +39,13 @@ MASK_AGENT  = 1   # 模型生成，训练
 MASK_TOOL   = 0   # 工具返回，不训练
 
 
-def calculator(expr: str) -> str:
-    """安全计算数学表达式，返回结果字符串。
+# ── 工具层 ──────────────────────────────────────────────────────────────────
+# 源项目每个工具是 tools/ 目录下的独立类，Solver 经 Executor.execute_command 动态分发。
+# V1 只有一个工具，但仍把"分发"这个接缝留出来（TOOLS 注册表 + _dispatch_tool）——
+# 加工具只需往 TOOLS 里加一项，loop 一行不改。这是对齐源项目的可扩展分发范式。
 
-    只允许数字和基本运算符，不 eval 任意代码。
-    """
+def calculator(expr: str) -> str:
+    """安全计算数学表达式，返回结果字符串。只允许数字和基本运算符，不 eval 任意代码。"""
     expr = expr.strip()
     if not re.fullmatch(r"[\d\s\+\-\*\/\(\)\.]+", expr):
         return "Error: 不支持的表达式"
@@ -46,119 +56,162 @@ def calculator(expr: str) -> str:
         return f"Error: {e}"
 
 
-def _tokenize(text: str, existing_vocab: dict[str, int]) -> list[int]:
+TOOLS = {"calculator": calculator}
+
+
+def _dispatch_tool(name: str, arg: str) -> str:
+    """按工具名分发执行，返回结果字符串。对齐源项目 Executor.execute_command 的角色。"""
+    fn = TOOLS.get(name)
+    if fn is None:
+        return f"Error: 未知工具 {name}"
+    return fn(arg)
+
+
+def _tokenize(text: str, vocab: dict[str, int]) -> list[int]:
     """简单的字符级 tokenizer（V1 教学用）。
 
     源项目用 SGLang 的真 tokenizer；V1 用字符级假 tokenizer，
     目的是让 tokens/loss_mask 的对应关系在 print 里肉眼可读。
     真 tokenizer 在 V6 接 SGLang RolloutManager 时自然引入。
     """
-    tokens = []
-    for ch in text:
-        tokens.append(existing_vocab.setdefault(ch, len(existing_vocab)))
-    return tokens
+    return [vocab.setdefault(ch, len(vocab)) for ch in text]
 
 
-async def generate(prompt: str, label: str, max_turns: int = 5) -> Sample:
-    """多轮 calculator agent rollout，返回完整 Sample。
+# ── 轨迹累加器 ─────────────────────────────────────────────────────────────
+# 把"追加一段文字 → 按 mask 类型打标 → 记进 turns"这三件事收进一个小对象，
+# 免得 loop 里反复对 tokens / loss_mask / response 三个 list 手工 append（V1 旧代码的糙点）。
 
-    对齐源项目签名: agentic/agentflow/rollout.py:104
-      async def generate(args, sample, sampling_params, evaluation=False) -> Sample
+class _Trajectory:
+    def __init__(self, prompt: str) -> None:
+        self.vocab: dict[str, int] = {}
+        self.tokens: list[int] = _tokenize(prompt, self.vocab)
+        self.loss_mask: list[int] = [MASK_PROMPT] * len(self.tokens)
+        self.response_chunks: list[str] = []
+        # turns: 每轮一条结构化记录，对齐源项目 solver.py 的 turns[]（放进 metadata 供教学/调试）
+        self.turns: list[dict] = []
 
-    这里简化了 args/sampling_params，把核心流程讲清楚就够了。
+    def emit(self, text: str, mask: int, *, kind: str, tool_result: str | None = None) -> None:
+        toks = _tokenize(text, self.vocab)
+        self.tokens.extend(toks)
+        self.loss_mask.extend([mask] * len(toks))
+        # 工具返回段不算模型生成的一"轮"，只作为上下文；只有 agent 段才记进 turns
+        if mask == MASK_AGENT:
+            self.response_chunks.append(text)
+            turn = {"kind": kind, "text": text, "token_count": len(toks)}
+            if tool_result is not None:
+                turn["tool_result"] = tool_result
+            self.turns.append(turn)
+        else:
+            self.response_chunks.append(text)
 
-    agent 流程:
-      模型判断是否需要调用 calculator
-        -> 是: 生成 <tool>calculator: <expr></tool>，执行，把结果拼回上下文
-        -> 否: 生成最终答案 <answer>...</answer>
+    @property
+    def response(self) -> str:
+        return "".join(self.response_chunks)
+
+
+def _chat(client: OpenAI, model_name: str, messages: list[dict],
+          max_tokens: int, temperature: float) -> str:
+    """一次 SGLang chat completion，返回文本。stop 在工具/答案闭合标签处截断。"""
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        stop=["</tool>", "</answer>"],
+    )
+    return resp.choices[0].message.content or ""
+
+
+_SYSTEM_PROMPT = (
+    "你是一个数学助手。如果需要计算，用 <tool>calculator: <表达式></tool> 调用工具。"
+    "得到工具结果后，给出最终答案: <answer>数字</answer>。"
+    "注意: 只输出工具调用或最终答案，不要多余解释。"
+)
+
+
+async def run_agent_loop(
+    client: OpenAI,
+    model_name: str,
+    prompt: str,
+    *,
+    max_turns: int = 5,
+    max_tokens: int = 128,
+    temperature: float = 0.0,
+) -> tuple[_Trajectory, str | None]:
+    """多轮 calculator agent loop——本项目里 agent 交互的唯一实现处。
+
+    对齐源项目 core/solver.py:65 Solver.solve()：持有循环本身。
+    V1 入口 generate() 与 V2 hook 都调它，绝不各写一份。
+
+    每轮：
+      模型判断要不要调工具
+        -> 调工具: 生成 <tool>calculator: <expr></tool>，_dispatch_tool 执行，结果拼回上下文
+        -> 出答案: 生成 <answer>...</answer>，结束
+
+    返回 (trajectory, final_answer)。trajectory 里已备好 tokens/loss_mask/response/turns。
     """
-    import asyncio
-
-    client = OpenAI(base_url=SGLANG_BASE_URL, api_key="EMPTY")
-
-    # ---------- 累积轨迹 ----------
-    # response_parts: 每段 (text, mask_type)
-    response_parts: list[tuple[str, int]] = []
     messages: list[dict] = [
-        {
-            "role": "system",
-            "content": (
-                "你是一个数学助手。如果需要计算，用 <tool>calculator: <表达式></tool> 调用工具。"
-                "得到工具结果后，给出最终答案: <answer>数字</answer>。"
-                "注意: 只输出工具调用或最终答案，不要多余解释。"
-            ),
-        },
+        {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
-
+    traj = _Trajectory(prompt)
     final_answer: str | None = None
+    loop = asyncio.get_event_loop()
 
     for turn in range(max_turns):
-        # 调 SGLang 生成下一段
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                max_tokens=128,
-                temperature=0.0,
-                stop=["</tool>", "</answer>"],
-            ),
+        # 同步 OpenAI 客户端丢到线程池，别阻塞事件循环
+        agent_text = await loop.run_in_executor(
+            None, _chat, client, model_name, messages, max_tokens, temperature
         )
-        agent_text = response.choices[0].message.content or ""
 
-        # 检查是否含工具调用
         tool_match = re.search(r"<tool>calculator:\s*(.+?)(?:</tool>|$)", agent_text, re.DOTALL)
         answer_match = re.search(r"<answer>\s*(.+?)(?:</answer>|$)", agent_text, re.DOTALL)
 
         if tool_match:
             # --- 工具调用轮 ---
-            agent_call_text = agent_text + "</tool>"  # 补完闭合 tag
-            tool_result = calculator(tool_match.group(1).strip())
+            agent_call = agent_text + "</tool>"          # 补回被 stop 截掉的闭合标签
+            expr = tool_match.group(1).strip()
+            tool_result = _dispatch_tool("calculator", expr)
             tool_text = f"\n[calculator结果: {tool_result}]\n"
 
-            response_parts.append((agent_call_text, MASK_AGENT))   # 模型生成 -> 训练
-            response_parts.append((tool_text,        MASK_TOOL))    # 工具返回 -> 不训练
+            traj.emit(agent_call, MASK_AGENT, kind="tool_call", tool_result=tool_result)
+            traj.emit(tool_text, MASK_TOOL, kind="tool_return")
 
-            # 把工具结果拼回对话，模型继续看
-            messages.append({"role": "assistant", "content": agent_call_text})
-            messages.append({"role": "tool",      "content": tool_text, "tool_call_id": f"t{turn}"})
+            messages.append({"role": "assistant", "content": agent_call})
+            messages.append({"role": "tool", "content": tool_text, "tool_call_id": f"t{turn}"})
 
         elif answer_match:
             # --- 最终答案轮 ---
-            final_text = agent_text + "</answer>"
-            response_parts.append((final_text, MASK_AGENT))   # 最终答案 -> 训练
-            # 模型可能吐出 <answer>5</</answer> 这类脏尾（0.6B 小模型格式不稳），
-            # 答案本身不含 '<'，截到第一个 '<' 之前最鲁棒。
+            traj.emit(agent_text + "</answer>", MASK_AGENT, kind="answer")
+            # 0.6B 小模型格式不稳，可能吐 <answer>5</</answer>；答案不含 '<'，截到第一个 '<' 前最鲁棒
             final_answer = answer_match.group(1).split("<", 1)[0].strip()
             break
 
         else:
-            # 模型输出了别的，当作普通 agent 文本继续
-            response_parts.append((agent_text, MASK_AGENT))
+            # 模型输出了别的，当普通 agent 文本继续
+            traj.emit(agent_text, MASK_AGENT, kind="agent")
             messages.append({"role": "assistant", "content": agent_text})
 
-    # ---------- 拼 response / tokens / loss_mask ----------
-    full_response = "".join(text for text, _ in response_parts)
-    vocab: dict[str, int] = {}
+    return traj, final_answer
 
-    # prompt 段 token（loss_mask 全 0）
-    prompt_tokens = _tokenize(prompt, vocab)
-    prompt_mask   = [MASK_PROMPT] * len(prompt_tokens)
 
-    # response 段 token（按段类型打 mask）
-    resp_tokens: list[int] = []
-    resp_mask:   list[int] = []
-    for text, mask_type in response_parts:
-        toks = _tokenize(text, vocab)
-        resp_tokens.extend(toks)
-        resp_mask.extend([mask_type] * len(toks))
+async def generate(prompt: str, label: str, max_turns: int = 5) -> Sample:
+    """V1 便捷入口（测试用）：跑一遍 loop，组装成 Sample。
 
+    对齐源项目 rollout.py:104 generate() 的"薄"定位：不含 loop 逻辑，只调 run_agent_loop
+    再填 Sample。final_answer 放进 metadata["final_output"]，对齐源项目
+    sample.metadata["final_output"]（不再像旧代码返回 (Sample, final_answer) 元组）。
+    """
+    client = OpenAI(base_url=SGLANG_BASE_URL, api_key="EMPTY")
+    traj, final_answer = await run_agent_loop(
+        client, MODEL_NAME, prompt, max_turns=max_turns
+    )
     return Sample(
         prompt=prompt,
         label=label,
-        response=full_response,
-        tokens=prompt_tokens + resp_tokens,
-        loss_mask=prompt_mask + resp_mask,
+        response=traj.response,
+        tokens=traj.tokens,
+        loss_mask=traj.loss_mask,
         reward=None,  # reward 由 reward_func 单独计算，V1 先留 None
-    ), final_answer
+        metadata={"final_output": final_answer, "turns": traj.turns},
+    )

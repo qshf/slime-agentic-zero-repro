@@ -44,12 +44,14 @@ def test_reward_func() -> None:
 
 async def test_real_rollout() -> None:
     """不变量3+4: 真实 rollout 的 loss_mask 段规则 + 契约长度（需 SGLang）。"""
-    sample, final_answer = await generate("2 + 3 = ?", label="5")
+    sample = await generate("2 + 3 = ?", label="5")
+    final_answer = sample.metadata.get("final_output")
 
     print("\n  --- 完整 trajectory ---")
     print(f"  prompt: {sample.prompt}")
     print(f"  response: {sample.response!r}")
     print(f"  final_answer: {final_answer}")
+    print(f"  turns: {len(sample.metadata.get('turns', []))} 轮")
     print(f"  tokens: {len(sample.tokens)}, loss_mask: {len(sample.loss_mask)}")
     print(f"  trainable: {sample.trainable_token_count()}/{len(sample.tokens)}")
 
