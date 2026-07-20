@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openai import OpenAI
 
+from toy_rl.agent.tools import CalculatorTool, ToolRegistry
 from toy_rl.sample import Sample
 
 # SGLang 的 OpenAI 兼容接口，对齐源项目 agentic/agentflow/rollout.py 里的默认端口
@@ -40,31 +41,15 @@ MASK_TOOL   = 0   # 工具返回，不训练
 
 
 # ── 工具层 ──────────────────────────────────────────────────────────────────
-# 源项目每个工具是 tools/ 目录下的独立类，Solver 经 Executor.execute_command 动态分发。
-# V1 只有一个工具，但仍把"分发"这个接缝留出来（TOOLS 注册表 + _dispatch_tool）——
-# 加工具只需往 TOOLS 里加一项，loop 一行不改。这是对齐源项目的可扩展分发范式。
+# 工具定义/注册/分发已抽到 toy_rl/agent/tools.py（对齐源项目 tools/ 与 core/executor 的分离）。
+# 这里只建一个 registry 单例；加工具 = 往列表里加一个 BaseTool 子类，loop 一行不改。
+# 源项目 Solver 经 Executor.execute_command 动态分发；nano 用 _REGISTRY.execute_command 对齐这个角色。
 
-def calculator(expr: str) -> str:
-    """安全计算数学表达式，返回结果字符串。只允许数字和基本运算符，不 eval 任意代码。"""
-    expr = expr.strip()
-    if not re.fullmatch(r"[\d\s\+\-\*\/\(\)\.]+", expr):
-        return "Error: 不支持的表达式"
-    try:
-        result = eval(expr, {"__builtins__": {}}, {})  # noqa: S307 — 已通过正则限制
-        return str(result)
-    except Exception as e:
-        return f"Error: {e}"
+_REGISTRY = ToolRegistry([CalculatorTool()])
 
-
-TOOLS = {"calculator": calculator}
-
-
-def _dispatch_tool(name: str, arg: str) -> str:
-    """按工具名分发执行，返回结果字符串。对齐源项目 Executor.execute_command 的角色。"""
-    fn = TOOLS.get(name)
-    if fn is None:
-        return f"Error: 未知工具 {name}"
-    return fn(arg)
+# 兼容旧测试：test_v1_rollout.py 直接断言 calculator("2 + 3") == "5"。
+# 保留模块级 calculator 名，指向工具的 execute（纯内部重构，不改测试）。
+calculator = CalculatorTool().execute
 
 
 def _tokenize(text: str, vocab: dict[str, int]) -> list[int]:
@@ -123,9 +108,12 @@ def _chat(client: OpenAI, model_name: str, messages: list[dict],
 
 
 _SYSTEM_PROMPT = (
-    "你是一个数学助手。如果需要计算，用 <tool>calculator: <表达式></tool> 调用工具。"
+    "你是一个数学助手。如果需要计算，用 <tool>工具名: <参数></tool> 调用工具。"
     "得到工具结果后，给出最终答案: <answer>数字</answer>。"
-    "注意: 只输出工具调用或最终答案，不要多余解释。"
+    "注意: 只输出工具调用或最终答案，不要多余解释。\n"
+    "可用工具:\n"
+    # 工具清单/示例由 registry 从工具元数据动态渲染，对齐源项目"元数据注入 planner prompt"。
+    + _REGISTRY.render_for_prompt()
 )
 
 
@@ -145,7 +133,7 @@ async def run_agent_loop(
 
     每轮：
       模型判断要不要调工具
-        -> 调工具: 生成 <tool>calculator: <expr></tool>，_dispatch_tool 执行，结果拼回上下文
+        -> 调工具: 生成 <tool>calculator: <expr></tool>，_REGISTRY.execute_command 执行，结果拼回上下文
         -> 出答案: 生成 <answer>...</answer>，结束
 
     返回 (trajectory, final_answer)。trajectory 里已备好 tokens/loss_mask/response/turns。
@@ -171,7 +159,7 @@ async def run_agent_loop(
             # --- 工具调用轮 ---
             agent_call = agent_text + "</tool>"          # 补回被 stop 截掉的闭合标签
             expr = tool_match.group(1).strip()
-            tool_result = _dispatch_tool("calculator", expr)
+            tool_result = _REGISTRY.execute_command("calculator", expr)
             tool_text = f"\n[calculator结果: {tool_result}]\n"
 
             traj.emit(agent_call, MASK_AGENT, kind="tool_call", tool_result=tool_result)
