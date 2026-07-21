@@ -5,6 +5,7 @@ description = "从 0 复现 slime-agentic 的最小 Agentic RL 训练系统（�
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.0",   # V1: 调 SGLang 的 OpenAI 兼容接口
+    "ray>=2.5",      # V4: actor 拆进程 + ray.get 同步点
 ]
 
 # 各版本按需追加依赖:
