@@ -12,13 +12,13 @@
 本文件的 generate 只做"框架契约 → loop → 回填 sample"的薄适配，
 正如源项目 rollout.py:104 只是 solver.solve() 的薄适配器，绝不重抄一遍 loop。
 
-args 用一个极简 dataclass 承载配置(源项目是庞大的 argparse Namespace，这里只取需要的)。
+args 是框架层配置对象（V3 起收归 mini_slime/args.py，本文件 re-export；源项目是庞大的
+argparse Namespace，nano 只取需要的字段）。
 """
 
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -29,18 +29,10 @@ from toy_rl.agent.calculator_agent import run_agent_loop
 from toy_rl.reward import extract_answer
 from toy_rl.sample import Sample
 
-
-@dataclass
-class Args:
-    """极简配置对象，对齐源项目 args 的角色(但只保留必要字段)。"""
-    sglang_base_url: str = "http://localhost:30000/v1"
-    model_name: str = "Qwen/Qwen3-0.6B"
-    max_turns: int = 5
-    max_tokens: int = 128
-    temperature: float = 0.0
-    # hook 路径(对齐 --custom-generate-function-path / --custom-rm-path)
-    custom_generate_function_path: str = "toy_rl.agent.calculator_hooks.generate"
-    custom_rm_path: str = "toy_rl.agent.calculator_hooks.reward_func"
+# V3 起 Args 收归框架层 mini_slime/args.py（single source of truth）。
+# 这里 re-export，保持 `from toy_rl.agent.calculator_hooks import Args`（V2 测试）零改。
+# 见 docs/decisions/v3.md：配置的归属是框架，agent 只被透传进来读它。
+from mini_slime.args import Args  # noqa: F401  (re-export)
 
 
 async def generate(args: Args, sample: Sample) -> Sample:

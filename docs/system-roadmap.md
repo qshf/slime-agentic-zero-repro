@@ -145,9 +145,9 @@
 - 验证：`test_v2_hooks.py` 从路径加载并跑通。
 - 对应源项目：`slime/utils/arguments.py` 三 hook、`agentic/agentflow/rollout.py:209`。
 
-**V3 mini_slime 最小闭环**
+**V3 mini_slime 最小闭环** ✅ 代码完成+本地离线测过（3/3），待服务器端到端
 - 上一版痛点：有 generate/reward 但无编排循环。
-- 切片：`mini_slime/{rollout_manager,trainer,weight_sync}.py`，多轮 rollout→fake train→fake update_weights，输出各阶段耗时+reward_mean+tokens_per_rollout。
+- 切片：`mini_slime/{args,rollout_manager,trainer,weight_sync,train}.py`，多轮 rollout→fake train→fake update_weights，输出各阶段耗时+reward_mean+tokens_per_rollout。
 - 验证：`test_v3_loop.py` 跑 2 轮断言指标齐全。
 - 对应源项目：`train.py:65-93`。
 
