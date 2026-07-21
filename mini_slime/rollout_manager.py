@@ -98,3 +98,10 @@ class RolloutManager:
             "rewards": [s.reward for s in samples],
             "response_lengths": [len(s.tokens) for s in samples],
         }
+
+    def pid(self) -> int:
+        """当前进程 PID。V4 起把本类包成 @ray.remote actor（见 mini_slime/ray/placement_group.py），
+        测试用它确认 RolloutManager 与 Trainer/主进程在**不同进程**。V3 单进程用不到。"""
+        import os
+
+        return os.getpid()

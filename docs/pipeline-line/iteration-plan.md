@@ -42,14 +42,14 @@ slime-agentic 的训练是一条流水线：`train.py` 主循环调 `RolloutMana
 - **对应源项目：** `slime/utils/arguments.py`（三 hook flag）、`agentic/agentflow/rollout.py:209`（reward_func 签名）。
 - **暴露的新问题：** 有了 generate/reward，但还是单进程串行手动调用，没有编排循环，rollout 和 train 挤在一个函数里。→ 引出 V3。
 
-### V3: mini_slime 最小闭环
+### V3: mini_slime 最小闭环  ✅ 完成（5090 端到端 4/4）
 - **上一版痛点：** 缺一个编排层把 rollout→train→update_weights 串成多轮循环。
 - **解决方法：** `mini_slime/{rollout_manager,trainer,weight_sync}.py`，跑多轮 `rollout → fake train → fake update_weights`，输出 rollout_time / train_time / update_weights_time / reward_mean / tokens_per_rollout。
 - **新引入的概念：** RolloutManager 编排职责、weight_sync 抽象（fake）、每轮指标采集（V9 吞吐实验的雏形）。
 - **对应源项目：** `train.py:65-93`（主循环编排）。
 - **暴露的新问题：** 全串行 —— rollout 时 trainer 空转，train 时 rollout 空转，单进程无法并行。→ 引出 V4。
 
-### V4: Ray 化
+### V4: Ray 化  ✅ 完成（5090 端到端 3/3，actor 分进程）
 - **上一版痛点：** 单进程串行，rollout 和 train 无法并行，资源利用率低。
 - **解决方法：** RolloutManager / Trainer 改 `@ray.remote` actor，用 `ray.get` 显式标注同步点，单机多进程运行。
 - **新引入的概念：** Ray actor、ObjectRef、`.remote()` / `ray.get()`、rollout 与 train 分进程。
