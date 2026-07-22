@@ -18,34 +18,18 @@
     是 **batch 级**（一次跑完整个 dataset）。nano 把"遍历 batch"这层放在 RolloutManager 里，
     源放在 custom rollout function 里。语义等价（都产出一批 Sample），只是分层位置不同——nano
     这样分层能让 per-sample 的 agent loop 更聚焦（V1/V2 已定的 per-sample 契约）。
-  - 硬编码小题库 data_source：源 data_source_cls(args) 从数据集加载，nano 用几条 calculator 题。
+  - 硬编码小题库 data_source：源 data_source_cls(args) 从数据集加载。A1 起 nano 也把它做成
+    `data_source_path` hook（可切换 calculator / MemAgent 数据源）；各 loader 内仍是硬编码小集
+    （见 toy_rl/agent/calculator_data.py、toy_rl/agent/memagent/data.py）。详见 docs/decisions/a1.md。
 """
 
 from __future__ import annotations
 
+import copy
+
 from mini_slime.args import Args
 from mini_slime.hooks import load_function
 from toy_rl.sample import Sample
-
-
-# --- data_source（对齐源 self.data_source，V3 用硬编码小题库）------------------------
-# 源: data_source_cls = load_function(args.data_source_path); self.data_source = data_source_cls(args)
-# V3: 只需几条能跑通闭环的 calculator 题；(prompt, label) 元组列表即可。
-# 题目难度：4B 心算就能答对小算术（会绕过工具、tool 路径练不到），故换成大数乘除/多步
-# 表达式——超出可靠心算范围，逼模型真去调 calculator。label 均由 eval 校验过。
-_PROMPTS: list[tuple[str, str]] = [
-    ("347 * 89 = ?", "30883"),
-    ("638 * 47 = ?", "29986"),
-    ("72 * 84 = ?", "6048"),
-    ("(123 + 456) * 7 = ?", "4053"),
-    ("1024 / 16 = ?", "64"),
-    ("9876 - 5432 = ?", "4444"),
-]
-
-
-def _load_prompts() -> list[tuple[str, str]]:
-    """对齐源 data_source 加载（V3 返回硬编码题库）。"""
-    return list(_PROMPTS)
 
 
 class RolloutManager:
@@ -53,30 +37,32 @@ class RolloutManager:
 
     def __init__(self, args: Args) -> None:
         self.args = args
-        self.data_source = _load_prompts()
-        # 对齐源 rollout.py:455-457：generate / reward 都由 load_function 按路径动态加载。
+        # 对齐源 rollout.py:455-457：data_source / generate / reward 都由 load_function 按路径动态加载。
+        # A1 起数据源可切换（对齐源 data_source_cls）：calculator 走 calculator_data，MemAgent 走 memagent/data。
+        self.data_source = load_function(args.data_source_path)(args)  # -> list[Sample]
         self.generate_rollout = load_function(args.custom_generate_function_path)
         self.reward_func = load_function(args.custom_rm_path)
 
-    def _next_batch(self, rollout_id: int) -> list[tuple[str, str]]:
+    def _next_batch(self, rollout_id: int) -> list[Sample]:
         """按 rollout_id 从 data_source 滚动取一个 batch（对齐源按 rollout_batch_size 取窗口）。
 
         源用全局 dataset 指针；V3 用 (rollout_id * batch_size) 起点 + 取模环绕，
         保证每轮都能取满 batch_size 条（题库小于 num_rollout*batch_size 时循环复用）。
+        返回**深拷贝**：generate hook 会就地回填 Sample，拷贝避免污染 data_source 供下一轮复用。
         """
         n = self.args.batch_size
         start = (rollout_id * n) % len(self.data_source)
-        return [self.data_source[(start + i) % len(self.data_source)] for i in range(n)]
+        return [copy.deepcopy(self.data_source[(start + i) % len(self.data_source)]) for i in range(n)]
 
     async def generate(self, rollout_id: int) -> dict:
         """对齐源 rollout.py:539 def generate(rollout_id)：产出一批训练数据 dict。
 
         源: _get_rollout_data → _convert_samples_to_train_data → _split_train_data_by_dp
         V3: 逐条跑 generate hook（真 SGLang rollout）+ reward hook → _convert（不切 DP）
+        A1: 数据源直接给 Sample（可能带 metadata["context"]），hook 就地回填 tokens/loss_mask/reward。
         """
         samples: list[Sample] = []
-        for prompt, label in self._next_batch(rollout_id):
-            s = Sample(prompt=prompt, label=label)
+        for s in self._next_batch(rollout_id):
             s = await self.generate_rollout(self.args, s)              # 真 SGLang rollout（复用 V1/V2 loop）
             s.reward = (await self.reward_func(self.args, s))["reward"]  # per-sample reward hook
             samples.append(s)

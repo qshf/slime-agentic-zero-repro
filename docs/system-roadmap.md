@@ -165,9 +165,9 @@
 
 ### 主线二
 
-**A1 MemAgent**
-- 引入：真实 agent 的 chunk 记忆更新循环（单引擎，无工具）。
-- 简化：math 归一化只做主流程。
+**A1 MemAgent**  ✅ 本地离线通过（loss_mask 全 1 + boxed reward + 闭环），待服务器
+- 引入：真实 agent 的 chunk 记忆更新循环（单引擎，无工具）。loss_mask 全 1（无工具边界，最简）。
+- 简化：math 归一化只做主流程；char 级分 chunk、硬编码 mini QA（见 docs/decisions/a1.md 偏离表）。
 - 对应源项目：`agentic/memagent/rollout.py`（298 行，reward 内嵌 272-297）。
 
 **A2 AgentFlow**（工具边界精华课）

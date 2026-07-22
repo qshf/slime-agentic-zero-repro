@@ -6,7 +6,7 @@
 
 - **项目**：从 0 复现一个最小 Agentic RL 训练系统，**在复现中学习** slime-agentic 的系统设计。
 - **源项目**：slime-agentic —— 基于 Ray + SGLang + Megatron/FSDP 的 Agentic RL 训练框架（58K LOC）。
-- **当前阶段**：主线一进行中。V0、V1、V2、V3、V4、V5 均已验证通过（V5 5090 端到端 async 193.7s < sync 209.3s）。**主线一已打通**，下一步主线二 A1 MemAgent。
+- **当前阶段**：主线一已打通（V0-V5 全验证）。**主线二进行中**：A1 MemAgent 本地离线通过（loss_mask 全 1 + boxed reward + 闭环），待服务器端到端。
 
 > **铁律（每版必须遵守）**：**代码范式遵从原项目**。nano 的代码结构 / 接口签名 / 命名 / 数据流必须对齐 slime-agentic 源项目在对应位置的写法。**只允许在其基础上做得更清晰（更好），不允许比源项目更乱、更 hack、更偏离（更差）**。判断法：写任一段前先问"源项目对应位置怎么做的"，对齐它；要偏离只能朝"更清晰且语义等价"的方向，并在注释里写明为何偏离。反例（已修）：把 agent loop 抄成两份塞进 generate() 里——源项目 rollout.py 是薄适配器，loop 在 solver.py。
 >
@@ -43,7 +43,7 @@
 
 | 版本 | 标题 | 关键学点 | 状态 |
 |------|------|---------|------|
-| A1 | MemAgent | 单引擎/无工具/loss_mask 全 1 | 计划中 |
+| A1 | MemAgent | 单引擎/无工具/loss_mask 全 1 | ✅ 本地离线通过（loss_mask 全 1 + boxed reward + 闭环），待服务器 |
 | A2 | AgentFlow | executor token 不训练（工具边界精华）| 计划中 |
 | A3 | ToolOrchestra（仅 QA 路径）| 多专家路由 + 多组件 reward | 计划中（**主线二终点**）|
 
@@ -122,6 +122,14 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **对齐源命名的落定**：同步基线**复用 V4 的 train_ray.py**（扮演源 train.py 角色），不按 roadmap 草稿名另建 `train_sync.py`（会重复）——朝"源命名 train.py↔train_async.py + 不重复"更清晰。
 - 验证：`scripts/test_v5_async.py --offline` 本地 **PASSED**——`sync_total=2.018s`、`async_total=1.492s`、`saving=0.526s`（理论 (3-1)·0.2=0.4s）。异步 rollout 1/2 的 `wait_gen=0.000s` 是 overlap 的直接证据（gen(N+1) 早在上轮 train 期间跑完）。V0/V2/V3/V4 回归全绿。5090 端到端 **PASSED**：真 SGLang gen 50-70s，`sync_total=209.3s`、`async_total=193.7s`、`saving=15.6s`（>理论 10s，多出为 gen 方差），异步 rollout 1/2 同样 `wait_gen=0.000s`、weight_v→4。
 - **登记待显现的痛点**：异步引入 off-policy staleness（train 用 gen(N) 旧权重、gen(N+1) 已在跑），`update_weights_interval` 即调新旧度的旋钮；nano fake reward 感知不到，留主线二真 agent 时显现。**主线一系统骨架到此打通** → 主线二 A1 MemAgent。
+
+### A1 MemAgent（2026-07-22）详见 docs/decisions/a1.md
+- 主线二第一个真实 agent。建 `toy_rl/agent/memagent/{rollout,data,stub_rollout}.py`：镜像源 `agentic/memagent/rollout.py` 的 chunk 记忆循环（`for chunk: memory=LLM(problem,memory,chunk)` → `answer=LLM(problem,memory)` with `\boxed{}`），**每轮独立训练序列**、memory 文本跨轮传递。
+- **A1 教学核心 = loss_mask 全 1**：每轮 response 全训练、无工具返回段置 0（对齐源 `[1]*len(token_ids)`）。这是最简 loss_mask，和 A2 的"executor token=0"（工具边界）形成对照。reward = 抽 `\boxed{}` + is_equiv 归一化。
+- **主线一改造（都朝更对齐源 + 零回归）**：data_source 做成 `data_source_path` hook（对齐源 data_source_cls），RolloutManager 改为动态加载数据源、产出带 `metadata["context"]` 的 Sample；calculator `_PROMPTS` 抽到 `calculator_data.py`（产出与旧题库一致，主线一回归零改动）。
+- **范式对齐落定**：源 memagent 的循环**就在 generate 里**（无 solver），故 A1 把循环放 `_run_memory_loop`、real/stub 只注入不同 chat_fn——按对应源结构对齐，不套 calculator 的"loop 独立模块"（那是因 agentflow 有 solver）。
+- 验证：`scripts/test_a1_memagent.py --offline` **PASSED**——3 chunk→4 turn、loss_mask 全 1（trainable=167=各轮 response 之和）、`\boxed{Lyonar}`→reward=1.0、闭环 reward_mean=1.0。V0/V2/V3/V4/V5 回归全绿（data_source 改造对 calculator 透明）。服务器端到端待跑。
+- **偏离**：char 级分 chunk（无真 tokenizer）、假 token 无真 log_probs、硬编码 mini QA、reward 归一化取最简、reward 不做 turn 均摊、data_source 返回 Sample 列表——均见 a1.md 偏离表。**暴露痛点**：loss_mask 全 1 教不了工具边界 → A2 AgentFlow。
 
 ## 7. 待办 / 已知问题
 

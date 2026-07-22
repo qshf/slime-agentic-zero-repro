@@ -30,10 +30,12 @@ class Args:
     max_tokens: int = 512
     temperature: float = 0.0
 
-    # --- hook 路径（对齐 --custom-generate-function-path / --custom-rm-path）---
-    #     RolloutManager 用 load_function 按这两个路径动态加载 generate / reward。
+    # --- hook 路径（对齐 --custom-generate-function-path / --custom-rm-path / data_source）---
+    #     RolloutManager 用 load_function 按这三个路径动态加载 data_source / generate / reward。
+    #     默认是 calculator 路径（主线一）；主线二换 agent 只改这三条路径 + 下面的 agent 专属字段。
     custom_generate_function_path: str = "toy_rl.agent.calculator_hooks.generate"
     custom_rm_path: str = "toy_rl.agent.calculator_hooks.reward_func"
+    data_source_path: str = "toy_rl.agent.calculator_data.load_data_source"  # 对齐源 args.data_source_path
 
     # --- 主循环编排配置（V3 新增，对齐 train.py 的 args.num_rollout / rollout_batch_size）---
     num_rollout: int = 2              # 主循环轮数，对齐 args.num_rollout（train.py:65）
@@ -47,3 +49,10 @@ class Args:
     #     偏离登记见 docs/decisions/v5.md。
     fake_train_seconds: float = 0.0   # Trainer.train 模拟训练一步耗时；V5 打开以让 overlap 可观测
     fake_gen_seconds: float = 0.0     # 离线 stub gen 模拟推理耗时；服务器真 SGLang 时恒为 0
+
+    # --- A1 MemAgent 专属字段（对齐源 agentic/memagent/rollout.py 的 MEM_* 环境变量）---
+    #     只在 data/generate/reward 路径指向 memagent 时生效；calculator 路径不读这些。
+    mem_chunk_chars: int = 400   # 按**字符**切 chunk（nano 无真 tokenizer；源是 MEM_CHUNK_TOKENS 按 token）
+    mem_max_chunks: int = 8      # 最多切几个 chunk（对齐源 MAX_CHUNKS）
+    mem_max_memory: int = 512    # 记忆更新轮 max_tokens（对齐源 MAX_MEMORY_TOKENS）
+    mem_max_final: int = 256     # 最终回答轮 max_tokens（对齐源 MAX_FINAL_TOKENS）
