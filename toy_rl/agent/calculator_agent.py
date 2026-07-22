@@ -123,7 +123,7 @@ async def run_agent_loop(
     prompt: str,
     *,
     max_turns: int = 5,
-    max_tokens: int = 128,
+    max_tokens: int = 512,  # Qwen3 think 段较长，128 会截断 → 废轮；见 mini_slime/args.py 注释
     temperature: float = 0.0,
 ) -> tuple[_Trajectory, str | None]:
     """多轮 calculator agent loop——本项目里 agent 交互的唯一实现处。
