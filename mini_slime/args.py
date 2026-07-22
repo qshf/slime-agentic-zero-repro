@@ -23,7 +23,10 @@ class Args:
     sglang_base_url: str = "http://localhost:30000/v1"
     model_name: str = "Qwen/Qwen3-0.6B"
     max_turns: int = 5
-    max_tokens: int = 128
+    # Qwen3-0.6B 是混合推理模型，每轮先吐一段 <think>。128 装不下"think + 闭合 + 动作"，
+    # 会在 think 中途撞 max_tokens 被截断 → 该轮无 tool/answer，白耗一轮。提到 512 让整段
+    # 思考+动作在一轮内跑完（512*max_turns=2560 < context-length 4096，不溢出）。
+    max_tokens: int = 512
     temperature: float = 0.0
 
     # --- hook 路径（对齐 --custom-generate-function-path / --custom-rm-path）---
