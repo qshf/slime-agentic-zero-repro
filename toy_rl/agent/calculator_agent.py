@@ -31,8 +31,9 @@ from toy_rl.agent.tools import CalculatorTool, ToolRegistry
 from toy_rl.sample import Sample
 
 # SGLang 的 OpenAI 兼容接口，对齐源项目 agentic/agentflow/rollout.py 里的默认端口
-SGLANG_BASE_URL = "http://localhost:30000/v1"
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+# 默认指向 5090 上的 Qwen3.5-4B（端口 30001）；0.6B 仍在 30000，切回改这两行即可。
+SGLANG_BASE_URL = "http://localhost:30001/v1"
+MODEL_NAME = "Qwen/Qwen3.5-4B"
 
 # loss_mask 的三种段类型（与 V0 保持概念对齐）
 MASK_PROMPT = 0   # 题目/context，不训练
@@ -107,10 +108,14 @@ def _chat(client: OpenAI, model_name: str, messages: list[dict],
     return resp.choices[0].message.content or ""
 
 
+# 提示词写法说明：早期用 <answer>数字</answer> 这类中文占位符，弱模型（0.6B）没照抄、
+# 强模型（Qwen3.5-4B）反而把"数字"当字面内容原样输出 → 抽取出"数字"、reward=0。
+# 故改成"具体示例 + 明确禁止照抄占位符"，对任何强度的模型都稳。工具/答案标签格式不变。
 _SYSTEM_PROMPT = (
-    "你是一个数学助手。如果需要计算，用 <tool>工具名: <参数></tool> 调用工具。"
-    "得到工具结果后，给出最终答案: <answer>数字</answer>。"
-    "注意: 只输出工具调用或最终答案，不要多余解释。\n"
+    "你是一个数学助手。如果需要计算，用 <tool>calculator: 表达式</tool> 调用工具"
+    "（表达式处填真实算式，例如 <tool>calculator: 12 * 34</tool>）。\n"
+    "拿到工具结果后，用 <answer></answer> 包裹最终数字，例如答案是 42 就输出 <answer>42</answer>。\n"
+    "注意: 只输出工具调用或最终答案，不要多余解释，也不要照抄本说明里的示例数字。\n"
     "可用工具:\n"
     # 工具清单/示例由 registry 从工具元数据动态渲染，对齐源项目"元数据注入 planner prompt"。
     + _REGISTRY.render_for_prompt()
