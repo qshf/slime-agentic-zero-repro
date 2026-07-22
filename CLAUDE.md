@@ -20,8 +20,9 @@
 - **nano 项目**：`/Users/qshf/my-project/slime-agentic-zero-repro`（git 已 init，主分支 main）
 - **当前活跃分支**：`v4`
 - **分支准则（每版必须遵守）**：**每个版本切一个 `vN` 分支，从上一版分支的末端切出；当版的全部提交——实施计划 doc + 代码实现 + 验证结果——都落在 `vN` 上，绝不提交到别的版本分支**。判断法：提交前先 `git branch --show-current`，确认在当版分支。反例（已修）：V4 的计划/实现/调试提交错落在 `v3` 分支上——已把 `v3` 回退到其最后一个 V3 提交、V4 全部收进 `v4` 分支。
-- **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/zj`）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
-- **git 远端**：`git@github.com:qshf/-slime-agentic-zero-repro.git`
+- **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/slime-agentic-zero-repro`，git 管理）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
+- **服务器 git 恢复准则（每版必须遵守）**：服务器 checkout 是 **git 管理**的（当前目录 `/home/ubuntu/slime-agentic-zero-repro`，旧的 `zj` 已弃用）。**当服务器所在版本与要跑的版本不匹配时，用 git 从远程仓库恢复到目标版本**（`git fetch origin && git reset --hard origin/<vN>`），**绝不用 rsync 往 git 工作树上盖**——rsync 会把本地其它版本的文件混进 checkout（tracked 被改、v4 文件混进 v3），污染分支状态。反例（已修）：本次调试把本地 v4 工作树 rsync 盖到服务器 v3 checkout，事后 `git restore` + `git clean` 才复原成干净 v3。**前置（待补）**：服务器现 HTTPS(443) 连 github 超时、SSH(22) 网络可达但未配 key，`git fetch` 暂不通；需先给服务器配 github SSH key 并把 remote 换成 SSH，此准则方能落地。
+- **git 远端**：`git@github.com:qshf/slime-agentic-zero-repro.git`（SSH；注意仓库名无前导横杠。旧 CLAUDE.md 曾误写 `-slime...`）
 
 ## 3. 进度状态
 
