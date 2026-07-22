@@ -6,7 +6,7 @@
 
 - **项目**：从 0 复现一个最小 Agentic RL 训练系统，**在复现中学习** slime-agentic 的系统设计。
 - **源项目**：slime-agentic —— 基于 Ray + SGLang + Megatron/FSDP 的 Agentic RL 训练框架（58K LOC）。
-- **当前阶段**：主线一进行中。V0、V1、V2、V3、V4 均已验证通过；V5（同步 vs 异步，主线一终点）本地离线通过（async 1.492s < sync 2.018s），待服务器端到端。**主线一骨架到此打通**，下一步主线二 A1 MemAgent。
+- **当前阶段**：主线一进行中。V0、V1、V2、V3、V4、V5 均已验证通过（V5 5090 端到端 async 193.7s < sync 209.3s）。**主线一已打通**，下一步主线二 A1 MemAgent。
 
 > **铁律（每版必须遵守）**：**代码范式遵从原项目**。nano 的代码结构 / 接口签名 / 命名 / 数据流必须对齐 slime-agentic 源项目在对应位置的写法。**只允许在其基础上做得更清晰（更好），不允许比源项目更乱、更 hack、更偏离（更差）**。判断法：写任一段前先问"源项目对应位置怎么做的"，对齐它；要偏离只能朝"更清晰且语义等价"的方向，并在注释里写明为何偏离。反例（已修）：把 agent loop 抄成两份塞进 generate() 里——源项目 rollout.py 是薄适配器，loop 在 solver.py。
 >
@@ -37,7 +37,7 @@
 | V2 | custom generate/reward hook 化 | 服务器 | ✅ 代码完成+离线测过，待服务器端到端 |
 | V3 | mini_slime 最小闭环 | 服务器 | ✅ 完成（5090 端到端 4/4，reward=1.0）|
 | V4 | Ray 化 | 服务器 | ✅ 完成（5090 端到端 3/3，actor 分进程 + reward=1.0）|
-| V5 | 同步 vs 异步 | 服务器 | ✅ 本地离线通过（async<sync，saving≈(N-1)·train），待服务器端到端（**主线一终点**）|
+| V5 | 同步 vs 异步 | 服务器 | ✅ 完成（5090 端到端 async 193.7s < sync 209.3s；本地离线 async<sync；**主线一终点**）|
 
 **主线二 · 三个真实 Agent**（做扎实，按难度）
 
@@ -120,7 +120,7 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - 建 `mini_slime/train_async.py`（≡ 源 train_async.py）：预取 gen(0) → 循环里先 `generate.remote(N+1)` 提前发起下一轮、再 `ray.get(async_train(N))`，让 train N 与 gen N+1 **跨进程并行**；`update_weights` 按 interval、换权重前先 sync 在途 gen。这就是源注释的"改 ray.get 位置"。
 - **核心洞察 + 偏离**：fake trainer `train≈0` → overlap 无可省、断言必挂。故加两个"模拟耗时"旋钮（`args.py`，默认 0.0，V3/V4 零影响）：`fake_train_seconds`（Trainer.train sleep，代表训练一步 wall-clock）、`fake_gen_seconds`（离线 stub gen sleep，代表 SGLang 推理；服务器真 SGLang 时=0）。
 - **对齐源命名的落定**：同步基线**复用 V4 的 train_ray.py**（扮演源 train.py 角色），不按 roadmap 草稿名另建 `train_sync.py`（会重复）——朝"源命名 train.py↔train_async.py + 不重复"更清晰。
-- 验证：`scripts/test_v5_async.py --offline` 本地 **PASSED**——`sync_total=2.018s`、`async_total=1.492s`、`saving=0.526s`（理论 (3-1)·0.2=0.4s）。异步 rollout 1/2 的 `wait_gen=0.000s` 是 overlap 的直接证据（gen(N+1) 早在上轮 train 期间跑完）。V0/V2/V3/V4 回归全绿。服务器端到端待跑（真 SGLang + fake_train_seconds=5.0，因 gen 方差大以观测报告为主）。
+- 验证：`scripts/test_v5_async.py --offline` 本地 **PASSED**——`sync_total=2.018s`、`async_total=1.492s`、`saving=0.526s`（理论 (3-1)·0.2=0.4s）。异步 rollout 1/2 的 `wait_gen=0.000s` 是 overlap 的直接证据（gen(N+1) 早在上轮 train 期间跑完）。V0/V2/V3/V4 回归全绿。5090 端到端 **PASSED**：真 SGLang gen 50-70s，`sync_total=209.3s`、`async_total=193.7s`、`saving=15.6s`（>理论 10s，多出为 gen 方差），异步 rollout 1/2 同样 `wait_gen=0.000s`、weight_v→4。
 - **登记待显现的痛点**：异步引入 off-policy staleness（train 用 gen(N) 旧权重、gen(N+1) 已在跑），`update_weights_interval` 即调新旧度的旋钮；nano fake reward 感知不到，留主线二真 agent 时显现。**主线一系统骨架到此打通** → 主线二 A1 MemAgent。
 
 ## 7. 待办 / 已知问题

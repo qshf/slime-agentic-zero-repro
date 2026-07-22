@@ -157,7 +157,7 @@
 - 验证：`test_v4_ray.py` 确认两 actor 不同进程 + 闭环通过。
 - 对应源项目：`slime/ray/rollout.py:441`、`placement_group.py:181`。
 
-**V5 同步 vs 异步**（主线一承诺终点）✅ 本地离线通过（async 1.492s < sync 2.018s，saving≈(N-1)·fake_train_seconds），待服务器端到端
+**V5 同步 vs 异步**（主线一承诺终点）✅ 完成（5090 端到端 async 193.7s < sync 209.3s；本地离线 async 1.492s < sync 2.018s）
 - 上一版痛点：ray.get 强制等待。
 - 切片：同步基线复用 `train_ray.py`（≡ 源 train.py）vs 新建 `train_async.py`（提前 `generate.remote(N+1)` overlap train N，update_weights 按 interval）。为让 fake trainer 的 overlap 可观测，加 `fake_train_seconds`/`fake_gen_seconds` 模拟耗时旋钮（默认 0，见 v5.md 偏离表）。
 - 验证：`test_v5_async.py --offline` 断言异步版总耗时 < 同步版（异步 rollout 1/2 `wait_gen=0.000s` 是 overlap 铁证）。
