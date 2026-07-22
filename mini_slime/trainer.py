@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import time
+
 from mini_slime.args import Args
 from mini_slime.weight_sync import WeightUpdater
 
@@ -34,7 +36,12 @@ class Trainer:
         """对齐源 actor.train(rollout_id, rollout_data)：消费 train_data dict。
 
         V3 fake：不 forward/backward，只消费数据结构、产出可断言指标。
+        V5 加：`fake_train_seconds` sleep **代表**真 FSDP/Megatron 一步的计算 wall-clock（fake 不算
+        真梯度，故无天然耗时）——这是 V5 异步能 overlap 掉的那段时间。默认 0.0 时此行 no-op，V3/V4
+        行为不变。偏离登记见 docs/decisions/v5.md。
         """
+        if self.args.fake_train_seconds > 0:
+            time.sleep(self.args.fake_train_seconds)
         rewards = rollout_data["rewards"]
         n_trainable = sum(sum(m) for m in rollout_data["loss_masks"])
         n_total = sum(rollout_data["response_lengths"])

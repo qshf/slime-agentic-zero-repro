@@ -38,4 +38,12 @@ class Args:
     # --- 主循环编排配置（V3 新增，对齐 train.py 的 args.num_rollout / rollout_batch_size）---
     num_rollout: int = 2              # 主循环轮数，对齐 args.num_rollout（train.py:65）
     batch_size: int = 2              # 每轮取几条 prompt，对齐 args.rollout_batch_size
-    update_weights_interval: int = 1  # 每几轮同步一次权重；V3 恒为 1，字段先留给 V5 异步
+    update_weights_interval: int = 1  # 每几轮同步一次权重（对齐 train_async.py:62）；V3/V4 恒为 1
+
+    # --- V5 异步 overlap 的"模拟耗时"旋钮（默认 0.0 → V3/V4 完全不受影响）---
+    #     源项目 train 是真 FSDP/Megatron 一步（秒级）、gen 是真 SGLang 推理，故 overlap 能省真
+    #     wall-clock。nano 是 fake：train≈0、离线 gen≈0，overlap 无可省、断言无法成立。这两个旋钮
+    #     用 sleep **代表**我们没真跑的那段计算的 wall-clock，让 V5 的 overlap 可观测可断言。
+    #     偏离登记见 docs/decisions/v5.md。
+    fake_train_seconds: float = 0.0   # Trainer.train 模拟训练一步耗时；V5 打开以让 overlap 可观测
+    fake_gen_seconds: float = 0.0     # 离线 stub gen 模拟推理耗时；服务器真 SGLang 时恒为 0

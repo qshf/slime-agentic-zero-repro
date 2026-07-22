@@ -12,6 +12,7 @@ reward 直接复用 calculator 的（规则匹配），只有 generate 换成"�
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -29,7 +30,14 @@ async def generate(args, sample: Sample) -> Sample:
 
     trajectory = prompt 段(loss_mask=0) + agent 答案段(loss_mask=1)，与 V1/V2 的段语义一致，
     只是把"多轮 SGLang 交互"替换成"一步算出"。tokens 用字符级假 token（够验证契约/闭环）。
+
+    V5 加：`fake_gen_seconds` sleep **代表**真 SGLang 多轮推理的 wall-clock（离线无引擎故无天然
+    耗时）——它给 train 提供一个可被 overlap 藏起来的时间窗。服务器路径走真 SGLang（此值恒为 0，
+    不 sleep）。默认 0.0 时 no-op，V4 离线测试行为不变。偏离登记见 docs/decisions/v5.md。
     """
+    if getattr(args, "fake_gen_seconds", 0) > 0:
+        await asyncio.sleep(args.fake_gen_seconds)
+
     expr = sample.prompt.replace("=", "").replace("?", "").strip()  # "2 + 3 = ?" -> "2 + 3"
     ans = _CALC.execute(expr)
     resp = f"<answer>{ans}</answer>"
