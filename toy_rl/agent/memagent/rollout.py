@@ -33,6 +33,7 @@ token 都参与训练，**没有工具返回段要置 0**。这正好和 A2 Agen
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -88,6 +89,19 @@ ChatFn = Callable[[str, bool], Awaitable[str]]
 def _tokenize(text: str, vocab: dict[str, int]) -> list[int]:
     """字符级假 tokenizer（沿用 V1-V5 约定；真 tokenizer 留 V6）。跨轮共享一个 vocab。"""
     return [vocab.setdefault(ch, len(vocab)) for ch in text]
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _strip_think(text: str) -> str:
+    """去掉 Qwen3 混合推理模型的 <think>…</think> 段。
+
+    Qwen3.5-4B 是混合推理模型，默认每轮先吐一大段思考。若把它当"更新后的记忆"传给下一轮，
+    记忆会被思考噪声污染、最终轮也答不出 \\boxed{}。故对 chat 输出剥掉 think 段（配合下面
+    enable_thinking=False 双保险）。对齐源 memagent `_strip_stop_tokens` 的同类"清洗生成文本"角色。
+    """
+    return _THINK_RE.sub("", text).strip()
 
 
 def _split_chunks(context: str, chunk_chars: int, max_chunks: int) -> list[str]:
@@ -157,13 +171,18 @@ def _sglang_chat_fn(args: Args) -> ChatFn:
             messages=[{"role": "user", "content": prompt_text}],
             max_tokens=max_tokens,
             temperature=args.temperature,
+            # 关掉 Qwen3 思考段：off-the-shelf 混合推理模型会先吐一大段 think 把 token 预算耗尽、
+            # 甚至对着模板 meta-rambling 而不做任务（实测 reward=0 的根因）。源 MemAgent 用的是为记忆
+            # 任务微调过的模型、无此问题；nano 接现成模型故显式关思考，让它直接产记忆/答案。
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         return resp.choices[0].message.content or ""
 
     async def chat_fn(prompt_text: str, is_final: bool) -> str:
         max_tokens = args.mem_max_final if is_final else args.mem_max_memory
         # 同步 OpenAI 客户端丢线程池，别阻塞事件循环（同 calculator_agent）
-        return await loop.run_in_executor(None, _call, prompt_text, max_tokens)
+        text = await loop.run_in_executor(None, _call, prompt_text, max_tokens)
+        return _strip_think(text)  # 双保险：剥掉可能残留的 <think> 段，避免污染记忆/答案
 
     return chat_fn
 
