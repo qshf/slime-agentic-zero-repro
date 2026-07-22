@@ -20,8 +20,9 @@ class Args:
     """极简配置对象，对齐源项目 args 的角色（庞大 Namespace 里只保留 nano 用到的字段）。"""
 
     # --- rollout / SGLang 推理配置（generate hook 读）---
-    sglang_base_url: str = "http://localhost:30000/v1"
-    model_name: str = "Qwen/Qwen3-0.6B"
+    #     默认指向 5090 上的 Qwen3.5-4B（GPU1、端口 30001）；0.6B 仍在 30000 可切回对比。
+    sglang_base_url: str = "http://localhost:30001/v1"
+    model_name: str = "Qwen/Qwen3.5-4B"
     max_turns: int = 5
     # Qwen3-0.6B 是混合推理模型，每轮先吐一段 <think>。128 装不下"think + 闭合 + 动作"，
     # 会在 think 中途撞 max_tokens 被截断 → 该轮无 tool/answer，白耗一轮。提到 512 让整段

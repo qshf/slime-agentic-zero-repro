@@ -31,13 +31,15 @@ from toy_rl.sample import Sample
 # --- data_source（对齐源 self.data_source，V3 用硬编码小题库）------------------------
 # 源: data_source_cls = load_function(args.data_source_path); self.data_source = data_source_cls(args)
 # V3: 只需几条能跑通闭环的 calculator 题；(prompt, label) 元组列表即可。
+# 题目难度：4B 心算就能答对小算术（会绕过工具、tool 路径练不到），故换成大数乘除/多步
+# 表达式——超出可靠心算范围，逼模型真去调 calculator。label 均由 eval 校验过。
 _PROMPTS: list[tuple[str, str]] = [
-    ("2 + 3 = ?", "5"),
-    ("10 - 4 = ?", "6"),
-    ("6 * 7 = ?", "42"),
-    ("20 / 5 = ?", "4"),
-    ("8 + 15 = ?", "23"),
-    ("100 - 37 = ?", "63"),
+    ("347 * 89 = ?", "30883"),
+    ("638 * 47 = ?", "29986"),
+    ("72 * 84 = ?", "6048"),
+    ("(123 + 456) * 7 = ?", "4053"),
+    ("1024 / 16 = ?", "64"),
+    ("9876 - 5432 = ?", "4444"),
 ]
 
 
