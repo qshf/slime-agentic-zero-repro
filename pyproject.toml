@@ -4,13 +4,15 @@ version = "0.1.0"
 description = "从 0 复现 slime-agentic 的最小 Agentic RL 训练系统（教学用）"
 requires-python = ">=3.10"
 dependencies = [
-    "openai>=1.0",   # V1: 调 SGLang 的 OpenAI 兼容接口
-    "ray>=2.5",      # V4: actor 拆进程 + ray.get 同步点
+    "openai>=1.0",         # V1: 调 SGLang 的 OpenAI 兼容接口
+    "ray>=2.5",            # V4: actor 拆进程 + ray.get 同步点
+    "python-dotenv>=1.0",  # A2: 从 .env 加载 DEEPSEEK_API_KEY 等(密钥不进 git)
 ]
 
 # 各版本按需追加依赖:
 #   V1 起: openai(调 SGLang); SGLang 本身用 docker 部署在服务器 5090
 #   V4 起: ray
+#   A2 起: python-dotenv(读 .env 里的 coder 模型密钥)
 
 [tool.uv]
 package = false

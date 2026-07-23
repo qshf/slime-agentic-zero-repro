@@ -130,14 +130,25 @@ class PythonCoderTool:
 
 
 def deepseek_coder_chat_fn() -> CoderChatFn:
-    """real coder chat_fn：打外部 DeepSeek API（OpenAI 兼容）。密钥/base_url/model 走环境变量。
+    """real coder chat_fn：打外部 DeepSeek API（OpenAI 兼容）。密钥/base_url/model 走环境变量或 .env。
 
     - DEEPSEEK_API_KEY（必填）
     - CODER_BASE_URL（默认 https://api.deepseek.com/v1）
     - CODER_MODEL（默认 deepseek-v4-flash）
-    DeepSeek v4 是推理模型：只取 message.content（忽略 reasoning_content）。
+    读取顺序：真实环境变量优先，其次 .env（见 .env.example）。DeepSeek v4 是推理模型：只取
+    message.content（忽略 reasoning_content）。
     """
     from openai import OpenAI
+
+    # 从 .env 加载密钥（.env 不进 git，见 .env.example / .gitignore）。已在真实环境变量里则不覆盖。
+    # 源 tool.py 是纯 os.environ；nano 加这层 dotenv 是"更方便"的工程增强（次级借鉴，不改源语义——
+    # 仍是 os.environ 读，dotenv 只是把 .env 灌进 os.environ）。找不到 dotenv/.env 时静默跳过。
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
 
     api_key = os.environ.get("DEEPSEEK_API_KEY", "")
     base_url = os.environ.get("CODER_BASE_URL", "https://api.deepseek.com/v1")
