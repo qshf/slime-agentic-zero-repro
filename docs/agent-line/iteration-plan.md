@@ -17,7 +17,7 @@ Args 字段**，闭环骨架一行不改——这正是 V2 hook 化的兑现。
 |------|------|------------------|---------------|-----------|--------|
 | A1 | MemAgent | chunk 记忆更新循环（单引擎、无工具）| **全 1**（无工具边界，最简） | `agentic/memagent/rollout.py` | 服务器 |
 | A2 | AgentFlow | Planner→Executor→Verifier 多引擎协调 | **executor token=0**（工具边界精华课）| `agentic/agentflow/core/*` | 服务器 |
-| A3 | ToolOrchestra（仅 QA）| 多专家路由 + 多组件 reward | orchestrator=1，专家/工具=0 | `agentic/ToolOrchestra/{orchestra_solver,reward}.py` | 服务器 |
+| A3 | ToolOrchestra（仅 QA）| 多专家路由 + 多组件 reward | orchestrator=1，专家/工具=0 | `agentic/ToolOrchestra/{orchestra_solver,reward}.py` | ✅ 离线完成；服务器待验 |
 
 难度避连击：A2（协调多引擎，烧脑）之后 A3 砍到只做 QA 路径（func_call/tau2 记录设计不实现）。
 
@@ -41,7 +41,7 @@ Args 字段**，闭环骨架一行不改——这正是 V2 hook 化的兑现。
 - **对应源项目：** `agentic/agentflow/core/{solver,planner,executor,verifier,rewarder}.py`。
 - **暴露的新问题：** 单任务；缺多 agent 路由和多组件 reward。→ 引出 A3。
 
-### A3: ToolOrchestra（仅 QA 路径，主线二终点）
+### A3: ToolOrchestra（仅 QA 路径，主线二终点）✅ 离线完成；服务器待验
 - **上一版痛点：** AgentFlow 单任务，缺多专家路由 + 多组件 reward。
 - **引入的概念：** orchestrator 路由到多专家（QA 路径），reward = 正确性 + 成本 + 延迟。
 - **简化：** func_call 路径 + tau2 环境模拟器**不实现**（记录设计，见 system-roadmap 已弃/降级方向）。

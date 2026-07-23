@@ -69,3 +69,13 @@ class Args:
     af_fixed_model: str = "Qwen/Qwen3.5-4B"
     af_max_steps: int = 3        # ReAct 最多步数（对齐源 Solver.max_steps，nano 砍到 3 够说清概念）
     af_max_tokens: int = 512     # 每次 LLM 调用 max_tokens
+
+    # --- A3 ToolOrchestra QA 专属字段（对齐源 ToolOrchestra QA solver）---
+    # orchestrator 是唯一产训练轨迹的角色；expert/search 是工具环境，结果作为 role=tool observation
+    # 写入下一轮 prompt。默认复用 4B 端点；逻辑专家角色/价格/偏好在每条数据 metadata 中定义。
+    orchestra_orchestrator_base_url: str = "http://localhost:30001/v1"
+    orchestra_orchestrator_model: str = "Qwen/Qwen3.5-4B"
+    orchestra_expert_base_url: str = "http://localhost:30001/v1"
+    orchestra_expert_model: str = "Qwen/Qwen3.5-4B"
+    orchestra_max_steps: int = 4
+    orchestra_max_tokens: int = 512

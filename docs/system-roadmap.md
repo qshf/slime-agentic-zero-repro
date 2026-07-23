@@ -176,7 +176,7 @@
 - 简化：引擎数从源 3-5 降到**双引擎**（训练 planner / 固定其余）；单玩具工具 calculator；命令解析只留正则（见 docs/decisions/a2.md 偏离表）。
 - 对应源项目：`agentic/agentflow/core/{solver,planner,executor,verifier,rewarder}.py`。
 
-**A3 ToolOrchestra（仅 QA 路径）**（主线二承诺终点）
+**A3 ToolOrchestra（仅 QA 路径）** ✅ 离线完成；服务器待验（主线二承诺终点）
 - 上一版痛点：AgentFlow 单任务；缺多 agent 路由和多组件 reward。
 - 引入：orchestrator 路由到多专家（QA 路径），reward = 正确性+成本+延迟。
 - 简化：**func_call 路径 + tau2 环境模拟器不实现**（记录设计）。
