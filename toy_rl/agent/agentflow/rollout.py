@@ -37,9 +37,9 @@ from toy_rl.agent.agentflow.executor import Executor
 from toy_rl.agent.agentflow.planner import Planner
 from toy_rl.agent.agentflow.rewarder import Rewarder
 from toy_rl.agent.agentflow.solver import Solver
+from toy_rl.agent.agentflow.tools.base_generator import BaseGeneratorTool
 from toy_rl.agent.agentflow.tools.python_coder import (
     PythonCoderTool,
-    TOOL_DESCRIPTION,
     deepseek_coder_chat_fn,
 )
 from toy_rl.agent.agentflow.verifier import Verifier
@@ -81,13 +81,21 @@ def _build_solver(args: Args, planner_chat_fn: ChatFn, fixed_chat_fn: ChatFn, co
     """组装三模型 Solver：planner→训练引擎，executor/verifier/final_output→固定引擎，
     python_coder 内部→独立 coder 模型。对齐源 rollout.py:136-144 的 engine_map（nano 三分版）。
     real / stub 都调它，只换三个 chat_fn。
+
+    工具注册两个（对齐源 engine_map 的两工具 + executor 真分发）：
+      · python_coder → 内部独立 coder 模型（coder_chat_fn，纯环境）；
+      · base_generator → 固定 base 引擎（fixed_chat_fn，与 executor/verifier 同档，对齐源 rollout.py:141
+        `base_generator`→`generate_engine`）。
+    executor 按 planner 吐出的 tool_name 在两者间真分发（见 executor.py:Executor._resolve_tool）。
     """
     coder_tool = PythonCoderTool(coder_chat_fn)
-    available_tools = [coder_tool.tool_name]
-    toolbox_metadata = {coder_tool.tool_name: {"description": TOOL_DESCRIPTION}}
+    base_generator_tool = BaseGeneratorTool(fixed_chat_fn)
+    toolbox = {t.tool_name: t for t in (coder_tool, base_generator_tool)}
+    available_tools = sorted(toolbox)
+    toolbox_metadata = {name: {"description": t.tool_description} for name, t in toolbox.items()}
 
     planner = Planner(planner_chat_fn, available_tools, toolbox_metadata)
-    executor = Executor(fixed_chat_fn, coder_tool)
+    executor = Executor(fixed_chat_fn, toolbox)
     verifier = Verifier(fixed_chat_fn, available_tools, toolbox_metadata)
     return Solver(planner, executor, verifier, final_output_chat_fn=fixed_chat_fn, max_steps=args.af_max_steps)
 

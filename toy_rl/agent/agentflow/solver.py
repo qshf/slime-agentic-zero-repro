@@ -10,7 +10,7 @@ ReAct 循环（对齐源 solver.py:65-212）：
         next_step = planner.generate_next_step(...)          # 训练序列 #1、#2…  → _emit_turn
         ctx, sub_goal, tool = extract_context_subgoal_and_tool(next_step)
         cmd_query = executor.generate_tool_command(...)      # 固定引擎，不进 turns
-        result   = executor.execute_command(tool, cmd_query) # 工具执行，不进 turns
+        result   = executor.execute_command(tool, cmd_query) # 按 tool_name 真分发到工具，不进 turns
         memory.add_action(...)
         conclusion = verifier.verificate_context(...)        # 固定引擎，不进 turns
         if conclusion == "STOP": break
@@ -115,7 +115,8 @@ class Solver:
             if not tool_name:
                 tool_name = self.planner.available_tools[0] if self.planner.available_tools else ""
 
-            # executor 生成命令 + 执行工具（固定引擎，不进 turns；工具内部 coder 模型写代码→子进程）
+            # executor 生成命令 + 按 tool_name 真分发执行（固定引擎，不进 turns；
+            # python_coder→内部 coder 模型写代码→子进程 / base_generator→固定引擎直接答）
             cmd_query = await self.executor.generate_tool_command(question, context, sub_goal, tool_name)
             execution_result = await self.executor.execute_command(tool_name, cmd_query)
             memory.add_action(step_count, tool_name, sub_goal, cmd_query, execution_result)

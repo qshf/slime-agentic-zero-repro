@@ -9,6 +9,8 @@
   4. reward：离线 stub \\boxed{label} 命中 → reward=1.0；reward∈[0,1]。
   5. 闭环：agentflow 数据源+generate+reward 插进 train_ray 跑通，reward_mean/weight_version 正确。
   6. 零回归：靠 test_v0/v2/v3/v4/v5/a1（本脚本外单独跑）。
+  7. **executor 真分发（本版新增）**：execute_command 按 tool_name 分发到 python_coder / base_generator
+     两个不同工具（不是假参数固定走 coder），未知名回退不崩。
 
 用法:
   python scripts/test_a2_agentflow.py --offline   # 本地: stub 求解循环(不连 SGLang) + 闭环
@@ -30,6 +32,9 @@ from mini_slime import train_ray
 from toy_rl.agent.agentflow import data as af_data
 from toy_rl.agent.agentflow import rollout as af_rollout
 from toy_rl.agent.agentflow import stub_rollout as af_stub
+from toy_rl.agent.agentflow.executor import Executor
+from toy_rl.agent.agentflow.tools.base_generator import BaseGeneratorTool
+from toy_rl.agent.agentflow.tools.python_coder import PythonCoderTool
 
 
 def _offline_args() -> Args:
@@ -90,6 +95,41 @@ async def _one_sample(args: Args, generate) -> float:
     return r["reward"]
 
 
+def test_executor_dispatch(args: Args, offline: bool) -> None:
+    """新不变量：execute_command 按 tool_name **真分发**（不是假参数）。
+
+    构一个 Executor 挂两工具：python_coder（stub coder→subprocess print）+ base_generator（回声 chat_fn）。
+    断言不同 tool_name 走到不同工具、未知名回退第一个——证明 tool_name 真正决定分发。
+    """
+    async def coder_chat_fn(system_prompt: str, query: str) -> str:
+        return "```python\nprint(42)\n```"   # 真 subprocess 执行取 stdout=42
+
+    async def base_chat_fn(prompt_text: str) -> str:
+        return f"BASE_ANSWER: {prompt_text}"  # base_generator 直接回声固定引擎文本
+
+    coder = PythonCoderTool(coder_chat_fn)
+    base = BaseGeneratorTool(base_chat_fn)
+    toolbox = {t.tool_name: t for t in (coder, base)}
+    executor = Executor(base_chat_fn, toolbox)
+
+    async def _run() -> None:
+        # 1) python_coder → 内部 coder→subprocess，stdout=42
+        r_coder = await executor.execute_command("Python_Code_Generator_Tool", "compute anything")
+        assert r_coder == "42", f"python_coder 应真跑 subprocess 得 42，得 {r_coder!r}"
+        # 2) base_generator → 固定引擎直接答（无 subprocess），回声可辨
+        r_base = await executor.execute_command("Generalist_Solution_Generator_Tool", "hello")
+        assert r_base.startswith("BASE_ANSWER:") and "hello" in r_base, \
+            f"base_generator 应走 chat_fn 文本，得 {r_base!r}"
+        # 3) 两者真不同（分发确实按名字选了不同实例）
+        assert r_coder != r_base, "两工具返回相同——分发未按 tool_name 生效？"
+        # 4) 未知名回退到第一个注册工具（不崩）
+        r_unknown = await executor.execute_command("No_Such_Tool", "x")
+        assert isinstance(r_unknown, str), "未知工具名应回退且返回字符串（永不抛异常）"
+
+    asyncio.run(_run())
+    print("  executor_dispatch OK")
+
+
 def test_single_sample(args: Args, offline: bool) -> None:
     generate = af_stub.generate if offline else af_rollout.generate
     reward = asyncio.run(_one_sample(args, generate))
@@ -119,7 +159,7 @@ def main() -> int:
     args = _offline_args() if offline else _server_args()
 
     failed = 0
-    for t in (test_single_sample, test_closed_loop):
+    for t in (test_executor_dispatch, test_single_sample, test_closed_loop):
         try:
             t(args, offline)
         except AssertionError as e:

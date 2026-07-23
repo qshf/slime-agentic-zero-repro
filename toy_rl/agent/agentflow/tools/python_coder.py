@@ -28,6 +28,8 @@ import re
 import sys
 from typing import Awaitable, Callable
 
+from .base import BaseTool
+
 _EXEC_TIMEOUT = 30           # 秒（对齐源 _EXEC_TIMEOUT）
 _MAX_OUTPUT_LENGTH = 4000    # 对齐源 _MAX_OUTPUT_LENGTH
 _DANGEROUS_CALLS = ["exit", "quit", "sys.exit", "os._exit"]
@@ -99,7 +101,7 @@ async def _run_code_in_subprocess(code: str, timeout: int) -> str:
     return _truncate(output, _MAX_OUTPUT_LENGTH)
 
 
-class PythonCoderTool:
+class PythonCoderTool(BaseTool):
     """镜像源 Python_Coder_Tool：内部 coder LLM 写代码 → 子进程执行。永不抛异常（对齐源 execute）。"""
 
     tool_name = TOOL_NAME
