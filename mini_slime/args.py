@@ -92,6 +92,7 @@ class Args:
     #   设了才走 GRPO 组归一；留空（默认）时 RolloutManager 用内置 per-sample 转换（V0-A3 不受影响）。
     custom_convert_path: str = ""
     # 真训练超参（trainer.py 真 torch 一步读；对齐源 fsdp_utils/actor.py + ppo_utils.py）。
+    train_backend: str = "fake"   # "fake"=只统计（V0-A3/离线）; "torch"=真 forward/backward/optimizer（V6.3）
     train_model_path: str = "/home/ubuntu/models/Qwen/Qwen3-0.6B"  # 训练侧可训模型（单卡先用 0.6B）
     train_lr: float = 1e-6
     eps_clip: float = 0.2         # PPO clip 下界 1-eps_clip

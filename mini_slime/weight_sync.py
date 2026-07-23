@@ -8,29 +8,48 @@
 Trainer 训 / WeightUpdater 同步权重）在文件层面就清晰可见——这正是 V3 的教学目标。源项目里
 它也是独立的一层（actor 只是调用方）。
 
-偏离说明（详见 docs/decisions/v3.md 偏离表）：
-  - fake：无真训练器 → 无真权重张量，无真 RolloutManager 引擎句柄 → 无处广播。
-    V3 只 bump 版本号 + 记"第几次同步"，供主循环打点。
-  - 真 bucket-by-bucket 广播到 SGLang 留 **V6+**（需真训练 backend + 真引擎）。
+偏离说明（详见 docs/decisions/{v3,v6}.md 偏离表）：
+  - fake（V0-A3）：无真训练器 → 无真权重张量、无引擎句柄 → 无处广播。只 bump 版本号 + 计数。
+  - V6.3 torch：走 **disk reload** 最小路径——训练后 save_pretrained 落盘 → SGLang
+    /update_weights_from_disk 重载。源用 tensor/distributed bucket 广播（免落盘、更快），
+    nano 取 disk reload 是因为不接管 SGLang 进程内存、单机最简可用；tensor 广播留 V7 加固。
 """
 
 from __future__ import annotations
 
 
 class WeightUpdater:
-    """训练后权重 → 推理引擎的同步器。对齐源 actor.update_weights 委托的权重同步机制（fake）。"""
+    """训练后权重 → 推理引擎的同步器。对齐源 actor.update_weights 委托的权重同步机制。"""
 
-    def __init__(self) -> None:
+    def __init__(self, save_path: str | None = None, torch_actor=None) -> None:
         self.version = 0      # 当前推理引擎上的权重版本号（每同步一次 +1）
         self.num_syncs = 0    # 累计同步次数（供主循环打点/断言）
+        self.save_path = save_path      # V6.3 torch：落盘路径（None=fake，不落盘）
+        self.torch_actor = torch_actor  # V6.3 torch：持有可训模型，用于 save_pretrained
+        self.generate_url = None        # V6.3 torch：SGLang /update_weights_from_disk 端点（可选）
 
     def update_weights(self, state_dict=None) -> int:
         """把训练后权重推回推理引擎。
 
         源: 遍历权重 bucket，逐块广播到 SGLang engine（update_weights_from_distributed）。
-        V3 fake: 不接收/广播真张量（state_dict 恒为 None），只推进版本号并计数。
+        fake: 不接收/广播真张量，只推进版本号并计数。
+        torch（V6.3）: save_pretrained 落盘 → 若配了 generate_url 则触发 SGLang /update_weights_from_disk。
         返回新的权重版本号。
         """
+        if self.torch_actor is not None and self.save_path:
+            self.torch_actor.save_pretrained(self.save_path)
+            if self.generate_url:
+                self._reload_sglang()
         self.num_syncs += 1
         self.version += 1
         return self.version
+
+    def _reload_sglang(self) -> None:
+        """触发 SGLang 从磁盘热重载权重（对齐源"训练后引擎换新权重"语义的最小 disk 版）。"""
+        import requests
+
+        url = self.generate_url.replace("/generate", "/update_weights_from_disk")
+        try:
+            requests.post(url, json={"model_path": self.save_path}, timeout=120)
+        except Exception as exc:  # noqa: BLE001 — 同步失败不该炸整个训练循环，记录即可
+            print(f"[WeightUpdater] SGLang reload failed: {exc}")

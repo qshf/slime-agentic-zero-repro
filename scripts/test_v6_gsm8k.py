@@ -119,11 +119,74 @@ def test_grpo_closed_loop() -> None:
     print("  grpo_closed_loop OK")
 
 
+def _server_args() -> Args:
+    """服务器真训练配置：真 log_probs（/generate）+ GRPO + torch 训练一步。"""
+    return Args(
+        num_rollout=3,
+        batch_size=1,
+        n_samples_per_prompt=4,
+        gsm8k_num_train=4,
+        gsm8k_num_eval=10,
+        data_source_path="toy_rl.agent.toolorchestra.gsm8k_data.load_data_source",
+        custom_generate_function_path="toy_rl.agent.toolorchestra.rollout.generate",
+        custom_rm_path="toy_rl.agent.toolorchestra.rollout.reward_func",
+        custom_convert_path="mini_slime.custom_convert.custom_convert",
+        train_backend="torch",
+    )
+
+
+async def _eval_accuracy(args: Args) -> float:
+    """在 GSM8K test 子集上量 orchestrator 答对率（真实 rollout，held-out，不训练）。"""
+    from toy_rl.agent.toolorchestra import rollout
+
+    eval_samples = gsm8k_data.load_eval_source(args)
+    correct = 0
+    for sample in eval_samples:
+        done = await rollout.generate(args, sample)
+        feats = await rollout.reward_func(args, done)
+        correct += 1 if feats["correctness"] >= 0.5 else 0
+    return correct / len(eval_samples)
+
+
+def test_server_train_improves(args: Args) -> None:
+    """V6.3 核心断言：真训练后 GSM8K 答对率 > 未训练 base（RL 有效性最小证明）。
+
+    真 log_probs（/generate）→ 真 GRPO 组归一 → 真 torch 训练一步 → 真权重同步回 SGLang。
+    """
+    # 真 log_probs 契约：先验一条真实 rollout 的 token/loss_mask/log_probs 对齐。
+    sample = asyncio.run(_probe_real_logprobs(args))
+    print(f"  real_logprobs OK (tokens={len(sample.tokens)}, nonzero_lp={sample.metadata['_nonzero_lp']})")
+
+    acc_before = asyncio.run(_eval_accuracy(args))
+    train_ray.train(args)  # 真 torch 训练 num_rollout 轮 + 每轮权重同步回 SGLang
+    acc_after = asyncio.run(_eval_accuracy(args))
+    print(f"  acc_before={acc_before:.3f} acc_after={acc_after:.3f}")
+    assert acc_after > acc_before, f"训练后答对率应提升，得到 before={acc_before} after={acc_after}"
+    print("  server_train_improves OK")
+
+
+async def _probe_real_logprobs(args: Args):
+    from toy_rl.agent.toolorchestra import rollout
+
+    sample = await rollout.generate(args, gsm8k_data.load_data_source(args)[0])
+    assert len(sample.tokens) == len(sample.loss_mask) == len(sample.rollout_log_probs)
+    nonzero = sum(1 for lp in sample.rollout_log_probs if lp != 0.0)
+    assert nonzero > 0, "response 段必须有真实非 0 log_probs（来自 /generate）"
+    sample.metadata["_nonzero_lp"] = nonzero
+    return sample
+
+
 def main() -> int:
     offline = "--offline" in sys.argv
     if not offline:
-        print("  V6 服务器段（真 log_probs/真训练）尚未实现，仅 --offline 可跑")
-        return 0
+        failed = 0
+        try:
+            test_server_train_improves(_server_args())
+        except Exception as exc:
+            failed += 1
+            print(f"  FAIL test_server_train_improves: {type(exc).__name__}: {exc}")
+        ray.shutdown()
+        return failed
     args = _offline_args()
     failed = 0
     for test in (test_calculator, test_closed_loop):
