@@ -56,3 +56,16 @@ class Args:
     mem_max_chunks: int = 8      # 最多切几个 chunk（对齐源 MAX_CHUNKS）
     mem_max_memory: int = 512    # 记忆更新轮 max_tokens（对齐源 MAX_MEMORY_TOKENS）
     mem_max_final: int = 256     # 最终回答轮 max_tokens（对齐源 MAX_FINAL_TOKENS）
+
+    # --- A2 AgentFlow 专属字段（对齐源 agentic/agentflow/rollout.py 的 engine_map 双引擎）---
+    #     只在 data/generate/reward 路径指向 agentflow 时生效；calculator/memagent 路径不读这些。
+    #     A2 精华 = "executor token 不训练"：planner 走**训练引擎**（权重每轮更新、要优化的策略），
+    #     executor/verifier/final_output/rewarder 走**固定引擎**（不变权重的"环境"，对 loss 零贡献）。
+    #     偏离登记见 docs/decisions/a2.md：默认两字段同指 30001+4B（0.6B 跑 judge/final_output 太弱），
+    #     角色仍分两引擎（两 chat_fn）；服务器把 af_fixed_base_url 指 30000+0.6B 即成两真实引擎。
+    af_planner_base_url: str = "http://localhost:30001/v1"   # 训练引擎（planner 唯一策略）
+    af_planner_model: str = "Qwen/Qwen3.5-4B"
+    af_fixed_base_url: str = "http://localhost:30001/v1"     # 固定引擎（executor/verifier/final_output/rewarder）
+    af_fixed_model: str = "Qwen/Qwen3.5-4B"
+    af_max_steps: int = 3        # ReAct 最多步数（对齐源 Solver.max_steps，nano 砍到 3 够说清概念）
+    af_max_tokens: int = 512     # 每次 LLM 调用 max_tokens

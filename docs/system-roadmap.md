@@ -170,10 +170,10 @@
 - 简化：math 归一化只做主流程；char 级分 chunk、硬编码 mini QA（见 docs/decisions/a1.md 偏离表）。
 - 对应源项目：`agentic/memagent/rollout.py`（298 行，reward 内嵌 272-297）。
 
-**A2 AgentFlow**（工具边界精华课）
+**A2 AgentFlow**（工具边界精华课）✅ 本地离线过（single reward=1.0、闭环 reward_mean=1.0；服务器端到端待跑）
 - 上一版痛点：MemAgent loss_mask 全 1，教不了工具边界。
-- 引入：Planner→Executor→Verifier，executor token loss_mask=0；LLM-as-judge reward。
-- 简化：引擎数可从 3-5 降到能说清概念的最小数。
+- 引入：Planner→Executor→Verifier，**只有 planner 进 training turns**（executor/verifier/final_output 不训练）；LLM-as-judge reward 回退。
+- 简化：引擎数从源 3-5 降到**双引擎**（训练 planner / 固定其余）；单玩具工具 calculator；命令解析只留正则（见 docs/decisions/a2.md 偏离表）。
 - 对应源项目：`agentic/agentflow/core/{solver,planner,executor,verifier,rewarder}.py`。
 
 **A3 ToolOrchestra（仅 QA 路径）**（主线二承诺终点）

@@ -6,7 +6,7 @@
 
 - **项目**：从 0 复现一个最小 Agentic RL 训练系统，**在复现中学习** slime-agentic 的系统设计。
 - **源项目**：slime-agentic —— 基于 Ray + SGLang + Megatron/FSDP 的 Agentic RL 训练框架（58K LOC）。
-- **当前阶段**：主线一已打通（V0-V5 全验证）。**主线二进行中**：A1 MemAgent ✅ 完成（5090 端到端 single reward=1.0、闭环 reward_mean=0.5）。下一步 A2 AgentFlow。
+- **当前阶段**：主线一已打通（V0-V5 全验证）。**主线二进行中**：A1 MemAgent ✅ 完成（5090 端到端）。A2 AgentFlow ✅ 本地离线过（single reward=1.0、闭环 reward_mean=1.0；服务器端到端待跑）。下一步 A3 ToolOrchestra。
 
 > **铁律（每版必须遵守）**：**代码范式遵从原项目**。nano 的代码结构 / 接口签名 / 命名 / 数据流必须对齐 slime-agentic 源项目在对应位置的写法。**只允许在其基础上做得更清晰（更好），不允许比源项目更乱、更 hack、更偏离（更差）**。判断法：写任一段前先问"源项目对应位置怎么做的"，对齐它；要偏离只能朝"更清晰且语义等价"的方向，并在注释里写明为何偏离。反例（已修）：把 agent loop 抄成两份塞进 generate() 里——源项目 rollout.py 是薄适配器，loop 在 solver.py。
 >
@@ -18,7 +18,7 @@
 
 - **源项目**：`/Users/qshf/my-project/slime-agentic`（github: LMIS-ORG/slime-agentic，分支 main。只读，用于对照）
 - **nano 项目**：`/Users/qshf/my-project/slime-agentic-zero-repro`（git 已 init，主分支 main）
-- **当前活跃分支**：`v4`
+- **当前活跃分支**：`a2`
 - **分支准则（每版必须遵守）**：**每个版本切一个 `vN` 分支，从上一版分支的末端切出；当版的全部提交——实施计划 doc + 代码实现 + 验证结果——都落在 `vN` 上，绝不提交到别的版本分支**。判断法：提交前先 `git branch --show-current`，确认在当版分支。反例（已修）：V4 的计划/实现/调试提交错落在 `v3` 分支上——已把 `v3` 回退到其最后一个 V3 提交、V4 全部收进 `v4` 分支。
 - **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/slime-agentic-zero-repro`，git 管理）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
 - **服务器 git 恢复准则（每版必须遵守）**：服务器 checkout 是 **git 管理**的（当前目录 `/home/ubuntu/slime-agentic-zero-repro`，旧的 `zj` 已弃用）。**当服务器所在版本与要跑的版本不匹配时，用 git 从远程仓库恢复到目标版本**（`git fetch origin && git reset --hard origin/<vN>`），**绝不用 rsync 往 git 工作树上盖**——rsync 会把本地其它版本的文件混进 checkout（tracked 被改、v4 文件混进 v3），污染分支状态。反例（已修）：本次调试把本地 v4 工作树 rsync 盖到服务器 v3 checkout，事后 `git restore` + `git clean` 才复原成干净 v3。**已落地（2026-07-22）**：服务器已配 github SSH key（`~/.ssh/id_ed25519`，公钥已加到 github）、remote 已换 SSH，`git fetch origin && git reset --hard origin/<vN>` 实测可用（HTTPS 443 仍超时，故必须走 SSH）。
@@ -44,7 +44,7 @@
 | 版本 | 标题 | 关键学点 | 状态 |
 |------|------|---------|------|
 | A1 | MemAgent | 单引擎/无工具/loss_mask 全 1 | ✅ 完成（5090 端到端 single reward=1.0、闭环 reward_mean=0.5；离线 4/4）|
-| A2 | AgentFlow | executor token 不训练（工具边界精华）| 计划中 |
+| A2 | AgentFlow | executor token 不训练（工具边界精华）| ✅ 本地离线过（single reward=1.0、闭环 reward_mean=1.0；服务器端到端待跑）|
 | A3 | ToolOrchestra（仅 QA 路径）| 多专家路由 + 多组件 reward | 计划中（**主线二终点**）|
 
 **主线三 · 分布式后端**（记录设计，后续复现）：V6 SGLang / V7 FSDP / V8 Megatron / V9 吞吐实验。
@@ -131,6 +131,14 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - 验证：`scripts/test_a1_memagent.py --offline` **PASSED**——3 chunk→4 turn、loss_mask 全 1（trainable=167=各轮 response 之和）、`\boxed{Lyonar}`→reward=1.0、闭环 reward_mean=1.0。V0/V2/V3/V4/V5 回归全绿（data_source 改造对 calculator 透明）。**5090 端到端 PASSED**：single_sample reward=1.0（真答出 `\boxed{Lyonar}`）、闭环 reward_mean=0.5（4B 两条 QA 答对一条，真实模型行为）。
 - **服务器踩坑（已修）**：Qwen3.5-4B 混合推理默认吐 `<think>`，把 token 预算耗尽、对着模板 meta-rambling → reward=0（tokens 11376、gen 274s）。修：`enable_thinking=False` + `_strip_think`（源用微调模型无此问题，nano 接现成模型显式关思考）。修后 tokens→2629、gen→32s、reward=1.0。
 - **偏离**：char 级分 chunk（无真 tokenizer）、假 token 无真 log_probs、硬编码 mini QA、reward 归一化取最简、reward 不做 turn 均摊、data_source 返回 Sample 列表——均见 a1.md 偏离表。**暴露痛点**：loss_mask 全 1 教不了工具边界 → A2 AgentFlow。
+
+### A2 AgentFlow（2026-07-23）详见 docs/decisions/a2.md
+- 主线二第二个真实 agent。建 `toy_rl/agent/agentflow/{memory,planner,executor,verifier,rewarder,solver,rollout,data,stub_rollout}.py`：镜像源 `agentic/agentflow/` 的 Planner→Executor→Verifier ReAct 循环（plan → for step(next_step→executor→verifier→STOP?) → final_output）。
+- **A2 教学核心 = "executor token 不训练"**：`solver.py` 里**只有 planner 的 `plan()`/`generate_next_step()` 被 `_emit_turn`（loss_mask=1）**，executor/verifier/final_output 的生成完全不进 turns（进 `sample.response` 供日志/reward 但不进 `sample.tokens`）。系统层落地 = **双引擎**：planner 走训练引擎（策略）、executor/verifier/final_output/judge 走固定引擎（不变权重的"环境"）。这与 A1 的 loss_mask 全 1 形成"工具边界"对照。
+- **reward 新增 LLM-as-judge 回退**：boxed 精确匹配（命中 1.0）→ miss 回退 `Rewarder`（固定引擎判 `VERDICT: True/False`）。对齐源 rollout.py:209 + rewarder.py。
+- **范式对齐落定**：源 agentflow 有独立 solver（区别于 memagent 循环在 generate 里），故 A2 忠实把 loop 放 `solver.py`、rollout.py 只做薄适配（造双引擎 chat_fn + 回填 sample + reward）。boxed/is_equiv/strip_think 复用 A1 memagent.rollout（不重复造）。
+- **偏离**：固定引擎默认与训练引擎同端点（0.6B 跑 judge/final_output 太弱，角色仍分两 chat_fn，服务器指 30000 即成两真实引擎）、单玩具工具 calculator（砍 base_generator/python_coder 子进程）、命令解析只留正则、Solver 收 chat_fn 而非 engine_map、formatters 折进 solver、字符级假 token、硬编码算术 QA——均见 a2.md 偏离表。
+- 验证：`scripts/test_a2_agentflow.py --offline` **PASSED**——turns=2（1 plan+1 next_step）、每轮 loss_mask 全 1、`sum(loss_mask)==sum(response_length)`（executor/verifier/final_output 对可训练 token 零贡献）、turns 全为 kind=="planner"、`\boxed{888}`→reward=1.0、闭环 reward_mean=1.0、weight_v→2。V0/V2/V3/V4/V5/A1 回归全绿（A2 只新增文件 + 加 Args 字段）。**5090 端到端待跑**。**暴露痛点**：单 reward + 固定单工具路由 → A3 ToolOrchestra（多专家路由 + 多组件 reward）。
 
 ## 7. 待办 / 已知问题
 
