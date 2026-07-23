@@ -66,6 +66,8 @@ def train(args: Args) -> list[dict]:
             "tokens_per_rollout": sum(rollout_data["response_lengths"]),
             "weight_version": actor_model.weight_version(),
         }
+        if "loss" in m:  # V6.3 torch 后端：透传真训练 loss（fake 后端无此键）
+            metrics["loss"] = m["loss"]
         metrics_log.append(metrics)
         print(
             f"[rollout {rollout_id}] "
