@@ -70,27 +70,43 @@ def _metadata() -> dict:
     }
 
 
-def _load_split(split: str, n: int) -> list[Sample]:
+def _load_rows(split: str, n: int, local_dir: str):
+    """加载 GSM8K 某 split 的前 N 行。
+
+    服务器连不上 HF（CLAUDE.md 已记）：优先读本地 parquet（local_dir/<split>-00000-of-00001.parquet）；
+    不存在时回退 datasets.load_dataset("openai/gsm8k")（本地开发有网）。返回 [{question, answer}, ...]。
+    """
+    import os
+
+    parquet_path = os.path.join(local_dir, f"{split}-00000-of-00001.parquet")
+    if os.path.isfile(parquet_path):
+        import pandas as pd
+
+        frame = pd.read_parquet(parquet_path).head(n)
+        return frame.to_dict("records")
+
     from datasets import load_dataset
 
     dataset = load_dataset("openai/gsm8k", "main", split=split)
-    samples: list[Sample] = []
-    for row in dataset.select(range(min(n, len(dataset)))):
-        samples.append(
-            Sample(
-                prompt=row["question"],
-                label=_extract_gold(row["answer"]),
-                metadata=_metadata(),
-            )
+    return [dataset[i] for i in range(min(n, len(dataset)))]
+
+
+def _load_split(split: str, n: int, local_dir: str) -> list[Sample]:
+    return [
+        Sample(
+            prompt=str(row["question"]),
+            label=_extract_gold(str(row["answer"])),
+            metadata=_metadata(),
         )
-    return samples
+        for row in _load_rows(split, n, local_dir)
+    ]
 
 
 def load_data_source(args) -> list[Sample]:
     """训练数据源：GSM8K train 前 N 条（对齐源 data_source_cls 的可切换加载）。"""
-    return _load_split("train", args.gsm8k_num_train)
+    return _load_split("train", args.gsm8k_num_train, args.gsm8k_local_dir)
 
 
 def load_eval_source(args) -> list[Sample]:
     """eval 数据源：GSM8K test 前 N 条，量 before/after 答对率（held-out，不参与训练）。"""
-    return _load_split("test", args.gsm8k_num_eval)
+    return _load_split("test", args.gsm8k_num_eval, args.gsm8k_local_dir)

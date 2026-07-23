@@ -85,6 +85,9 @@ class Args:
     #     需 calculator 工具才能稳定答对——满足"调工具才答对"+"base 有提升空间"。
     gsm8k_num_train: int = 8      # 离线/训练取前 N 条 train（避免每次拉全量 7473）
     gsm8k_num_eval: int = 20      # eval 取前 N 条 test，量 before/after 答对率
+    # 服务器连不上 HF（CLAUDE.md 已记 HF/github 不可达）：优先从本地 parquet 目录加载 GSM8K；
+    # 该目录不存在时回退 datasets.load_dataset("openai/gsm8k")（本地开发有网时走这条）。
+    gsm8k_local_dir: str = "/home/ubuntu/data/gsm8k"
     # GRPO 组归一：同题 n_samples_per_prompt 个 rollout → 组内 min-max + 标准化（对齐源 custom_convert）。
     n_samples_per_prompt: int = 4
     global_batch_size: int = 1    # custom_convert 裁剪到该倍数（对齐源；nano 单卡取 1）
