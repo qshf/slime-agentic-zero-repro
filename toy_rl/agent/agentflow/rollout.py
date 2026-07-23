@@ -1,20 +1,23 @@
 """A2: AgentFlow rollout —— 薄适配器，镜像源 agentic/agentflow/rollout.py。
 
 对齐源 rollout.py 的两个职责：
-  - `generate(args, sample)`：造**双引擎**两个真 SGLang chat_fn（训练引擎 planner / 固定引擎
-    executor+verifier+final_output）→ 组装 Solver → `solver.solve` → 回填 Sample。对齐源 rollout.py:104
-    的 engine_map（砍掉 python_coder 子进程 / base_generator 多工具 / 6-key 冗余映射）。
+  - `generate(args, sample)`：造**三模型**引擎（对齐源 engine_map，rollout.py:136-144）→ 组装 Solver →
+    `solver.solve` → 回填 Sample。三分：
+      · planner（plan/next_step）= 训练引擎（policy，权重每轮更新）—— **唯一训练目标**；
+      · executor/verifier/final_output = 固定 base 引擎（纯环境，不训练）；
+      · python_coder 内部 coder 模型 = **外部 DeepSeek API**（独立模型，纯环境，不训练）。
   - `reward_func(args, sample)`：boxed 精确匹配（命中给 1.0）→ miss 回退 `Rewarder`（固定引擎判官），
     对齐源 rollout.py:209/237-244。
 
 范式对齐（铁律）：agent loop 全在 solver.py（对齐源 rollout 是薄适配器、loop 在 core/solver.py），
-本文件只做"造引擎 + 回填 sample + reward"。boxed/is_equiv/strip_think **复用 A1 memagent.rollout**
-（同一套归一化，不重复造）。
+本文件只做"造引擎 + 回填 sample + reward"。boxed/is_equiv/strip_think **复用 A1 memagent.rollout**。
 
 偏离（详见 docs/decisions/a2.md 偏离表）：
-  - 双引擎默认同端点（30001+4B）：源 executor/verifier/final_output 走独立 30000。0.6B 跑
-    judge/final_output 太弱、reward 不稳；nano 保 reward 可用。**角色仍分两引擎**（两 chat_fn），
-    loss_mask 边界与端点无关；服务器把 af_fixed_base_url 指 30000 即成两真实引擎。
+  - **base 角色共享 planner 端点**：源 executor/verifier/final 用独立 base 引擎（30000），与 planner
+    policy 分开；nano 默认两字段同端点（0.6B 跑 judge/final 太弱），**角色仍分两 chat_fn**，loss_mask
+    边界与端点无关；服务器把 af_fixed_base_url 指 30000 即成两真实引擎。
+  - **coder = 外部 DeepSeek API**：源 coder 挂独立 SGLang（30001，coder_engine）；nano 不起第二个
+    SGLang，coder 是独立于 policy 的纯环境模型，用外部 API 当它最贴源三分。密钥走环境变量、离线用 stub。
   - 字符级假 token / 无真 log_probs（沿用 V1-V5/A1）。
 """
 
@@ -34,8 +37,12 @@ from toy_rl.agent.agentflow.executor import Executor
 from toy_rl.agent.agentflow.planner import Planner
 from toy_rl.agent.agentflow.rewarder import Rewarder
 from toy_rl.agent.agentflow.solver import Solver
+from toy_rl.agent.agentflow.tools.python_coder import (
+    PythonCoderTool,
+    TOOL_DESCRIPTION,
+    deepseek_coder_chat_fn,
+)
 from toy_rl.agent.agentflow.verifier import Verifier
-from toy_rl.agent.tools import CalculatorTool, ToolRegistry
 # 复用 A1 的 boxed/归一化/strip_think（同一套，不重复造）
 from toy_rl.agent.memagent.rollout import (
     _is_equiv,
@@ -46,11 +53,6 @@ from toy_rl.agent.memagent.rollout import (
 from toy_rl.sample import Sample
 
 ChatFn = Callable[[str], Awaitable[str]]
-
-
-def _make_registry() -> ToolRegistry:
-    """Executor 的唯一玩具工具：复用 V1 的 calculator（A2 数据是算术 QA，恰好能解）。"""
-    return ToolRegistry([CalculatorTool()])
 
 
 def _sglang_chat_fn(base_url: str, model: str, args: Args) -> ChatFn:
@@ -75,27 +77,31 @@ def _sglang_chat_fn(base_url: str, model: str, args: Args) -> ChatFn:
     return chat_fn
 
 
-def _build_solver(args: Args, planner_chat_fn: ChatFn, fixed_chat_fn: ChatFn) -> Solver:
-    """组装双引擎 Solver：planner→训练引擎，executor/verifier/final_output→固定引擎。
-
-    对齐源 rollout.py:136-144 的 engine_map（nano 双引擎版）。real / stub 都调它，只换两个 chat_fn。
+def _build_solver(args: Args, planner_chat_fn: ChatFn, fixed_chat_fn: ChatFn, coder_chat_fn) -> Solver:
+    """组装三模型 Solver：planner→训练引擎，executor/verifier/final_output→固定引擎，
+    python_coder 内部→独立 coder 模型。对齐源 rollout.py:136-144 的 engine_map（nano 三分版）。
+    real / stub 都调它，只换三个 chat_fn。
     """
-    registry = _make_registry()
-    planner = Planner(planner_chat_fn, registry.available_tools, registry.toolbox_metadata)
-    executor = Executor(fixed_chat_fn, registry)
-    verifier = Verifier(fixed_chat_fn, registry.available_tools, registry.toolbox_metadata)
+    coder_tool = PythonCoderTool(coder_chat_fn)
+    available_tools = [coder_tool.tool_name]
+    toolbox_metadata = {coder_tool.tool_name: {"description": TOOL_DESCRIPTION}}
+
+    planner = Planner(planner_chat_fn, available_tools, toolbox_metadata)
+    executor = Executor(fixed_chat_fn, coder_tool)
+    verifier = Verifier(fixed_chat_fn, available_tools, toolbox_metadata)
     return Solver(planner, executor, verifier, final_output_chat_fn=fixed_chat_fn, max_steps=args.af_max_steps)
 
 
 async def generate(args: Args, sample: Sample) -> Sample:
-    """薄适配器：造双引擎真 SGLang chat_fn → 组装 Solver → solve（对齐源 rollout.py:104）。"""
+    """薄适配器：造三模型 chat_fn → 组装 Solver → solve（对齐源 rollout.py:104）。"""
     if not isinstance(sample.metadata, dict):
         sample.metadata = {}
     sample.metadata["original_question"] = sample.prompt  # reward 用原问题（solver 不覆盖 prompt）
 
     planner_chat_fn = _sglang_chat_fn(args.af_planner_base_url, args.af_planner_model, args)
     fixed_chat_fn = _sglang_chat_fn(args.af_fixed_base_url, args.af_fixed_model, args)
-    solver = _build_solver(args, planner_chat_fn, fixed_chat_fn)
+    coder_chat_fn = deepseek_coder_chat_fn()   # 独立 coder 模型 = 外部 DeepSeek API
+    solver = _build_solver(args, planner_chat_fn, fixed_chat_fn, coder_chat_fn)
     return await solver.solve(args, sample)
 
 
@@ -115,7 +121,7 @@ async def reward_func(args: Args, sample: Sample) -> dict:
     if pred and label and _is_equiv(pred, label):
         score = 1.0
     else:
-        # 回退 LLM-as-judge：固定引擎判官（对齐源——用 30000 固定引擎、不用训练 planner，reward 稳定）
+        # 回退 LLM-as-judge：固定引擎判官（对齐源——用固定引擎、不用训练 planner，reward 稳定）
         fixed_chat_fn = _sglang_chat_fn(args.af_fixed_base_url, args.af_fixed_model, args)
         rewarder = Rewarder(fixed_chat_fn)
         score = await rewarder.compute_reward(question=question, model_response=final_output, groundtruth=label)

@@ -133,12 +133,12 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **偏离**：char 级分 chunk（无真 tokenizer）、假 token 无真 log_probs、硬编码 mini QA、reward 归一化取最简、reward 不做 turn 均摊、data_source 返回 Sample 列表——均见 a1.md 偏离表。**暴露痛点**：loss_mask 全 1 教不了工具边界 → A2 AgentFlow。
 
 ### A2 AgentFlow（2026-07-23）详见 docs/decisions/a2.md
-- 主线二第二个真实 agent。建 `toy_rl/agent/agentflow/{memory,planner,executor,verifier,rewarder,solver,rollout,data,stub_rollout}.py`：镜像源 `agentic/agentflow/` 的 Planner→Executor→Verifier ReAct 循环（plan → for step(next_step→executor→verifier→STOP?) → final_output）。
-- **A2 教学核心 = "executor token 不训练"**：`solver.py` 里**只有 planner 的 `plan()`/`generate_next_step()` 被 `_emit_turn`（loss_mask=1）**，executor/verifier/final_output 的生成完全不进 turns（进 `sample.response` 供日志/reward 但不进 `sample.tokens`）。系统层落地 = **双引擎**：planner 走训练引擎（策略）、executor/verifier/final_output/judge 走固定引擎（不变权重的"环境"）。这与 A1 的 loss_mask 全 1 形成"工具边界"对照。
-- **reward 新增 LLM-as-judge 回退**：boxed 精确匹配（命中 1.0）→ miss 回退 `Rewarder`（固定引擎判 `VERDICT: True/False`）。对齐源 rollout.py:209 + rewarder.py。
-- **范式对齐落定**：源 agentflow 有独立 solver（区别于 memagent 循环在 generate 里），故 A2 忠实把 loop 放 `solver.py`、rollout.py 只做薄适配（造双引擎 chat_fn + 回填 sample + reward）。boxed/is_equiv/strip_think 复用 A1 memagent.rollout（不重复造）。
-- **偏离**：固定引擎默认与训练引擎同端点（0.6B 跑 judge/final_output 太弱，角色仍分两 chat_fn，服务器指 30000 即成两真实引擎）、单玩具工具 calculator（砍 base_generator/python_coder 子进程）、命令解析只留正则、Solver 收 chat_fn 而非 engine_map、formatters 折进 solver、字符级假 token、硬编码算术 QA——均见 a2.md 偏离表。
-- 验证：`scripts/test_a2_agentflow.py --offline` **PASSED**——turns=2（1 plan+1 next_step）、每轮 loss_mask 全 1、`sum(loss_mask)==sum(response_length)`（executor/verifier/final_output 对可训练 token 零贡献）、turns 全为 kind=="planner"、`\boxed{888}`→reward=1.0、闭环 reward_mean=1.0、weight_v→2。V0/V2/V3/V4/V5/A1 回归全绿（A2 只新增文件 + 加 Args 字段）。**5090 端到端待跑**。**暴露痛点**：单 reward + 固定单工具路由 → A3 ToolOrchestra（多专家路由 + 多组件 reward）。
+- 主线二第二个真实 agent。建 `toy_rl/agent/agentflow/{memory,planner,executor,verifier,rewarder,solver,rollout,data,stub_rollout,tools/python_coder}.py`：镜像源 `agentic/agentflow/` 的 Planner→Executor→Verifier ReAct 循环（plan → for step(next_step→executor→verifier→STOP?) → final_output）。
+- **A2 教学核心 = "executor token 不训练"**：`solver.py` 里**只有 planner 的 `plan()`/`generate_next_step()` 被 `_emit_turn`（loss_mask=1）**，executor/verifier/final_output 的生成完全不进 turns（进 `sample.response` 供日志/reward 但不进 `sample.tokens`）。
+- **系统层落地 = 忠实源"三模型分工"**（engine_map，rollout.py:136-144）：①planner=训练引擎（policy，唯一训练目标）；②executor/verifier/final_output=固定 base 引擎（纯环境）；③**python_coder 内部 coder 模型=独立模型**（纯环境）。executor 出**自然语言**命令→python_coder 工具内部再调 coder 模型翻成 Python→subprocess 执行。写代码那次 LLM 调用不在 executor、不进 trajectory，故"规划"（训练）与"写代码"（不训练）解耦——不把两关注点耦合、不篡改训练目标（曾考虑砍掉 python_coder 内层 LLM 让 executor 直接产代码，**已否决**：违源可分离性）。nano coder 模型 = **外部 DeepSeek API**（密钥/base_url/model 走环境变量、不进 git；DeepSeek v4 是推理模型，只取 content 忽略 reasoning_content）。
+- **reward 新增 LLM-as-judge 回退**：boxed 精确匹配（命中 1.0）→ miss 回退 `Rewarder`（固定引擎判 `VERDICT: True/False`）。
+- **偏离**：base 角色共享 planner 端点（不单起 base 实例，三角色都不训练、语义无关）、coder=外部 DeepSeek API（不起第二个 SGLang，coder 是独立纯环境模型，外部 API 最贴源三分）、单工具 python_coder（砍 base_generator + importlib 目录扫描）、命令解析只留正则、Solver 收 chat_fn 而非 engine_map、字符级假 token、硬编码多步计算 QA——均见 a2.md 偏离表。
+- 验证：`scripts/test_a2_agentflow.py --offline` **PASSED**——turns=2、每轮 loss_mask 全 1、`sum(loss_mask)==sum(response_length)`（executor/verifier/final/coder 对可训练 token 零贡献）、turns 全为 kind=="planner"、python_coder **真跑 subprocess**（stub coder `print(165)`→stdout 165 进 response）、`\boxed{165}`→reward=1.0、闭环 reward_mean=1.0、weight_v→2。真 DeepSeek 单独验证过（NL→Python→165）。V0/V2/V3/V4/V5/A1 回归全绿。**5090 端到端待跑**（需 `DEEPSEEK_API_KEY` + 服务器能出网到 api.deepseek.com）。**暴露痛点**：单 reward + 固定单工具路由 → A3 ToolOrchestra（多专家路由 + 多组件 reward）。
 
 ## 7. 待办 / 已知问题
 

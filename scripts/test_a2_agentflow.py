@@ -80,6 +80,9 @@ async def _one_sample(args: Args, generate) -> float:
     # 执行痕迹应在 response（供日志/reward）
     assert "[executor]" in sample.response and "[verifier]" in sample.response, \
         "response 里应有 executor/verifier 痕迹"
+    # python_coder 真跑 subprocess：执行结果（label 的 stdout）应出现在 response 里
+    label = str(sample.label)
+    assert label in sample.response, f"python_coder 执行结果 {label!r} 未出现在 response（子进程未真执行？）"
     # 4) reward
     r = await af_rollout.reward_func(args, sample)
     print(f"    final_output={sample.metadata['final_output']!r} pred={r['pred']!r} reward={r['reward']}")

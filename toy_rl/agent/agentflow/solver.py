@@ -115,9 +115,9 @@ class Solver:
             if not tool_name:
                 tool_name = self.planner.available_tools[0] if self.planner.available_tools else ""
 
-            # executor 生成命令 + 执行工具（固定引擎，不进 turns）
+            # executor 生成命令 + 执行工具（固定引擎，不进 turns；工具内部 coder 模型写代码→子进程）
             cmd_query = await self.executor.generate_tool_command(question, context, sub_goal, tool_name)
-            execution_result = self.executor.execute_command(tool_name, cmd_query)
+            execution_result = await self.executor.execute_command(tool_name, cmd_query)
             memory.add_action(step_count, tool_name, sub_goal, cmd_query, execution_result)
             response_text += (
                 f"\n===== [executor] tool={tool_name} query={cmd_query!r} =====\n{execution_result}"
