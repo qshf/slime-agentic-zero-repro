@@ -6,7 +6,7 @@
 
 - **项目**：从 0 复现一个最小 Agentic RL 训练系统，**在复现中学习** slime-agentic 的系统设计。
 - **源项目**：slime-agentic —— 基于 Ray + SGLang + Megatron/FSDP 的 Agentic RL 训练框架（58K LOC）。
-- **当前阶段**：主线一已打通（V0-V5 全验证）。**主线二进行中**：A1 MemAgent ✅ 完成（5090 端到端）。A2 AgentFlow ✅ 本地离线过（single reward=1.0、闭环 reward_mean=1.0；服务器端到端待跑）。下一步 A3 ToolOrchestra。
+- **当前阶段**：主线一已打通（V0-V5 全验证）。**主线二进行中**：A1 MemAgent ✅ 完成（5090 端到端）。A2 AgentFlow ✅ 完成（5090 端到端 single reward=1.0、闭环 reward_mean=1.0；真 4B planner + 真 DeepSeek coder）。下一步 A3 ToolOrchestra。
 
 > **铁律（每版必须遵守）**：**代码范式遵从原项目**。nano 的代码结构 / 接口签名 / 命名 / 数据流必须对齐 slime-agentic 源项目在对应位置的写法。**只允许在其基础上做得更清晰（更好），不允许比源项目更乱、更 hack、更偏离（更差）**。判断法：写任一段前先问"源项目对应位置怎么做的"，对齐它；要偏离只能朝"更清晰且语义等价"的方向，并在注释里写明为何偏离。反例（已修）：把 agent loop 抄成两份塞进 generate() 里——源项目 rollout.py 是薄适配器，loop 在 solver.py。
 >
@@ -44,7 +44,7 @@
 | 版本 | 标题 | 关键学点 | 状态 |
 |------|------|---------|------|
 | A1 | MemAgent | 单引擎/无工具/loss_mask 全 1 | ✅ 完成（5090 端到端 single reward=1.0、闭环 reward_mean=0.5；离线 4/4）|
-| A2 | AgentFlow | executor token 不训练（工具边界精华）| ✅ 本地离线过（single reward=1.0、闭环 reward_mean=1.0；服务器端到端待跑）|
+| A2 | AgentFlow | executor token 不训练（工具边界精华）| ✅ 完成（5090 端到端 reward=1.0、闭环 reward_mean=1.0；真 4B planner + 真 DeepSeek coder）|
 | A3 | ToolOrchestra（仅 QA 路径）| 多专家路由 + 多组件 reward | 计划中（**主线二终点**）|
 
 **主线三 · 分布式后端**（记录设计，后续复现）：V6 SGLang / V7 FSDP / V8 Megatron / V9 吞吐实验。
@@ -138,7 +138,7 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **系统层落地 = 忠实源"三模型分工"**（engine_map，rollout.py:136-144）：①planner=训练引擎（policy，唯一训练目标）；②executor/verifier/final_output=固定 base 引擎（纯环境）；③**python_coder 内部 coder 模型=独立模型**（纯环境）。executor 出**自然语言**命令→python_coder 工具内部再调 coder 模型翻成 Python→subprocess 执行。写代码那次 LLM 调用不在 executor、不进 trajectory，故"规划"（训练）与"写代码"（不训练）解耦——不把两关注点耦合、不篡改训练目标（曾考虑砍掉 python_coder 内层 LLM 让 executor 直接产代码，**已否决**：违源可分离性）。nano coder 模型 = **外部 DeepSeek API**（密钥/base_url/model 走环境变量、不进 git；DeepSeek v4 是推理模型，只取 content 忽略 reasoning_content）。
 - **reward 新增 LLM-as-judge 回退**：boxed 精确匹配（命中 1.0）→ miss 回退 `Rewarder`（固定引擎判 `VERDICT: True/False`）。
 - **偏离**：base 角色共享 planner 端点（不单起 base 实例，三角色都不训练、语义无关）、coder=外部 DeepSeek API（不起第二个 SGLang，coder 是独立纯环境模型，外部 API 最贴源三分）、单工具 python_coder（砍 base_generator + importlib 目录扫描）、命令解析只留正则、Solver 收 chat_fn 而非 engine_map、字符级假 token、硬编码多步计算 QA——均见 a2.md 偏离表。
-- 验证：`scripts/test_a2_agentflow.py --offline` **PASSED**——turns=2、每轮 loss_mask 全 1、`sum(loss_mask)==sum(response_length)`（executor/verifier/final/coder 对可训练 token 零贡献）、turns 全为 kind=="planner"、python_coder **真跑 subprocess**（stub coder `print(165)`→stdout 165 进 response）、`\boxed{165}`→reward=1.0、闭环 reward_mean=1.0、weight_v→2。真 DeepSeek 单独验证过（NL→Python→165）。V0/V2/V3/V4/V5/A1 回归全绿。**5090 端到端待跑**（需 `DEEPSEEK_API_KEY` + 服务器能出网到 api.deepseek.com）。**暴露痛点**：单 reward + 固定单工具路由 → A3 ToolOrchestra（多专家路由 + 多组件 reward）。
+- 验证：`scripts/test_a2_agentflow.py --offline` **PASSED**——turns=2、每轮 loss_mask 全 1、`sum(loss_mask)==sum(response_length)`（executor/verifier/final/coder 对可训练 token 零贡献）、turns 全为 kind=="planner"、python_coder **真跑 subprocess**（stub coder `print(165)`→stdout 165 进 response）、`\boxed{165}`→reward=1.0、闭环 reward_mean=1.0、weight_v→2。V0/V2/V3/V4/V5/A1 回归全绿。**5090 端到端 PASSED**（服务器直连，非隧道）：真 4B planner 吐 Context/Sub-Goal/Tool Name → 真 DeepSeek coder 翻 NL→Python→subprocess→`\boxed{165}`、reward=1.0、trainable=3018=各 planner turn 之和、闭环 reward_mean=1.0、gen=292s。**踩坑修正**：早先误记"5090 DNS 解析不了 DeepSeek 需 SSH 隧道"——**实际服务器可直连**（curl 返 401=能连只缺 key、DNS 正常），直接服务器侧跑通。**暴露痛点**：单 reward + 固定单工具路由 → A3 ToolOrchestra（多专家路由 + 多组件 reward）。
 
 ## 7. 待办 / 已知问题
 
