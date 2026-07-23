@@ -6,7 +6,7 @@
 
 - **项目**：从 0 复现一个最小 Agentic RL 训练系统，**在复现中学习** slime-agentic 的系统设计。
 - **源项目**：slime-agentic —— 基于 Ray + SGLang + Megatron/FSDP 的 Agentic RL 训练框架（58K LOC）。
-- **当前阶段**：主线一已打通（V0-V5 全验证）。主线二：A1 MemAgent ✅ 完成（5090 端到端）；A2 AgentFlow ✅ 完成（5090 端到端 single reward=1.0、闭环 reward_mean=1.0）；A3 ToolOrchestra QA ✅ 离线完成、待服务器端到端。
+- **当前阶段**：主线一已打通（V0-V5 全验证）。主线二：A1 MemAgent ✅ 完成（5090 端到端）；A2 AgentFlow ✅ 完成（5090 端到端 single reward=1.0、闭环 reward_mean=1.0）；A3 ToolOrchestra QA ✅ 完成（5090 端到端 turns=2、reward=0.880、真 4B search→answer 路由）。**主线二收官**。
 
 > **铁律（每版必须遵守）**：**代码范式遵从原项目**。nano 的代码结构 / 接口签名 / 命名 / 数据流必须对齐 slime-agentic 源项目在对应位置的写法。**只允许在其基础上做得更清晰（更好），不允许比源项目更乱、更 hack、更偏离（更差）**。判断法：写任一段前先问"源项目对应位置怎么做的"，对齐它；要偏离只能朝"更清晰且语义等价"的方向，并在注释里写明为何偏离。反例（已修）：把 agent loop 抄成两份塞进 generate() 里——源项目 rollout.py 是薄适配器，loop 在 solver.py。
 >
@@ -18,7 +18,7 @@
 
 - **源项目**：`/Users/qshf/my-project/slime-agentic`（github: LMIS-ORG/slime-agentic，分支 main。只读，用于对照）
 - **nano 项目**：`/Users/qshf/my-project/slime-agentic-zero-repro`（git 已 init，主分支 main）
-- **当前活跃分支**：`a2`
+- **当前活跃分支**：`a3`
 - **分支准则（每版必须遵守）**：**每个版本切一个 `vN` 分支，从上一版分支的末端切出；当版的全部提交——实施计划 doc + 代码实现 + 验证结果——都落在 `vN` 上，绝不提交到别的版本分支**。判断法：提交前先 `git branch --show-current`，确认在当版分支。反例（已修）：V4 的计划/实现/调试提交错落在 `v3` 分支上——已把 `v3` 回退到其最后一个 V3 提交、V4 全部收进 `v4` 分支。
 - **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/slime-agentic-zero-repro`，git 管理）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
 - **服务器 git 恢复准则（每版必须遵守）**：服务器 checkout 是 **git 管理**的（当前目录 `/home/ubuntu/slime-agentic-zero-repro`，旧的 `zj` 已弃用）。**当服务器所在版本与要跑的版本不匹配时，用 git 从远程仓库恢复到目标版本**（`git fetch origin && git reset --hard origin/<vN>`），**绝不用 rsync 往 git 工作树上盖**——rsync 会把本地其它版本的文件混进 checkout（tracked 被改、v4 文件混进 v3），污染分支状态。反例（已修）：本次调试把本地 v4 工作树 rsync 盖到服务器 v3 checkout，事后 `git restore` + `git clean` 才复原成干净 v3。**已落地（2026-07-22）**：服务器已配 github SSH key（`~/.ssh/id_ed25519`，公钥已加到 github）、remote 已换 SSH，`git fetch origin && git reset --hard origin/<vN>` 实测可用（HTTPS 443 仍超时，故必须走 SSH）。
@@ -45,7 +45,7 @@
 |------|------|---------|------|
 | A1 | MemAgent | 单引擎/无工具/loss_mask 全 1 | ✅ 完成（5090 端到端 single reward=1.0、闭环 reward_mean=0.5；离线 4/4）|
 | A2 | AgentFlow | executor token 不训练（工具边界精华）| ✅ 完成（5090 端到端 reward=1.0、闭环 reward_mean=1.0；真 4B planner + 真 DeepSeek coder）|
-| A3 | ToolOrchestra（仅 QA 路径）| 多专家路由 + 多组件 reward | ✅ 离线完成；服务器待验（**主线二终点**）|
+| A3 | ToolOrchestra（仅 QA 路径）| 多专家路由 + 多组件 reward | ✅ 完成（5090 端到端 turns=2、reward=0.880、真 4B search→answer(expert_fast)；离线 reward_mean=0.991）（**主线二终点**）|
 
 **主线三 · 分布式后端**（记录设计，后续复现）：V6 SGLang / V7 FSDP / V8 Megatron / V9 吞吐实验。
 
@@ -141,10 +141,12 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **分发修正（2026-07-23 收官后回补）**：初版 executor 只持单 coder_tool、`execute_command` 收了 `tool_name` 却从不使用（假分发）。已恢复**真分发**——`Executor` 收 `toolbox: dict[str,BaseTool]`、按 tool_name 查表选实例（未命中回退+warning，对齐源 `_resolve_tool_mapping`）；新增 `tools/{base,base_generator}.py`（base_generator=固定引擎直接答），与 python_coder 一起注册（对齐源 engine_map 两工具）。`generate_tool_command` **保留**（源保真 + "executor token 不训练"活教材；功能因两工具同 `execute(query=)` 签名而冗余，但注释改诚实，不暗示它承重）。新增 `test_executor_dispatch` 断言分发真按 tool_name 生效。详见 a2.md「分发修正」。
 - 验证：`scripts/test_a2_agentflow.py --offline` **PASSED**——turns=2、每轮 loss_mask 全 1、`sum(loss_mask)==sum(response_length)`（executor/verifier/final/coder 对可训练 token 零贡献）、turns 全为 kind=="planner"、python_coder **真跑 subprocess**（stub coder `print(165)`→stdout 165 进 response）、`\boxed{165}`→reward=1.0、闭环 reward_mean=1.0、weight_v→2。V0/V2/V3/V4/V5/A1 回归全绿。**5090 端到端 PASSED**（服务器直连，非隧道）：真 4B planner 吐 Context/Sub-Goal/Tool Name → 真 DeepSeek coder 翻 NL→Python→subprocess→`\boxed{165}`、reward=1.0、trainable=3018=各 planner turn 之和、闭环 reward_mean=1.0、gen=292s。**踩坑修正**：早先误记"5090 DNS 解析不了 DeepSeek 需 SSH 隧道"——**实际服务器可直连**（curl 返 401=能连只缺 key、DNS 正常），直接服务器侧跑通。**暴露痛点**：单 reward + 固定单工具路由 → A3 ToolOrchestra（多专家路由 + 多组件 reward）。
 
-### A3 ToolOrchestra（QA 路径，离线完成；服务器待验）
+### A3 ToolOrchestra（QA 路径，2026-07-23）详见 docs/decisions/a3.md
 - 建 `toy_rl/agent/toolorchestra/{data,prompt,solver,rollout,stub_rollout}.py`：采用源 QA 分支的 `messages -> assistant tool call -> role=tool observation -> messages` 循环；只有 orchestrator 输出进入 turns，search/expert 结果只进后续 prompt。
 - 两个逻辑专家按 sample metadata 的模型映射、价格与偏好向量路由；reward 同时计算正确性、专家成本、延迟、角色偏好。因 mini hook 是 per-sample，未复刻源 custom_convert 的同题多 rollout min-max/GRPO，改为单样本确定性 utility，偏离记在 `docs/decisions/a3.md`。
 - 验证：`scripts/test_a3_toolorchestra.py --offline` **PASSED**——search→answer 的 tool message 进入第二轮 prompt、loss_mask 仅覆盖 orchestrator、expert 失败后 error message 触发改选专家、多组件 reward 与 `train_ray` 闭环通过（reward_mean=0.991）。
+- **5090 端到端 PASSED**（真 4B orchestrator @30001）：`turns=2 events=2 reward=0.880`。真实轨迹——orchestrator 第一轮自主选 `search`（拿证据）→ 第二轮 `answer` 路由 `expert_fast` → 专家算出 `\boxed{165}`。契约全绿（turns 全 orchestrator、`len(tokens)==len(loss_mask)`、`sum(loss_mask)==sum(response_length)`、reward∈[0,1]）。多组件 reward 生效：correctness=1.0、total_cost=0.000656、total_latency≈10.4s、tool_counts={expert_fast:1} → 加权 reward=0.880（**非满分正是成本/延迟组件起作用**，这是 A3 相对 A2 单 reward 的核心增量）。**主线二收官。**
+- **收官前小修**（本次评估回补）：补齐 a3.md「偏离登记（按铁律三要素）」表（8 条，最大偏离=单样本预算归一 vs 源组内 GRPO min-max，留主线三）；删 solver.py 未使用的 `import asyncio`。
 
 ## 7. 待办 / 已知问题
 
