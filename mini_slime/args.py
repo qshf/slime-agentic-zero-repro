@@ -79,3 +79,22 @@ class Args:
     orchestra_expert_model: str = "Qwen/Qwen3.5-4B"
     orchestra_max_steps: int = 4
     orchestra_max_tokens: int = 512
+
+    # --- V6 GSM8K 真训练专属字段（主线三：真 log_probs + 真 GRPO + 真 torch 训练一步）---
+    #     GSM8K 小学数学应用题（答案以 "#### 数字" 结尾，可严格验证）；4B 裸答多步算术会错，
+    #     需 calculator 工具才能稳定答对——满足"调工具才答对"+"base 有提升空间"。
+    gsm8k_num_train: int = 8      # 离线/训练取前 N 条 train（避免每次拉全量 7473）
+    gsm8k_num_eval: int = 20      # eval 取前 N 条 test，量 before/after 答对率
+    # GRPO 组归一：同题 n_samples_per_prompt 个 rollout → 组内 min-max + 标准化（对齐源 custom_convert）。
+    n_samples_per_prompt: int = 4
+    global_batch_size: int = 1    # custom_convert 裁剪到该倍数（对齐源；nano 单卡取 1）
+    # 真训练超参（trainer.py 真 torch 一步读；对齐源 fsdp_utils/actor.py + ppo_utils.py）。
+    train_model_path: str = "/home/ubuntu/models/Qwen/Qwen3-0.6B"  # 训练侧可训模型（单卡先用 0.6B）
+    train_lr: float = 1e-6
+    eps_clip: float = 0.2         # PPO clip 下界 1-eps_clip
+    eps_clip_high: float = 0.2    # PPO clip 上界 1+eps_clip_high（对齐源 compute_policy_loss）
+    clip_grad: float = 1.0        # grad norm 裁剪（对齐源 clip_grad_norm_）
+    rollout_temperature: float = 1.0  # 训练侧重算 log_prob 的温度（须与 rollout 采样温度一致）
+    # SGLang 原生 /generate 端点（真 token_ids + log_probs，替换 A3 chat 端点）。
+    sglang_generate_url: str = "http://localhost:30001/generate"
+    weight_save_path: str = "/home/ubuntu/models/nano_v6_ckpt"  # 权重同步走 disk reload 的落盘路径

@@ -8,11 +8,16 @@ import time
 from typing import Any, Awaitable, Callable
 
 from mini_slime.args import Args
+from toy_rl.agent.tools import CalculatorTool
 from toy_rl.sample import Sample
 
 from .prompt import append_tool_result, initial_messages, render_orchestrator_prompt
 
 ChatFn = Callable[[str], Awaitable[str]]
+
+# V6 确定性 calculator 工具（V1 已建，execute(expression)->str，正则守卫后 eval）。
+# 模块级单例：无状态、纯函数式求值，solver 各样本共享。
+_CALCULATOR = CalculatorTool()
 
 
 def _tokenize(text: str, vocab: dict[str, int]) -> list[int]:
@@ -148,6 +153,16 @@ class OrchestraSolver:
             query = str(tool_args.get("query", question))
             output = str(metadata.get("search_context", "No evidence was supplied for this task."))
             return self._event("search", "", {"query": query}, output, "", _estimate_tokens(query), _estimate_tokens(output), 0.0), False
+
+        if tool_name == "calculator":
+            # V6 确定性工具（非 LLM）：真求值 orchestrator 给的表达式，结果回灌下一轮 prompt。
+            # 对齐源 SearchRetrievalTool 的"非终止工具、结果作为 tool observation 回流"结构语义。
+            expression = str(tool_args.get("expression", ""))
+            output = _CALCULATOR.execute(expression)
+            return self._event(
+                "calculator", "", {"expression": expression}, output, "",
+                _estimate_tokens(expression), _estimate_tokens(output), 0.0,
+            ), False
 
         if tool_name != "answer":
             return self._event(tool_name, "", tool_args, "", f"unknown tool: {tool_name}", 0, 0, 0.0), False

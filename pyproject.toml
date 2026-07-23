@@ -7,12 +7,21 @@ dependencies = [
     "openai>=1.0",         # V1: 调 SGLang 的 OpenAI 兼容接口
     "ray>=2.5",            # V4: actor 拆进程 + ray.get 同步点
     "python-dotenv>=1.0",  # A2: 从 .env 加载 DEEPSEEK_API_KEY 等(密钥不进 git)
+    "datasets>=2.14",      # V6: 加载 GSM8K 数据集（主线三真训练）
 ]
 
 # 各版本按需追加依赖:
 #   V1 起: openai(调 SGLang); SGLang 本身用 docker 部署在服务器 5090
 #   V4 起: ray
 #   A2 起: python-dotenv(读 .env 里的 coder 模型密钥)
+#   V6 起: datasets(GSM8K); 训练侧 torch/transformers 见 [project.optional-dependencies].train
+#          （只在服务器 V6.3 真训练需要，本地离线验证不装，避免拖慢环境）
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.1",          # V6.3: 真 torch 训练一步（forward/backward/optimizer）
+    "transformers>=4.40",  # V6.1: AutoTokenizer(apply_chat_template) + V6.3 加载可训模型
+]
 
 [tool.uv]
 package = false
