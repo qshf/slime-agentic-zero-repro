@@ -11,6 +11,8 @@ GPU、SGLang 在独立 docker 里不归 ray 调度）。详见 docs/decisions/v4
 
 from __future__ import annotations
 
+import site
+import sys
 from pathlib import Path
 
 import ray
@@ -21,7 +23,11 @@ from mini_slime.rollout_manager import RolloutManager
 
 # 项目根：让 ray worker 进程能 import mini_slime / toy_rl（worker 不继承 driver 运行时的
 # sys.path.insert，故通过 runtime_env 的 PYTHONPATH 显式传入——单机本地 ray，文件走文件系统）。
+# V6.3：还要带上 driver 的 site-packages（venv），否则 ray worker 只有项目根、import 不到
+# torch/transformers（V6.3 torch 训练在 worker actor 里跑）。用 driver 现有 sys.path 拼进去。
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+_SITE_PACKAGES = [p for p in (site.getsitepackages() if hasattr(site, "getsitepackages") else []) + sys.path if "site-packages" in p]
+_WORKER_PYTHONPATH = ":".join([_PROJECT_ROOT, *dict.fromkeys(_SITE_PACKAGES)])
 
 
 def create_placement_groups(args: Args) -> dict:
@@ -36,7 +42,7 @@ def create_placement_groups(args: Args) -> dict:
             num_gpus=0,
             ignore_reinit_error=True,
             log_to_driver=False,  # 压掉 worker 日志刷屏，测试输出更干净
-            runtime_env={"env_vars": {"PYTHONPATH": _PROJECT_ROOT}},
+            runtime_env={"env_vars": {"PYTHONPATH": _WORKER_PYTHONPATH}},
         )
     # 占位：nano 无 GPU bundle。源这里是 {"actor": (pg, idx, gpu_ids), "rollout": (...)}。
     return {"actor": None, "rollout": None}
