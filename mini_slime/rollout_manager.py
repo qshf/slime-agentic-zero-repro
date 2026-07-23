@@ -42,6 +42,11 @@ class RolloutManager:
         self.data_source = load_function(args.data_source_path)(args)  # -> list[Sample]
         self.generate_rollout = load_function(args.custom_generate_function_path)
         self.reward_func = load_function(args.custom_rm_path)
+        # V6.2 opt-in（对齐源 --custom-convert-samples-to-train-data-path）：设了则用 GRPO 组归一转换，
+        # 否则用内置 per-sample 转换（V0-A3 路径 custom_convert_path 为空，行为不变）。
+        self.custom_convert = (
+            load_function(args.custom_convert_path) if getattr(args, "custom_convert_path", "") else None
+        )
 
     def _next_batch(self, rollout_id: int) -> list[Sample]:
         """按 rollout_id 从 data_source 滚动取一个 batch（对齐源按 rollout_batch_size 取窗口）。
@@ -49,10 +54,15 @@ class RolloutManager:
         源用全局 dataset 指针；V3 用 (rollout_id * batch_size) 起点 + 取模环绕，
         保证每轮都能取满 batch_size 条（题库小于 num_rollout*batch_size 时循环复用）。
         返回**深拷贝**：generate hook 会就地回填 Sample，拷贝避免污染 data_source 供下一轮复用。
+
+        V6.2 GRPO：走 custom_convert 时，每条 prompt 复制 n_samples_per_prompt 份连续排列
+        （对齐源"同题多 rollout 连续成组"），供组内归一比较。
         """
         n = self.args.batch_size
         start = (rollout_id * n) % len(self.data_source)
-        return [copy.deepcopy(self.data_source[(start + i) % len(self.data_source)]) for i in range(n)]
+        base = [self.data_source[(start + i) % len(self.data_source)] for i in range(n)]
+        group = self.args.n_samples_per_prompt if self.custom_convert else 1
+        return [copy.deepcopy(s) for s in base for _ in range(group)]
 
     async def generate(self, rollout_id: int) -> dict:
         """对齐源 rollout.py:539 def generate(rollout_id)：产出一批训练数据 dict。
@@ -66,6 +76,9 @@ class RolloutManager:
             s = await self.generate_rollout(self.args, s)              # 真 SGLang rollout（复用 V1/V2 loop）
             s.reward = (await self.reward_func(self.args, s))["reward"]  # per-sample reward hook
             samples.append(s)
+        # V6.2：设了 custom_convert 走 GRPO 组归一（同题多 rollout），否则内置 per-sample 转换。
+        if self.custom_convert is not None:
+            return self.custom_convert(self.args, samples)
         return self._convert_samples_to_train_data(samples)
 
     def _convert_samples_to_train_data(self, samples: list[Sample]) -> dict:

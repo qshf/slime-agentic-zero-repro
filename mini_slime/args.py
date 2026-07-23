@@ -88,6 +88,9 @@ class Args:
     # GRPO 组归一：同题 n_samples_per_prompt 个 rollout → 组内 min-max + 标准化（对齐源 custom_convert）。
     n_samples_per_prompt: int = 4
     global_batch_size: int = 1    # custom_convert 裁剪到该倍数（对齐源；nano 单卡取 1）
+    # custom_convert hook 路径（对齐源 --custom-convert-samples-to-train-data-path）：
+    #   设了才走 GRPO 组归一；留空（默认）时 RolloutManager 用内置 per-sample 转换（V0-A3 不受影响）。
+    custom_convert_path: str = ""
     # 真训练超参（trainer.py 真 torch 一步读；对齐源 fsdp_utils/actor.py + ppo_utils.py）。
     train_model_path: str = "/home/ubuntu/models/Qwen/Qwen3-0.6B"  # 训练侧可训模型（单卡先用 0.6B）
     train_lr: float = 1e-6
