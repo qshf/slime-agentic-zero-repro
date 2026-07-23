@@ -120,13 +120,25 @@ def test_grpo_closed_loop() -> None:
 
 
 def _server_args() -> Args:
-    """服务器真训练配置：真 log_probs（/generate）+ GRPO + torch 训练一步。"""
+    """服务器真训练配置：真 log_probs（/generate）+ GRPO + torch 训练一步。
+
+    关键一致性：rollout 采样模型 == 训练重算 log_prob 的模型（否则 importance ratio 无意义）。
+    故 orchestrator/expert 与 train_model_path 统一用 0.6B（30000）——按计划风控条款回退 0.6B，
+    单卡训练轻量、且 0.6B 裸答 GSM8K 弱 → 给足'训练后>base'的提升空间。
+    """
     return Args(
         num_rollout=3,
         batch_size=1,
         n_samples_per_prompt=4,
         gsm8k_num_train=4,
         gsm8k_num_eval=10,
+        # orchestrator + expert 都走 0.6B@30000（与训练模型一致）。
+        orchestra_orchestrator_base_url="http://localhost:30000/v1",
+        orchestra_orchestrator_model="Qwen/Qwen3-0.6B",
+        orchestra_expert_base_url="http://localhost:30000/v1",
+        orchestra_expert_model="Qwen/Qwen3-0.6B",
+        sglang_generate_url="http://localhost:30000/generate",
+        train_model_path="/home/ubuntu/models/Qwen/Qwen3-0.6B",
         data_source_path="toy_rl.agent.toolorchestra.gsm8k_data.load_data_source",
         custom_generate_function_path="toy_rl.agent.toolorchestra.rollout.generate",
         custom_rm_path="toy_rl.agent.toolorchestra.rollout.reward_func",
