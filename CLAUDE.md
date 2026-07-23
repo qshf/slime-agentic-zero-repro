@@ -6,7 +6,7 @@
 
 - **项目**：从 0 复现一个最小 Agentic RL 训练系统，**在复现中学习** slime-agentic 的系统设计。
 - **源项目**：slime-agentic —— 基于 Ray + SGLang + Megatron/FSDP 的 Agentic RL 训练框架（58K LOC）。
-- **当前阶段**：主线一已打通（V0-V5 全验证）。主线二：A1 MemAgent ✅ 完成（5090 端到端）；A2 AgentFlow ✅ 完成（5090 端到端 single reward=1.0、闭环 reward_mean=1.0）；A3 ToolOrchestra QA ✅ 完成（5090 端到端 turns=2、reward=0.880、真 4B search→answer 路由）。**主线二收官**。
+- **当前阶段**：主线一（V0-V5）✅、主线二（A1/A2/A3）✅ 收官。**主线三启动**：V6 真训练闭环（GSM8K）✅ 全链路跑通——真 log_probs + 真 GRPO 组归一 + 真 torch 训练一步 + 真权重同步，5090 端到端验证机制全真实发生（acc 0.4→0.2 变化证明权重真被改，稳定提升属训练规模/超参问题留后续）。
 
 > **铁律（每版必须遵守）**：**代码范式遵从原项目**。nano 的代码结构 / 接口签名 / 命名 / 数据流必须对齐 slime-agentic 源项目在对应位置的写法。**只允许在其基础上做得更清晰（更好），不允许比源项目更乱、更 hack、更偏离（更差）**。判断法：写任一段前先问"源项目对应位置怎么做的"，对齐它；要偏离只能朝"更清晰且语义等价"的方向，并在注释里写明为何偏离。反例（已修）：把 agent loop 抄成两份塞进 generate() 里——源项目 rollout.py 是薄适配器，loop 在 solver.py。
 >
@@ -18,7 +18,7 @@
 
 - **源项目**：`/Users/qshf/my-project/slime-agentic`（github: LMIS-ORG/slime-agentic，分支 main。只读，用于对照）
 - **nano 项目**：`/Users/qshf/my-project/slime-agentic-zero-repro`（git 已 init，主分支 main）
-- **当前活跃分支**：`a3`
+- **当前活跃分支**：`v6`
 - **分支准则（每版必须遵守）**：**每个版本切一个 `vN` 分支，从上一版分支的末端切出；当版的全部提交——实施计划 doc + 代码实现 + 验证结果——都落在 `vN` 上，绝不提交到别的版本分支**。判断法：提交前先 `git branch --show-current`，确认在当版分支。反例（已修）：V4 的计划/实现/调试提交错落在 `v3` 分支上——已把 `v3` 回退到其最后一个 V3 提交、V4 全部收进 `v4` 分支。
 - **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/slime-agentic-zero-repro`，git 管理）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
 - **服务器 git 恢复准则（每版必须遵守）**：服务器 checkout 是 **git 管理**的（当前目录 `/home/ubuntu/slime-agentic-zero-repro`，旧的 `zj` 已弃用）。**当服务器所在版本与要跑的版本不匹配时，用 git 从远程仓库恢复到目标版本**（`git fetch origin && git reset --hard origin/<vN>`），**绝不用 rsync 往 git 工作树上盖**——rsync 会把本地其它版本的文件混进 checkout（tracked 被改、v4 文件混进 v3），污染分支状态。反例（已修）：本次调试把本地 v4 工作树 rsync 盖到服务器 v3 checkout，事后 `git restore` + `git clean` 才复原成干净 v3。**已落地（2026-07-22）**：服务器已配 github SSH key（`~/.ssh/id_ed25519`，公钥已加到 github）、remote 已换 SSH，`git fetch origin && git reset --hard origin/<vN>` 实测可用（HTTPS 443 仍超时，故必须走 SSH）。
@@ -47,7 +47,14 @@
 | A2 | AgentFlow | executor token 不训练（工具边界精华）| ✅ 完成（5090 端到端 reward=1.0、闭环 reward_mean=1.0；真 4B planner + 真 DeepSeek coder）|
 | A3 | ToolOrchestra（仅 QA 路径）| 多专家路由 + 多组件 reward | ✅ 完成（5090 端到端 turns=2、reward=0.880、真 4B search→answer(expert_fast)；离线 reward_mean=0.991）（**主线二终点**）|
 
-**主线三 · 分布式后端**（记录设计，后续复现）：V6 SGLang / V7 FSDP / V8 Megatron / V9 吞吐实验。
+**主线三 · 分布式后端**
+
+| 版本 | 标题 | 关键学点 | 状态 |
+|------|------|---------|------|
+| V6 | 真训练闭环（GSM8K）| 真 log_probs + 真 GRPO 组归一 + 真 torch 训练一步 + 真权重同步 | ✅ 全链路跑通（5090 端到端：真 log_probs nonzero、真 backward、weight_v 递增、真同步 disk reload；acc 0.4→0.2 变化证明权重真被改，稳定提升属训练规模/超参问题留后续）|
+| V7 | FSDP 真训一步 | offload / packing / 多维并行 | 记录设计 |
+| V8 | Megatron 并行 | TP/PP/CP/EP 概念 | 记录设计 |
+| V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
 
 ## 4. 环境前置
 
@@ -147,6 +154,14 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - 验证：`scripts/test_a3_toolorchestra.py --offline` **PASSED**——search→answer 的 tool message 进入第二轮 prompt、loss_mask 仅覆盖 orchestrator、expert 失败后 error message 触发改选专家、多组件 reward 与 `train_ray` 闭环通过（reward_mean=0.991）。
 - **5090 端到端 PASSED**（真 4B orchestrator @30001）：`turns=2 events=2 reward=0.880`。真实轨迹——orchestrator 第一轮自主选 `search`（拿证据）→ 第二轮 `answer` 路由 `expert_fast` → 专家算出 `\boxed{165}`。契约全绿（turns 全 orchestrator、`len(tokens)==len(loss_mask)`、`sum(loss_mask)==sum(response_length)`、reward∈[0,1]）。多组件 reward 生效：correctness=1.0、total_cost=0.000656、total_latency≈10.4s、tool_counts={expert_fast:1} → 加权 reward=0.880（**非满分正是成本/延迟组件起作用**，这是 A3 相对 A2 单 reward 的核心增量）。**主线二收官。**
 - **收官前小修**（本次评估回补）：补齐 a3.md「偏离登记（按铁律三要素）」表（8 条，最大偏离=单样本预算归一 vs 源组内 GRPO min-max，留主线三）；删 solver.py 未使用的 `import asyncio`。
+
+### V6 真训练闭环（GSM8K，2026-07-24）详见 docs/decisions/v6.md
+- **主线三第一版**：把 A3 后 nano 的四根假支柱（假 token / 无真 log_probs / fake trainer / fake weight_sync / 单样本 reward）换真。内部四刀：V6.0 GSM8K 数据源 + calculator 确定性工具（复用 V1 CalculatorTool）；V6.1 orchestrator 走 SGLang 原生 `/generate` 拿真 token+log_probs（+ 真 tokenizer apply_chat_template，补 A3「手工渲染」偏离）；V6.2 移植源 `custom_convert` 的 GRPO 组归一（同题多 rollout min-max + `(r-mean)/(std+eps)` clip[-3,3] + std<0.1 过滤，opt-in via `custom_convert_path`，补 A3 最大偏离）；V6.3 torch 真训练一步（loss 对齐源 `ppo_utils.compute_policy_loss`）+ 真权重同步（disk reload）。
+- 数据集 GSM8K（答案 `#### 数字` 可严格验证、小模型裸答会错、天然需 calculator）；服务器连不上 HF，parquet scp 到 `/home/ubuntu/data/gsm8k`，`gsm8k_data` 优先本地 parquet。
+- 关键一致性：rollout 采样模型 == 训练重算 log_prob 的模型（否则 importance ratio 无意义）→ orchestrator/expert/train_model_path 统一 0.6B@30000。
+- **5090 端到端全链路 PASSED**：`real_logprobs OK (tokens=241, nonzero_lp=16)`（真 log_probs 工作）；真 backward（某轮 `reward_mean=-0.346` 组内有对有错→真算梯度，`train=1.7-11s`）；weight_version 递增 2→3→4（真权重同步，`sync≈18-20s`=save+SGLang disk reload 真耗时）。`acc_before=0.400 acc_after=0.200`——acc **变化**证明权重真被改（机制全链路真实发生）；未稳定提升是训练量微不足道（4 题×3 轮×lr 1e-6）+ 多数轮组内无方差被 mask，属**训练规模/超参问题非机制问题**，留后续（调温度制造方差/换适中难度/加大 n 和轮数）。
+- ray worker 需带 venv site-packages 才能 import torch（V4/V5 只用标准库没暴露；见 placement_group 修正）。torch/transformers 收进 pyproject optional `[train]`（仅服务器装）。
+- **偏离**（v6.md 8 条三要素表）：单卡纯 torch 无 FSDP 多维并行、关 KL/entropy 取最纯 GRPO、权重同步 disk reload vs 源 tensor 广播、逐样本无 packing、GSM8K+calculator 替代 STEM/HLE+FAISS、只两工具、本地 parquet、acc 未稳定提升。
 
 ## 7. 待办 / 已知问题
 
