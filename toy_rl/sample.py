@@ -35,6 +35,12 @@ class Sample:
     #     agent 生成 token    -> 1  (这是我们要强化的行为)
     #     tool 返回 token     -> 0  (工具输出不是模型生成的, 学它等于学环境噪声)
 
+    # --- rollout 引擎产生时的 log_probs（V6.1 起，对齐源 Sample.rollout_log_probs）---
+    rollout_log_probs: list[float] = field(default_factory=list)
+    #   与 tokens 等长：prompt 段补 0，response 段是 SGLang /generate 返回的真 log_prob。
+    #   真训练一步用它作 old_log_probs 算 importance ratio = exp(new_log_prob - old_log_prob)。
+    #   V0-A3 走 chat 端点拿不到，留空；V6.1 起 orchestrator 走 /generate 才填真值。
+
     # --- reward_func 产生的打分 ---
     reward: float | None = None   # 标量奖励; 源项目也支持 dict(多组件 reward), 主线二 A3 再引入
 
@@ -53,4 +59,8 @@ class Sample:
         if self.loss_mask and len(self.loss_mask) != len(self.tokens):
             raise ValueError(
                 f"loss_mask 长度 {len(self.loss_mask)} != tokens 长度 {len(self.tokens)}"
+            )
+        if self.rollout_log_probs and len(self.rollout_log_probs) != len(self.tokens):
+            raise ValueError(
+                f"rollout_log_probs 长度 {len(self.rollout_log_probs)} != tokens 长度 {len(self.tokens)}"
             )

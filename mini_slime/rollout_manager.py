@@ -75,16 +75,18 @@ class RolloutManager:
           源: tokens / response_lengths / rewards / raw_reward / truncated / sample_indices / loss_masks
           V3: tokens / loss_masks / rewards / response_lengths（其余留后续）
 
-        偏离（详见 v3.md 偏离表）：
-          - response_lengths 用**全长 len(tokens)**：nano tokens 含 prompt 段（loss_mask=0），
-            源的 response_length 只算 response 部分。结构占位等价，真 response 边界留 V6。
-          - 无 rollout_log_probs：V1/V2 打 chat 端点拿不到真 log_probs，留 V6 接 /generate。
+        V6.1 起补齐两处 V3 登记的偏离：
+          - response_lengths 用**真 response 段长度**（sum(loss_mask)）：agent 的 loss_mask 里 1 的
+            个数就是 response token 数（prompt/tool 段为 0）。补上 V3 的"全长占位"偏离。
+          - rollout_log_probs：orchestrator 走 /generate 后 sample.rollout_log_probs 有真值；
+            旧版（chat 端点）留空 [] → 该字段对旧 agent 透明（trainer 只在有值时用）。
         """
         return {
             "tokens": [s.tokens for s in samples],
             "loss_masks": [s.loss_mask for s in samples],
             "rewards": [s.reward for s in samples],
-            "response_lengths": [len(s.tokens) for s in samples],
+            "response_lengths": [sum(s.loss_mask) if s.loss_mask else len(s.tokens) for s in samples],
+            "rollout_log_probs": [s.rollout_log_probs for s in samples],
         }
 
     def pid(self) -> int:
