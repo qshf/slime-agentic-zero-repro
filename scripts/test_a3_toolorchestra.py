@@ -42,8 +42,8 @@ async def _single_sample(args: Args) -> None:
     sample = await stub_rollout.generate(args, data.load_data_source(args)[0])
     turns = sample.metadata["turns"]
     events = sample.metadata["events"]
-    assert len(turns) == 2, "stub 应走 search -> answer 两轮"
-    assert [event["tool_name"] for event in events] == ["search", "answer"]
+    assert len(turns) == 2, "stub 应走 search -> call_expert 两轮"
+    assert [event["tool_name"] for event in events] == ["search", "call_expert"]
     assert all(turn["kind"] == "orchestrator" for turn in turns)
     assert all(turn["loss_mask"] == [1] * turn["response_length"] for turn in turns)
     assert "[TOOL name=search]" in turns[1]["prompt_text"], "search observation 必须进入下一轮 messages"
@@ -60,8 +60,8 @@ async def _error_reroute(args: Args) -> None:
         nonlocal calls
         calls += 1
         if '"status": "error"' in prompt_text:
-            return '<tool_call>{"name":"answer","arguments":{"expert":"expert_fast"}}</tool_call>'
-        return '<tool_call>{"name":"answer","arguments":{"expert":"expert_precise"}}</tool_call>'
+            return '<tool_call>{"name":"call_expert","arguments":{"expert":"expert_fast"}}</tool_call>'
+        return '<tool_call>{"name":"call_expert","arguments":{"expert":"expert_precise"}}</tool_call>'
 
     async def expert(prompt_text: str) -> str:
         if "expert_precise" in prompt_text:

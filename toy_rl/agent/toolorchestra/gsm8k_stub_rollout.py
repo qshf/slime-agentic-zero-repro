@@ -30,7 +30,7 @@ async def generate(args: Args, sample: Sample) -> Sample:
 
     async def orchestrator_chat_fn(prompt_text: str) -> str:
         if "[TOOL name=calculator]" in prompt_text:
-            return '<tool_call>{"name":"answer","arguments":{"expert":"expert_fast"}}</tool_call>'
+            return '<tool_call>{"name":"call_expert","arguments":{"expert":"expert_fast"}}</tool_call>'
         return (
             '<tool_call>{"name":"calculator","arguments":'
             f'{{"expression":"{expression}"}}}}</tool_call>'

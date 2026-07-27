@@ -28,7 +28,7 @@ _TOOLS = [
         "parameters": {"expression": "e.g. (3+5)*2"},
     },
     {
-        "name": "answer",
+        "name": "call_expert",
         "description": "Ask one expert to produce the final numeric answer, ending with \\boxed{}.",
         "parameters": {"expert": "expert_fast or expert_precise"},
     },

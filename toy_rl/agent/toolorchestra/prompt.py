@@ -8,7 +8,7 @@ from typing import Any
 
 SYSTEM_PROMPT = (
     "You are an orchestrator. Always call exactly one available tool; never solve the "
-    "problem directly. Use search before answer when evidence would help."
+    "problem directly. Use search before call_expert when evidence would help."
 )
 
 
@@ -47,6 +47,6 @@ def render_orchestrator_prompt(messages: list[dict[str, Any]], tools: list[dict[
             "Return exactly one tool call and no surrounding explanation:\n"
             '<tool_call>{"name":"search","arguments":{"query":"..."}}</tool_call>\n'
             "or\n"
-            '<tool_call>{"name":"answer","arguments":{"expert":"expert_fast"}}</tool_call>'
+            '<tool_call>{"name":"call_expert","arguments":{"expert":"expert_fast"}}</tool_call>'
         ),
     ])

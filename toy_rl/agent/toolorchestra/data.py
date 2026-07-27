@@ -12,7 +12,7 @@ _TOOLS = [
         "parameters": {"query": "short retrieval query"},
     },
     {
-        "name": "answer",
+        "name": "call_expert",
         "description": "Ask one expert to produce the final answer.",
         "parameters": {"expert": "expert_fast or expert_precise"},
     },

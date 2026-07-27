@@ -214,12 +214,15 @@ class OrchestraSolver:
                 _estimate_tokens(expression), _estimate_tokens(output), 0.0,
             ), False
 
-        if tool_name != "answer":
+        if tool_name != "call_expert":
             return self._event(tool_name, "", tool_args, "", f"unknown tool: {tool_name}", 0, 0, 0.0), False
 
+        # "call_expert" 工具（对齐源 _execute_answer / _execute_call_expert）：调用 expert 模型产生最终答案，done=True 终止循环。
+        # 与 search/calculator 的区别：非终止工具返回 done=False，结果作为 tool observation 进下一轮 prompt；
+        # call_expert 返回 done=True，expert 输出作为 final_answer 存入 metadata，不再继续循环。
         role_name = str(tool_args.get("expert", ""))
         if role_name not in metadata.get("model_mapping", {}):
-            return self._event("answer", role_name, tool_args, "", f"unknown expert role: {role_name}", 0, 0, 0.0), False
+            return self._event("call_expert", role_name, tool_args, "", f"unknown expert role: {role_name}", 0, 0, 0.0), False
 
         observations = "\n".join(
             message["content"] for message in messages if message.get("role") == "tool"
@@ -232,16 +235,17 @@ class OrchestraSolver:
         ])
         start = time.perf_counter()
         try:
-            output = await self.expert_chat_fn(f"[expert={role_name}]\n{expert_prompt}")
-            if not output.strip():
+            expert_output = await self.expert_chat_fn(f"[expert={role_name}]\n{expert_prompt}")
+            if not expert_output.strip():
                 raise RuntimeError("expert returned an empty response")
             error = ""
         except Exception as exc:
-            output = ""
+            expert_output = ""
             error = f"{type(exc).__name__}: {exc}"
         latency_ms = (time.perf_counter() - start) * 1000
         event = self._event(
-            "answer", role_name, tool_args, output, error,
-            _estimate_tokens(expert_prompt), _estimate_tokens(output), latency_ms,
+            "call_expert", role_name, tool_args, expert_output, error,
+            _estimate_tokens(expert_prompt), _estimate_tokens(expert_output), latency_ms,
         )
+        # done = not error：expert 成功返回则终止循环（第145行 break），失败则继续（可能触发重试或降级）
         return event, not error
