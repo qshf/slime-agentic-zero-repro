@@ -49,14 +49,8 @@ async def _single_sample(args: Args) -> None:
     assert "[TOOL name=search]" in turns[1]["prompt_text"], "search observation 必须进入下一轮 messages"
     assert sum(sample.loss_mask) == sum(turn["response_length"] for turn in turns)
     reward = await rollout.reward_func(args, sample)
-    assert reward["correctness"] == 1.0
-    assert reward["total_cost"] > 0
-    assert reward["reward"] > 0
-
-    metadata = data.load_data_source(args)[0].metadata
-    fast = {"correctness": 1.0, "total_cost": 0.0005, "total_latency": 20.0, "tool_counts": {"expert_fast": 1}}
-    precise = {"correctness": 1.0, "total_cost": 0.005, "total_latency": 1_500.0, "tool_counts": {"expert_precise": 1}}
-    assert rollout.preference_utility(fast, metadata) > rollout.preference_utility(precise, metadata)
+    assert reward["reward"] == 1.0  # 简化版只返回 correctness
+    assert reward["pred"] == "165"
 
 
 async def _error_reroute(args: Args) -> None:

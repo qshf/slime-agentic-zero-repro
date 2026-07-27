@@ -238,9 +238,9 @@ def _is_equiv(a: str | None, b: str | None) -> bool:
 
 
 async def reward_func(args: Args, sample: Sample) -> dict:
-    """对齐源 memagent/rollout.py:272：抽 \\boxed{} 答案 → is_equiv 比对 label，命中给 1.0。
+    """计算 reward：只看正确性，0.0 或 1.0。
 
-    返回 {"reward": score}（对齐 nano reward dict 约定，RolloutManager 读 ["reward"]；源返回 {"score":...}）。
+    args 参数保留用于接口统一，但本函数不使用。
     """
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     final_output = metadata.get("final_output", "") or sample.response or ""

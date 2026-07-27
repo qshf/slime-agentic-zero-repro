@@ -58,9 +58,9 @@ async def generate(args: Args, sample: Sample) -> Sample:
 
 
 async def reward_func(args: Args, sample: Sample) -> dict:
-    """对齐 agentic/agentflow/rollout.py:209 的 reward_func 签名。
+    """计算 reward：只看正确性，0.0 或 1.0。
 
-    返回 dict(源项目 reward 可以是 dict 承载多组件)；V2 只放 reward 一项。
+    args 参数保留用于接口统一（agentflow 需要 args 访问 LLM-as-judge），但本函数不使用。
     """
     predicted = extract_answer(sample.response)
     if predicted is None:

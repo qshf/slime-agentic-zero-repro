@@ -74,7 +74,12 @@ class RolloutManager:
         samples: list[Sample] = []
         for s in self._next_batch(rollout_id):
             s = await self.generate_rollout(self.args, s)              # 真 SGLang rollout（复用 V1/V2 loop）
-            s.reward = (await self.reward_func(self.args, s))["reward"]  # per-sample reward hook
+            reward_result = await self.reward_func(self.args, s)       # per-sample reward hook
+            s.reward = reward_result["reward"]
+            # 保存 reward_features 供 custom_convert 使用（V6.2 GRPO 需要 correctness）
+            if not isinstance(s.metadata, dict):
+                s.metadata = {}
+            s.metadata["reward_features"] = {"correctness": reward_result["reward"]}
             samples.append(s)
         # V6.2：设了 custom_convert 走 GRPO 组归一（同题多 rollout），否则内置 per-sample 转换。
         if self.custom_convert is not None:

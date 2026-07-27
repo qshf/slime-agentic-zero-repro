@@ -52,8 +52,7 @@ async def _calculator_roundtrip(args: Args) -> None:
     assert sum(sample.loss_mask) == sum(turn["response_length"] for turn in turns)
 
     reward = await rollout.reward_func(args, sample)
-    assert reward["correctness"] == 1.0, f"stub expert 吐了 label，应判对，得到 {reward}"
-    assert reward["tool_counts"].get("expert_fast") == 1
+    assert reward["reward"] == 1.0, f"stub expert 吐了 label，应判对，得到 {reward}"
 
 
 def test_calculator(args: Args) -> None:
@@ -70,30 +69,31 @@ def test_closed_loop(args: Args) -> None:
 
 
 def test_grpo_group_norm() -> None:
-    """V6.2：同题多 rollout → 组内 min-max + GRPO 标准化产出有区分度的 reward。"""
+    """V6.2：同题多 rollout → 组内 GRPO 标准化产出有区分度的 reward。
+
+    简化版：只测试 correctness（0/1），不测试多组件 reward（cost/latency/tool_counts）。
+    GRPO 的教学核心是"同题多 rollout 的标准化"，不是"多目标优化"。
+    """
     from mini_slime.custom_convert import _compute_preference_rewards, _grpo_normalize_and_filter
 
-    pref = {"accuracy": 1.0, "cost": 0.1, "latency": 0.1, "expert_fast": 0.3, "expert_precise": 0.1}
-    # 同题 4 rollout：#0 错、#1 对且便宜快(fast)、#2 对但贵慢(precise)、#3 对且便宜快。
+    # 同题 4 rollout：#0 错、#1 对、#2 对、#3 错。
     group = [
-        {"correctness": 0.0, "total_cost": 0.0, "total_latency": 0.0, "tool_counts": {}},
-        {"correctness": 1.0, "total_cost": 0.0005, "total_latency": 20.0, "tool_counts": {"expert_fast": 1}},
-        {"correctness": 1.0, "total_cost": 0.005, "total_latency": 1500.0, "tool_counts": {"expert_precise": 1}},
-        {"correctness": 1.0, "total_cost": 0.0006, "total_latency": 25.0, "tool_counts": {"expert_fast": 1}},
+        {"correctness": 0.0},
+        {"correctness": 1.0},
+        {"correctness": 1.0},
+        {"correctness": 0.0},
     ]
-    pref_rewards = _compute_preference_rewards(group, [pref] * 4)
-    assert pref_rewards[0] == 0.0, "错误 rollout preference reward 必须为 0"
-    # 便宜快的 fast rollout 应比贵慢的 precise 高（cost/latency 归一后 fast 占优）。
-    assert pref_rewards[1] > pref_rewards[2], f"fast 应优于 precise，得到 {pref_rewards}"
+    pref_rewards = _compute_preference_rewards(group)
+    assert pref_rewards == [0.0, 1.0, 1.0, 0.0], f"correctness 应直接透传，得到 {pref_rewards}"
 
     normalized, keep = _grpo_normalize_and_filter(pref_rewards, n=4)
     assert all(keep), "组内有方差（部分对部分错），应保留学习信号"
     assert abs(sum(normalized)) < 1e-3, "GRPO 标准化后组内均值应约为 0"
     assert max(normalized) <= 3.0 and min(normalized) >= -3.0, "标准化 reward 须 clip 到 [-3,3]"
 
-    # 无信号组（全对且完全一样）→ std<0.1 → 全 mask、reward=0。
-    same = [{"correctness": 1.0, "total_cost": 0.001, "total_latency": 10.0, "tool_counts": {"expert_fast": 1}}] * 4
-    same_rewards = _compute_preference_rewards(same, [pref] * 4)
+    # 无信号组（全对）→ std<0.1 → 全 mask、reward=0。
+    same = [{"correctness": 1.0}] * 4
+    same_rewards = _compute_preference_rewards(same)
     _, keep2 = _grpo_normalize_and_filter(same_rewards, n=4)
     assert not any(keep2), "无方差组应被 mask（std<0.1，无学习信号）"
     print("  grpo_group_norm OK")

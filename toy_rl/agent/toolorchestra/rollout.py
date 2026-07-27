@@ -127,64 +127,18 @@ def _prediction(final_output: str) -> str:
     return numbers[-1] if numbers else final_output.strip()
 
 
-def extract_features(sample: Sample) -> dict:
+async def reward_func(args: Args, sample: Sample) -> dict:
+    """计算 reward：只看正确性，0.0 或 1.0。
+
+    简化版：删除了成本/延迟/工具偏好等多组件计算。A3 的教学核心是"多专家路由"
+    （orchestrator 能选 search/answer/不同 expert），不是复杂 reward 函数。
+    单一正确性 reward 足够验证路由机制，且与 A1/A2 保持一致。
+
+    args 参数保留用于接口统一，但本函数不使用。
+    """
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-    events = metadata.get("events", [])
-    total_cost = 0.0
-    total_latency = 0.0
-    tool_counts: dict[str, int] = {}
-    mapping = metadata.get("model_mapping", {})
-    pricing = metadata.get("tool_pricing", {})
-
-    for event in events:
-        total_latency += float(event.get("latency_ms", 0.0))
-        role = event.get("role_name", "")
-        if not role:
-            continue
-        tool_counts[role] = tool_counts.get(role, 0) + 1
-        price = pricing.get(mapping.get(role, ""), {})
-        total_cost += (
-            event.get("input_tokens", 0) * float(price.get("input", 0.0))
-            + event.get("output_tokens", 0) * float(price.get("output", 0.0))
-        )
-
     final_output = str(metadata.get("final_output", ""))
     pred = _prediction(final_output)
     label = str(sample.label) if sample.label is not None else ""
-    return {
-        "correctness": 1.0 if pred and label and _is_equiv(pred, label) else 0.0,
-        "pred": pred,
-        "total_cost": total_cost,
-        "total_latency": total_latency,
-        "tool_counts": tool_counts,
-    }
-
-
-def preference_utility(features: dict, metadata: dict) -> float:
-    """单样本版 preference reward；源的同题 min-max/GRPO 放在 custom_convert，nano 无该接口。"""
-    if features["correctness"] < 0.5:
-        return 0.0
-    pref = metadata.get("pref_vec", {})
-    cost_budget = max(float(metadata.get("cost_budget", 1.0)), 1e-12)
-    latency_budget = max(float(metadata.get("latency_budget_ms", 1.0)), 1e-12)
-    components = {
-        "accuracy": 1.0,
-        "cost": max(0.0, 1.0 - features["total_cost"] / cost_budget),
-        "latency": max(0.0, 1.0 - features["total_latency"] / latency_budget),
-    }
-    used_roles = features.get("tool_counts", {})
-    for role in used_roles:
-        components[role] = 1.0
-
-    weights = {key: max(0.0, float(pref.get(key, 0.0))) for key in components}
-    if sum(weights.values()) == 0:
-        return 1.0
-    return sum(components[key] * weights[key] for key in components) / sum(weights.values())
-
-
-async def reward_func(args: Args, sample: Sample) -> dict:
-    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-    features = extract_features(sample)
-    reward = preference_utility(features, metadata)
-    metadata["reward_features"] = features
-    return {"reward": reward, **features}
+    correctness = 1.0 if pred and label and _is_equiv(pred, label) else 0.0
+    return {"reward": correctness, "pred": pred}

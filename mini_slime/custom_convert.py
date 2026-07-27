@@ -28,47 +28,17 @@ MIN_STD_THRESHOLD = 0.1
 REWARD_CLIP = 3.0
 
 
-def _compute_preference_rewards(group_features: list[dict], group_pref_vecs: list[dict]) -> list[float]:
-    """组内 min-max 归一 + 偏好加权（对齐源 _compute_preference_rewards）。
+def _compute_preference_rewards(group_features: list[dict]) -> list[float]:
+    """简化版：直接返回 correctness（0.0 或 1.0）。
 
-    - 错误 rollout（correctness<0.5）reward=0。
-    - 正确 rollout：reward = Σ pref_vec[f]·normalized(f)，f 含 tool_counts 各角色、accuracy、
-      cost（取负）、latency（取负）；normalized 是组内 min-max。
+    原版做组内 min-max 归一 + 多组件偏好加权（cost/latency/tool_counts），但 nano 已简化
+    reward_func 只返回 correctness。GRPO 的教学核心是"同题多 rollout 的组归一化"，不是
+    "多目标优化"，所以这里直接取 correctness 作为 preference reward。
+
+    组内 min-max 在只有 0/1 二值时退化为恒等（max=min 或 已归一），真正的区分度来自下游
+    _grpo_normalize_and_filter 的 (r-mean)/std 标准化（同组内有对有错才有梯度信号）。
     """
-    n = len(group_features)
-    if n == 0:
-        return []
-
-    all_keys: set[str] = set()
-    feature_vectors: list[dict[str, float]] = []
-    for feat in group_features:
-        fv: dict[str, float] = {}
-        for role, count in feat.get("tool_counts", {}).items():
-            fv[role] = float(count)
-            all_keys.add(role)
-        fv["accuracy"] = feat["correctness"]
-        fv["cost"] = -feat["total_cost"]
-        fv["latency"] = -feat["total_latency"]
-        all_keys.update(["accuracy", "cost", "latency"])
-        feature_vectors.append(fv)
-
-    feat_min = {k: min(fv.get(k, 0.0) for fv in feature_vectors) for k in all_keys}
-    feat_max = {k: max(fv.get(k, 0.0) for fv in feature_vectors) for k in all_keys}
-
-    rewards: list[float] = []
-    for i, feat in enumerate(group_features):
-        if feat["correctness"] < 0.5:
-            rewards.append(0.0)
-            continue
-        pref = group_pref_vecs[i] if i < len(group_pref_vecs) else {}
-        reward = 0.0
-        fv = feature_vectors[i]
-        for key in all_keys:
-            if feat_max[key] > feat_min[key]:
-                normalized = (fv.get(key, 0.0) - feat_min[key]) / (feat_max[key] - feat_min[key])
-                reward += float(pref.get(key, 0.0)) * normalized
-        rewards.append(reward)
-    return rewards
+    return [feat.get("correctness", 0.0) for feat in group_features]
 
 
 def _grpo_normalize_and_filter(rewards: list[float], n: int) -> tuple[list[float], list[bool]]:
@@ -112,17 +82,14 @@ def custom_convert(args, samples: list) -> dict:
     """
     n = getattr(args, "n_samples_per_prompt", 1)
 
-    # 1. 提 features + pref_vec，组内算 preference reward。
+    # 1. 提 features，组内算 preference reward（简化版直接取 correctness）。
     all_features = [s.metadata.get("reward_features", {"correctness": 0.0}) for s in samples]
-    all_pref = [s.metadata.get("pref_vec", {}) for s in samples]
 
     pref_rewards: list[float] = []
     num_groups = len(samples) // n
     for g in range(num_groups):
         pref_rewards.extend(
-            _compute_preference_rewards(
-                all_features[g * n : (g + 1) * n], all_pref[g * n : (g + 1) * n]
-            )
+            _compute_preference_rewards(all_features[g * n : (g + 1) * n])
         )
     for j in range(len(samples) - num_groups * n):
         pref_rewards.append(all_features[num_groups * n + j].get("correctness", 0.0))
