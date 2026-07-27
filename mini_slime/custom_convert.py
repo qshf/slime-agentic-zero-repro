@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 MIN_STD_THRESHOLD = 0.1
@@ -70,23 +72,36 @@ def _compute_preference_rewards(group_features: list[dict], group_pref_vecs: lis
 
 
 def _grpo_normalize_and_filter(rewards: list[float], n: int) -> tuple[list[float], list[bool]]:
-    """组内 GRPO 标准化 (r-mean)/(std+eps) clip[-3,3]，std<0.1 的组无信号 → mask（对齐源）。"""
+    """组内 GRPO 标准化 A=(r-mean)/(std+eps) clip[-3,3]，std<0.1 的组无信号 → mask。
+
+    偏离登记（对齐首要锚点 slime-agentic，登记见 docs/decisions/v6.md）：
+      ① 源怎么做：源 ToolOrchestra/custom_convert.py:135-149 用 Python 双层 for（外层遍历组、
+         内层遍历组内 rollout）逐个算 (r-mean)/std。
+      ② nano 为何偏离：那段循环思路正确但写法不够清晰。改成 numpy 广播——把展平 reward
+         reshape 成 [组数, n]，mean/std 沿 axis=1 一把算，克隆 minimind train_grpo.py:121-124 的
+         向量化可读性。numpy 本地已装，不破 --offline 路径（torch 才会破，故不用 torch）。
+      ③ 语义是否等价：**完全等价**。std 用 ddof=0（有偏，==源 var=Σ(r-mean)²/len）；clip[-3,3]、
+         eps=1e-6、std<0.1 整组 mask、余数样本补 0 —— 全部逐位对齐源。
+    """
     num_examples = len(rewards) // n
+    remainder = len(rewards) - num_examples * n
+
     normalized: list[float] = []
     keep_mask: list[bool] = []
-    for g in range(num_examples):
-        group = rewards[g * n : (g + 1) * n]
-        mean = sum(group) / len(group)
-        var = sum((r - mean) ** 2 for r in group) / len(group)
-        std = var ** 0.5
-        has_signal = std > MIN_STD_THRESHOLD
-        for r in group:
-            nr = max(-REWARD_CLIP, min(REWARD_CLIP, (r - mean) / (std + 1e-6))) if has_signal else 0.0
-            normalized.append(nr)
-            keep_mask.append(has_signal)
-    for _ in range(len(rewards) - num_examples * n):
-        normalized.append(0.0)
-        keep_mask.append(False)
+    if num_examples > 0:
+        groups = np.asarray(rewards[: num_examples * n], dtype=float).reshape(num_examples, n)  # [组数, n]
+        mean = groups.mean(axis=1, keepdims=True)                        # 组均值 [组数, 1]
+        std = groups.std(axis=1, keepdims=True)                          # 组标准差(ddof=0，==源有偏方差)
+        has_signal = std[:, 0] > MIN_STD_THRESHOLD                       # [组数] 组内是否有学习信号
+
+        adv = np.clip((groups - mean) / (std + 1e-6), -REWARD_CLIP, REWARD_CLIP)  # A=(r-mean)/(std+eps)
+        adv[~has_signal] = 0.0                                           # std<0.1 的组整组置 0（无梯度）
+        normalized = adv.reshape(-1).tolist()
+        keep_mask = np.repeat(has_signal, n).tolist()                    # 组标记广播回每个样本
+
+    # 尾部余数样本（不足一组）：无组可归一 → reward 置 0、mask 掉（对齐源）。
+    normalized.extend([0.0] * remainder)
+    keep_mask.extend([False] * remainder)
     return normalized, keep_mask
 
 
