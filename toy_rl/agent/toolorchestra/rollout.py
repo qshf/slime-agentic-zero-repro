@@ -64,31 +64,33 @@ def _sglang_gen_fn(args: Args) -> GenFn:
 
     def _call(prompt_text: str) -> GenOutput:
         # 把单段 prompt 包成 chat message 过真 chat_template（补齐"手工渲染"偏离）。
-        prompt = tokenizer.apply_chat_template(
+        formatted_prompt = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt_text}],
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        prompt_token_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        prompt_token_ids = tokenizer(formatted_prompt, add_special_tokens=False)["input_ids"]
         payload = {
-            "text": prompt,
+            "text": formatted_prompt,
             "sampling_params": {
                 "max_new_tokens": args.orchestra_max_tokens,
                 "temperature": args.rollout_temperature,
             },
             "return_logprob": True,
         }
-        raw = requests.post(args.sglang_generate_url, json=payload, timeout=360).json()
-        meta = raw["meta_info"]
-        pairs = meta["output_token_logprobs"]  # [(log_prob, token_id, ...), ...]
-        log_probs = [float(p[0]) for p in pairs]
-        token_ids = [int(p[1]) for p in pairs]
+        sglang_response = requests.post(args.sglang_generate_url, json=payload, timeout=360).json()
+        meta_info = sglang_response["meta_info"]
+        # output_token_logprobs 只含新生成的 token (y1,y2,...)，不含输入 prompt (x1,x2,...)
+        # 每个元素: (log_prob, token_id, ...) 其中 log_prob = log P(y_t | x1...xN, y1...y_{t-1})
+        output_token_logprob_pairs = meta_info["output_token_logprobs"]
+        generated_log_probs = [float(pair[0]) for pair in output_token_logprob_pairs]
+        generated_token_ids = [int(pair[1]) for pair in output_token_logprob_pairs]
         return GenOutput(
-            response=_strip_think(raw["text"]),
+            response=_strip_think(sglang_response["text"]),
             prompt_token_ids=list(prompt_token_ids),
-            token_ids=token_ids,
-            log_probs=log_probs,
+            generated_token_ids=generated_token_ids,    # 新生成的部分（不含 prompt）
+            generated_log_probs=generated_log_probs,    # 对应的 log P(y_t|context)
         )
 
     async def gen_fn(prompt_text: str) -> GenOutput:

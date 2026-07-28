@@ -38,8 +38,8 @@ async def _calculator_roundtrip(args: Args) -> None:
     turns = sample.metadata["turns"]
     events = sample.metadata["events"]
 
-    assert len(turns) == 2, "stub 应走 calculator -> answer 两轮"
-    assert [event["tool_name"] for event in events] == ["calculator", "answer"]
+    assert len(turns) == 2, "stub 应走 calculator -> call_expert 两轮"
+    assert [event["tool_name"] for event in events] == ["calculator", "call_expert"]
     assert all(turn["kind"] == "orchestrator" for turn in turns)
 
     # calculator 真求值：event output 必须是数字（非错误串），且进入下一轮 prompt。
@@ -49,7 +49,7 @@ async def _calculator_roundtrip(args: Args) -> None:
     assert "[TOOL name=calculator]" in turns[1]["prompt_text"], "calculator observation 必须进入下一轮 prompt"
 
     # 仅 orchestrator token 可训练（calculator/expert 不进 sample.tokens）。
-    assert sum(sample.loss_mask) == sum(turn["response_length"] for turn in turns)
+    assert sum(sample.loss_mask) == sum(turn["generated_length"] for turn in turns)
 
     reward = await rollout.reward_func(args, sample)
     assert reward["reward"] == 1.0, f"stub expert 吐了 label，应判对，得到 {reward}"

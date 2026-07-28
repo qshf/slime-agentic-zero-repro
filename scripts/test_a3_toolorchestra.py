@@ -45,9 +45,9 @@ async def _single_sample(args: Args) -> None:
     assert len(turns) == 2, "stub 应走 search -> call_expert 两轮"
     assert [event["tool_name"] for event in events] == ["search", "call_expert"]
     assert all(turn["kind"] == "orchestrator" for turn in turns)
-    assert all(turn["loss_mask"] == [1] * turn["response_length"] for turn in turns)
+    assert all(turn["generated_loss_mask"] == [1] * turn["generated_length"] for turn in turns)
     assert "[TOOL name=search]" in turns[1]["prompt_text"], "search observation 必须进入下一轮 messages"
-    assert sum(sample.loss_mask) == sum(turn["response_length"] for turn in turns)
+    assert sum(sample.loss_mask) == sum(turn["generated_length"] for turn in turns)
     reward = await rollout.reward_func(args, sample)
     assert reward["reward"] == 1.0  # 简化版只返回 correctness
     assert reward["pred"] == "165"
@@ -95,7 +95,7 @@ async def _server_sample(args: Args) -> None:
     assert turns, "真实 orchestrator 至少应产生一轮"
     assert all(turn["kind"] == "orchestrator" for turn in turns)
     assert len(sample.tokens) == len(sample.loss_mask)
-    assert sum(sample.loss_mask) == sum(turn["response_length"] for turn in turns)
+    assert sum(sample.loss_mask) == sum(turn["generated_length"] for turn in turns)
     reward = await rollout.reward_func(args, sample)
     assert 0.0 <= reward["reward"] <= 1.0
     print(f"  server turns={len(turns)} events={len(sample.metadata['events'])} reward={reward['reward']:.3f}")

@@ -23,12 +23,14 @@ class GenOutput:
 
     源 `_generate_with_tools` 返回 prompt_token_ids/token_ids/log_probs（来自 SGLang /generate）。
     V6.1 起 nano 也让 orchestrator 生成一次性带回真 token + 真 log_probs（真 RL 保真度）。
+
+    关键语义：generated_token_ids 和 generated_log_probs 只含新生成的 token（不含输入 prompt）。
     """
 
     response: str
     prompt_token_ids: list[int]
-    token_ids: list[int]         # response 段的真 token_ids
-    log_probs: list[float]       # response 段每个 token 的真 log_prob（与 token_ids 等长）
+    generated_token_ids: list[int]      # 新生成的 token_ids（不含 prompt，只有 y1,y2,y3）
+    generated_log_probs: list[float]    # 新生成 token 的 log_prob（与 generated_token_ids 等长）
 
 
 GenFn = Callable[[str], Awaitable[GenOutput]]
@@ -87,20 +89,31 @@ class OrchestraSolver:
     async def _generate_orchestrator(
         self, prompt_text: str, vocab: dict[str, int]
     ) -> tuple[str, list[int], int, list[float]]:
-        """产 orchestrator 一轮：(tokens, response_length, log_probs)。
+        """产 orchestrator 一轮：(full_token_ids, generated_length, generated_log_probs)。
 
         真路径（gen_fn）：token_ids/log_probs 来自 SGLang /generate（真 RL 保真度）。
         假路径（chat_fn）：字符级假 token、log_probs 置 0 占位（离线/A3，无真 tokenizer）。
+
+        返回值：
+          - response: 生成的文本
+          - full_token_ids: 完整序列 = prompt_tokens + generated_tokens
+          - generated_length: 新生成的 token 数量（不含 prompt）
+          - generated_log_probs: 新生成 token 的 log_probs（长度 = generated_length）
         """
         if self.orchestrator_gen_fn is not None:
             out = await self.orchestrator_gen_fn(prompt_text)
-            tokens = list(out.prompt_token_ids) + list(out.token_ids)
-            return out.response, tokens, len(out.token_ids), list(out.log_probs)
+            full_token_ids = list(out.prompt_token_ids) + list(out.generated_token_ids)
+            generated_length = len(out.generated_token_ids)
+            generated_log_probs = list(out.generated_log_probs)
+            return out.response, full_token_ids, generated_length, generated_log_probs
 
         response = await self.orchestrator_chat_fn(prompt_text)
-        ptoks = _tokenize(prompt_text, vocab)
-        rtoks = _tokenize(response, vocab)
-        return response, ptoks + rtoks, len(rtoks), [0.0] * len(rtoks)
+        prompt_token_ids = _tokenize(prompt_text, vocab)
+        response_token_ids = _tokenize(response, vocab)
+        full_token_ids = prompt_token_ids + response_token_ids
+        generated_length = len(response_token_ids)
+        generated_log_probs = [0.0] * generated_length
+        return response, full_token_ids, generated_length, generated_log_probs
 
     async def solve(self, args: Args, sample: Sample) -> Sample:
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
@@ -115,15 +128,15 @@ class OrchestraSolver:
 
         for step in range(self.max_steps):
             prompt_text = render_orchestrator_prompt(messages, tools)
-            response, tokens, response_length, log_probs = await self._generate_orchestrator(
+            response, full_token_ids, generated_length, generated_log_probs = await self._generate_orchestrator(
                 prompt_text, vocab
             )
             turns.append({
                 "kind": "orchestrator",
-                "tokens": tokens,
-                "response_length": response_length,
-                "loss_mask": [1] * response_length,
-                "rollout_log_probs": log_probs,
+                "full_token_ids": full_token_ids,           # 完整序列 (prompt + generated)
+                "generated_length": generated_length,       # 新生成的 token 数量
+                "generated_loss_mask": [1] * generated_length,  # 只覆盖 generated 部分的 mask
+                "generated_log_probs": generated_log_probs, # 新生成部分的 log_probs
                 "prompt_text": prompt_text,
                 "response": response,
             })
@@ -147,15 +160,17 @@ class OrchestraSolver:
                 break
             append_tool_result(messages, event)
 
+        # 拼接多轮 orchestrator 的 assistant 回复（只有 orchestrator 进 turns，tool 结果不进）。
+        # 每轮 turn["full_token_ids"] = prompt_tokens + generated_tokens（完整对话历史 + 本轮生成）。
         cat_tokens: list[int] = []
         cat_loss_mask: list[int] = []
         cat_log_probs: list[float] = []
         for turn in turns:
-            prompt_len = len(turn["tokens"]) - turn["response_length"]
-            cat_tokens += turn["tokens"]
-            cat_loss_mask += [0] * prompt_len + turn["loss_mask"]
-            # log_probs 只覆盖 response 段；prompt 段补 0（对齐源 _build_output 的 cat_log_probs）。
-            cat_log_probs += [0.0] * prompt_len + turn["rollout_log_probs"]
+            prompt_len = len(turn["full_token_ids"]) - turn["generated_length"]
+            cat_tokens += turn["full_token_ids"]
+            cat_loss_mask += [0] * prompt_len + turn["generated_loss_mask"]
+            # log_probs 只覆盖 generated 段；prompt 段补 0（对齐源 _build_output 的 cat_log_probs）。
+            cat_log_probs += [0.0] * prompt_len + turn["generated_log_probs"]
 
         sample.response = "\n\n".join(response_parts)
         sample.tokens = cat_tokens

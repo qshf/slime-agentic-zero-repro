@@ -99,39 +99,51 @@ def custom_convert(args, samples: list) -> dict:
 
     # 3. 按 turn 拆独立训练样本（orchestrator 每轮一条）。
     tokens_list, response_lengths, loss_masks = [], [], []
-    rewards, raw_rewards, log_probs_list = [], [], []
+    rewards, log_probs_list = [], []
     for i, sample in enumerate(samples):
         turns = sample.metadata.get("turns")
         norm_r = normalized[i]
         should_mask = not keep_mask[i]
+
         if not turns:
             # 无 turns（不该发生在 A3/V6 路径）：整条按单序列处理。
             tokens_list.append(sample.tokens)
             response_lengths.append(sum(sample.loss_mask) if sample.loss_mask else len(sample.tokens))
             loss_masks.append([0] * len(sample.loss_mask) if should_mask else sample.loss_mask)
             rewards.append(norm_r)
-            raw_rewards.append(pref_rewards[i])
             log_probs_list.append(sample.rollout_log_probs)
             continue
+
+        # 有 turns：每个 turn 拆成独立训练样本。
+        # 注意：turn["generated_loss_mask"] 只覆盖 generated 部分，需要前面补 prompt 的 0。
         for turn in turns:
-            prompt_len = len(turn["tokens"]) - turn["response_length"]
-            if prompt_len < 1 or turn["response_length"] < 1:
+            gen_len = turn["generated_length"]
+            prompt_len = len(turn["full_token_ids"]) - gen_len
+            if prompt_len < 1 or gen_len < 1:
                 continue
-            lm = [0] * turn["response_length"] if should_mask else turn["loss_mask"]
-            tokens_list.append(turn["tokens"])
-            response_lengths.append(turn["response_length"])
-            loss_masks.append([0] * prompt_len + lm)
+
+            # turn["generated_loss_mask"] 只有 generated 部分，长度 = generated_length
+            generated_loss_mask = turn["generated_loss_mask"]
+            generated_log_probs = turn.get("generated_log_probs", [0.0] * gen_len)
+
+            # 构建完整序列的 loss_mask 和 log_probs（prompt 段补 0）
+            if should_mask:
+                full_loss_mask = [0] * (prompt_len + gen_len)
+            else:
+                full_loss_mask = [0] * prompt_len + generated_loss_mask
+
+            full_log_probs = [0.0] * prompt_len + generated_log_probs
+
+            tokens_list.append(turn["full_token_ids"])
+            response_lengths.append(gen_len)
+            loss_masks.append(full_loss_mask)
             rewards.append(norm_r)
-            raw_rewards.append(pref_rewards[i])
-            log_probs_list.append(
-                [0.0] * prompt_len + turn.get("rollout_log_probs", [0.0] * turn["response_length"])
-            )
+            log_probs_list.append(full_log_probs)
 
     return {
         "tokens": tokens_list,
         "loss_masks": loss_masks,
         "rewards": rewards,
-        "raw_reward": raw_rewards,
         "response_lengths": response_lengths,
         "rollout_log_probs": log_probs_list,
     }
