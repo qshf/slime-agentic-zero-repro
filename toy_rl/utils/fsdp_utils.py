@@ -75,9 +75,10 @@ def apply_fsdp2(model, mesh, cpu_offload: bool = False, fp16: bool = False):
 
     offload_policy = CPUOffloadPolicy() if cpu_offload else None
 
-    # 对齐源 actor.py:949-950：从模型拿要 wrap 的层类名（如 ["Qwen3DecoderLayer"]）。
-    layer_cls_to_wrap = model._no_split_modules
-    assert layer_cls_to_wrap and layer_cls_to_wrap[0] is not None, "模型缺 _no_split_modules"
+    # 对齐源 actor.py:949-950：从模型拿要 wrap 的层类名（如 {"Qwen3DecoderLayer"}）。
+    # 注：transformers 5.x 里 _no_split_modules 是 set（旧版为 list），故用集合成员判断不索引。
+    layer_cls_to_wrap = set(model._no_split_modules or [])
+    assert layer_cls_to_wrap, "模型缺 _no_split_modules"
 
     tie = model.config.tie_word_embeddings
     # 对齐源 actor.py:952-957：decoder 层总 wrap；Embedding 仅在 **非 tie** 时单独 wrap。

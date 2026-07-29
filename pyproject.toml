@@ -21,6 +21,7 @@ dependencies = [
 train = [
     "torch>=2.1",          # V6.3: 真 torch 训练一步（forward/backward/optimizer）
     "transformers>=4.40",  # V6.1: AutoTokenizer(apply_chat_template) + V6.3 加载可训模型
+    "accelerate>=0.30",    # V7.0: FSDP init_empty_weights(非 tie 模型 meta-device 建模，对齐源)
 ]
 
 [tool.uv]

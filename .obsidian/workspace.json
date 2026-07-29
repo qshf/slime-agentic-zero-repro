@@ -1,0 +1,233 @@
+{
+  "main": {
+    "id": "6d654762d932a360",
+    "type": "split",
+    "children": [
+      {
+        "id": "24c4da50384947fd",
+        "type": "tabs",
+        "dimension": 67.61827079934747,
+        "children": [
+          {
+            "id": "678b523b0a551dbd",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "docs/v5-train-async-vs-train-ray.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "v5-train-async-vs-train-ray"
+            },
+            "group": "8fde0c6c1329e906"
+          }
+        ]
+      },
+      {
+        "id": "8ca2e08f6ddbe8c5",
+        "type": "tabs",
+        "dimension": 32.38172920065253,
+        "children": [
+          {
+            "id": "89bd7633d301a95b",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "docs/v5-train-async-vs-train-ray.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "v5-train-async-vs-train-ray 的大纲"
+            },
+            "group": "8fde0c6c1329e906"
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "0006bd53f16e4fc2",
+    "type": "split",
+    "children": [
+      {
+        "id": "79ddc6423d7ba19d",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "49ab075fc354410a",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "文件列表"
+            }
+          },
+          {
+            "id": "d70d601b60475186",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "搜索"
+            }
+          },
+          {
+            "id": "8181d0ecb73a30df",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "书签"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 200
+  },
+  "right": {
+    "id": "e7aa329b0af5bede",
+    "type": "split",
+    "children": [
+      {
+        "id": "43600eeb27a823be",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "7f6e2d72affddd98",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "docs/v5-train-async-vs-train-ray.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "v5-train-async-vs-train-ray 的反向链接列表"
+            }
+          },
+          {
+            "id": "5ec9a3aa72f7df29",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "docs/v5-train-async-vs-train-ray.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "v5-train-async-vs-train-ray 的出链列表"
+            }
+          },
+          {
+            "id": "dbcfd5ec513c851a",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "标签"
+            }
+          },
+          {
+            "id": "bfc53412e8bc9098",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "添加笔记属性"
+            }
+          },
+          {
+            "id": "87048cfcfb668e09",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "docs/v5-train-async-vs-train-ray.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "v5-train-async-vs-train-ray 的大纲"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:打开快速切换": false,
+      "graph:查看关系图谱": false,
+      "canvas:新建白板": false,
+      "daily-notes:打开/创建今天的日记": false,
+      "templates:插入模板": false,
+      "command-palette:打开命令面板": false,
+      "bases:新建数据库": false
+    }
+  },
+  "active": "678b523b0a551dbd",
+  "lastOpenFiles": [
+    "scripts/__pycache__/test_v7.0_fsdp_single.cpython-313.pyc",
+    "toy_rl/trainer/__pycache__/fsdp_trainer.cpython-313.pyc",
+    "toy_rl/trainer/__pycache__",
+    "toy_rl/utils/__pycache__/fsdp_utils.cpython-313.pyc",
+    "toy_rl/utils/__pycache__",
+    "scripts/test_v7.0_fsdp_single.py",
+    "toy_rl/utils/__init__.py",
+    "toy_rl/trainer/__init__.py",
+    "toy_rl/trainer/fsdp_trainer.py",
+    "toy_rl/trainer",
+    "toy_rl/utils/fsdp_utils.py",
+    "docs/decisions/v7-plan.md",
+    "docs/agent-line/iteration-plan.md",
+    "docs/system-roadmap.md",
+    "docs/v5-train-async-vs-train-ray.md",
+    "docs/train.md",
+    "docs/grpo-formula-to-code.md",
+    "docs/deep-dive-train-ray-train.md",
+    "docs/edge-deployment-design.md"
+  ]
+}
