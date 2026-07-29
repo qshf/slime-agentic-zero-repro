@@ -1,4 +1,4 @@
-"""V7.0: FSDPTrainer —— FSDP2 后端的真训练一步。
+"""V7.0/V7.2: FSDPTrainer —— FSDP2 后端的真训练一步（含梯度累积）。
 
 对齐源 slime/backends/fsdp_utils/actor.py：
   - init      ← actor.py:48-154：setup mesh → 建模型(tie 分支) → apply_fsdp2 → rank0 广播 → AdamW
@@ -14,10 +14,17 @@ V7.0 最小切片（单样本，2 卡真分片）：
   - 单样本前向 + 后向（暂不 packing）
   - loss 缩放对齐源：loss * dp_size / global_batch_size（actor.py:677）
 
-偏离源项目（V7.0，登记见 docs/decisions/v7.md）：
-  - 无 sequence packing（单样本，留 V7.1）；无 gradient accumulation（留 V7.2）；无 Ray（留 V7.3）
+V7.2 增量（梯度累积）：
+  - train_batch：zero_grad 一次 → 逐微批 backward 累积梯度 → 累积窗口末尾单次 clip+step
+    （对齐源 _train_core actor.py:521-532 + _train_step 的 step 门控 actor.py:684-690）
+  - 每微批 loss 乘 dp_size/global_batch_size：与 FSDP 反向的 dp 平均相抵，
+    累积 N 微批 == 全局批「逐样本 mean 之和 / gbs」的单次梯度（V7.2 教学核心）
+  - train_step 保留为 gbs=1 单微批的 train_batch 薄封装（V7.0 入口兼容）
+
+偏离源项目（V7.0/V7.2，登记见 docs/decisions/v7.md）：
+  - 无 sequence packing（每样本即一个微批，留 V7.1——需 flash-attn varlen，5090 未装）；无 Ray（留 V7.3）
   - cpu_offload=False（显存够）；无 ref model / KL / entropy（继承 V6 --no-ref，取最纯 GRPO）
-  - 单微批即一次 step（V7.0 单样本，grad_accum 概念留 V7.2）
+  - 一个 train_batch 即一个累积窗口（源用 grad_accum 边界列表支持窗口内多次 step，nano 简化为窗口=批）
 """
 
 from __future__ import annotations
@@ -116,24 +123,29 @@ class FSDPTrainer:
         )
         logger.info(f"Rank {self.rank}: FSDPTrainer ready (tie={tie}, dp_size={self.dp_size})")
 
-    def train_step(
+    def _micro_backward(
         self,
         tokens: list[int],
         loss_mask: list[int],
         reward: float,
-        old_log_probs: Optional[list[float]] = None,
-    ) -> dict:
-        """单样本 GRPO policy-gradient 一步。对齐源 actor.py:551-722（单样本简化）。
+        old_log_probs: Optional[list[float]],
+        global_batch_size: int,
+    ) -> float:
+        """单个微批的 forward + loss + backward（累积梯度，**不 step、不 zero_grad**）。
 
+        对齐源 actor.py:551-678 的 _train_step 主体（去掉 packing / step 门控）。
         loss 数学与 V6 TorchActor 完全一致：
-          cur_lp = logprob(model(tokens)[:-1], tokens[1:])           # actor.py:554-562
-          ratio  = exp(cur_lp - old_lp)                              # ppo_utils.py:132
-          pg     = min(ratio·adv, clip(ratio,1-e,1+e)·adv)           # ppo_utils.py:133-135
-          loss   = -masked_mean(pg)                                  # sum_of_sample_mean, actor.py:627
-          loss   = loss * dp_size / global_batch_size                # actor.py:677（梯度累积缩放）
+          cur_lp = logprob(model(tokens)[:-1], tokens[1:])   # actor.py:554-562
+          ratio  = exp(cur_lp - old_lp)                       # ppo_utils.py:132
+          pg     = min(ratio·adv, clip(ratio,1±e)·adv)        # ppo_utils.py:133-135
+          loss   = -masked_mean(pg)                           # sum_of_sample_mean, actor.py:911
+          loss   = loss * dp_size / global_batch_size         # actor.py:677（累积缩放）
+
+        缩放的意义（V7.2 教学核心）：每微批乘 dp_size/gbs，FSDP 反向自动按 dp_size 平均梯度，
+        两者相抵 → 累积 gbs 个微批的梯度 == 对全局批取「逐样本 mean 之和 / gbs」的单次梯度。
         """
         if len(tokens) < 2 or sum(loss_mask) == 0:
-            return {"loss": 0.0, "grad_norm": 0.0, "trained_samples": 0}
+            return 0.0
 
         input_ids = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)  # [1,L]
         tgt_mask = torch.tensor(loss_mask[1:], dtype=torch.float32, device=self.device)       # [L-1]
@@ -144,8 +156,6 @@ class FSDPTrainer:
             if old_log_probs is not None
             else None
         )
-
-        self.optimizer.zero_grad(set_to_none=True)
 
         # Forward（对齐 actor.py:554）：logits[:-1] 预测 tokens[1:]。
         logits = self.model(input_ids).logits.squeeze(0)[:-1, :].float()  # [L-1, V]
@@ -162,18 +172,59 @@ class FSDPTrainer:
         masked = (pg * tgt_mask).sum() / torch.clamp_min(tgt_mask.sum(), 1.0)
         loss = -masked  # optimizer 是 minimize，加负号把"最大化 J"转"最小化 L"。
 
-        # 梯度累积缩放（对齐 actor.py:677）：单样本 global_batch_size=1、dp_size 卡分摊。
-        loss = loss * self.dp_size / self.global_batch_size
+        # 梯度累积缩放（对齐 actor.py:677）：除以 global_batch_size、乘 dp_size 抵消 FSDP dp 平均。
+        loss = loss * self.dp_size / global_batch_size
+        loss.backward()  # 累积到 .grad，不清零
+        return float(loss.detach())
 
-        loss.backward()
+    def train_batch(
+        self,
+        samples: list[dict],
+        global_batch_size: Optional[int] = None,
+    ) -> dict:
+        """梯度累积一步：zero_grad → 逐微批 backward 累积 → 单次 clip+step。
+
+        对齐源 actor.py:521-532 + 684-693 的 _train_core 累积循环：本地按微批遍历、
+        梯度累积到 grad_accum 边界才 optimizer.step()。nano V7.2 每样本即一个微批
+        （无 packing，留 V7.1），一个 train_batch 即一个累积窗口 → 末尾 step 一次。
+
+        samples: [{tokens, loss_mask, reward, old_log_probs?}, ...]（本 rank 的本地微批）。
+        global_batch_size: 全局批大小（用于缩放）；默认取 self.global_batch_size。
+        """
+        gbs = global_batch_size if global_batch_size is not None else self.global_batch_size
+
+        self.optimizer.zero_grad(set_to_none=True)  # 累积窗口开始，清零一次（actor.py:523）
+        loss_sum, trained = 0.0, 0
+        for s in samples:
+            l = self._micro_backward(
+                s["tokens"], s["loss_mask"], s["reward"], s.get("old_log_probs"), gbs
+            )
+            loss_sum += l
+            trained += 1 if l != 0.0 else 0
+
+        # 累积窗口结束：clip + step 一次（actor.py:686-690）。
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
         self.optimizer.step()
 
         return {
-            "loss": float(loss.detach()),
+            "loss": loss_sum,
             "grad_norm": float(grad_norm),
-            "trained_samples": 1,
+            "trained_samples": trained,
+            "num_microbatches": len(samples),
         }
+
+    def train_step(
+        self,
+        tokens: list[int],
+        loss_mask: list[int],
+        reward: float,
+        old_log_probs: Optional[list[float]] = None,
+    ) -> dict:
+        """单样本一步（V7.0 兼容入口）= global_batch_size=1 的单微批 train_batch。"""
+        return self.train_batch(
+            [{"tokens": tokens, "loss_mask": loss_mask, "reward": reward, "old_log_probs": old_log_probs}],
+            global_batch_size=1,
+        )
 
     def save_pretrained(self, path: str) -> None:
         """聚合分片权重到 rank0 落盘（供 SGLang disk reload）。对齐源 checkpoint save 的最小版。
