@@ -18,7 +18,7 @@
 
 - **源项目**：`/Users/qshf/my-project/slime-agentic`（github: LMIS-ORG/slime-agentic，分支 main。只读，用于对照）
 - **nano 项目**：`/Users/qshf/my-project/slime-agentic-zero-repro`（git 已 init，主分支 main）
-- **当前活跃分支**：`v6`
+- **当前活跃分支**：`v7`
 - **分支准则（每版必须遵守）**：**每个版本切一个 `vN` 分支，从上一版分支的末端切出；当版的全部提交——实施计划 doc + 代码实现 + 验证结果——都落在 `vN` 上，绝不提交到别的版本分支**。判断法：提交前先 `git branch --show-current`，确认在当版分支。反例（已修）：V4 的计划/实现/调试提交错落在 `v3` 分支上——已把 `v3` 回退到其最后一个 V3 提交、V4 全部收进 `v4` 分支。
 - **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/slime-agentic-zero-repro`，git 管理）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
 - **服务器 git 恢复准则（每版必须遵守）**：服务器 checkout 是 **git 管理**的（当前目录 `/home/ubuntu/slime-agentic-zero-repro`，旧的 `zj` 已弃用）。**当服务器所在版本与要跑的版本不匹配时，用 git 从远程仓库恢复到目标版本**（`git fetch origin && git reset --hard origin/<vN>`），**绝不用 rsync 往 git 工作树上盖**——rsync 会把本地其它版本的文件混进 checkout（tracked 被改、v4 文件混进 v3），污染分支状态。反例（已修）：本次调试把本地 v4 工作树 rsync 盖到服务器 v3 checkout，事后 `git restore` + `git clean` 才复原成干净 v3。**已落地（2026-07-22）**：服务器已配 github SSH key（`~/.ssh/id_ed25519`，公钥已加到 github）、remote 已换 SSH，`git fetch origin && git reset --hard origin/<vN>` 实测可用（HTTPS 443 仍超时，故必须走 SSH）。
@@ -52,7 +52,7 @@
 | 版本 | 标题 | 关键学点 | 状态 |
 |------|------|---------|------|
 | V6 | 真训练闭环（GSM8K）| 真 log_probs + 真 GRPO 组归一 + 真 torch 训练一步 + 真权重同步 | ✅ 全链路跑通（5090 端到端：真 log_probs nonzero、真 backward、weight_v 递增、真同步 disk reload；acc 0.4→0.2 变化证明权重真被改，稳定提升属训练规模/超参问题留后续）|
-| V7 | FSDP 真训一步 | offload / packing / 多维并行 | 记录设计 |
+| V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | 🚧 V7.0+V7.2 ✅（5090 2卡真分片：q_proj local=full/2、tie 忠实处理不 hang、累积等价性 max_diff=0）；V7.1 packing 暂缓（5090 无 flash-attn）；V7.3 Ray+权重同步待做 |
 | V8 | Megatron 并行 | TP/PP/CP/EP 概念 | 记录设计 |
 | V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
 
@@ -162,6 +162,14 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **5090 端到端全链路 PASSED**：`real_logprobs OK (tokens=241, nonzero_lp=16)`（真 log_probs 工作）；真 backward（某轮 `reward_mean=-0.346` 组内有对有错→真算梯度，`train=1.7-11s`）；weight_version 递增 2→3→4（真权重同步，`sync≈18-20s`=save+SGLang disk reload 真耗时）。`acc_before=0.400 acc_after=0.200`——acc **变化**证明权重真被改（机制全链路真实发生）；未稳定提升是训练量微不足道（4 题×3 轮×lr 1e-6）+ 多数轮组内无方差被 mask，属**训练规模/超参问题非机制问题**，留后续（调温度制造方差/换适中难度/加大 n 和轮数）。
 - ray worker 需带 venv site-packages 才能 import torch（V4/V5 只用标准库没暴露；见 placement_group 修正）。torch/transformers 收进 pyproject optional `[train]`（仅服务器装）。
 - **偏离**（v6.md 8 条三要素表）：单卡纯 torch 无 FSDP 多维并行、关 KL/entropy 取最纯 GRPO、权重同步 disk reload vs 源 tensor 广播、逐样本无 packing、GSM8K+calculator 替代 STEM/HLE+FAISS、只两工具、本地 parquet、acc 未稳定提升。
+
+### V7 FSDP 真训一步（2026-07-29）详见 docs/decisions/v7.md
+- **主线三第二版**：把 V6 的「单卡纯 torch 整模型」换成 **FSDP2 分片后端**（对齐源 `fsdp_utils/actor.py`）。建 `toy_rl/utils/fsdp_utils.py`（mesh/wrap/init-context/broadcast）+ `toy_rl/trainer/fsdp_trainer.py`（FSDPTrainer）。内部切刀：V7.0 基础设施 → V7.2 梯度累积 →（V7.1 packing 暂缓）→ V7.3 待做。
+- **V7.0**：教学核心=**同一份 loss 数学换到分片后端**（loss 公式与 V6 torch_actor 完全相同，只换执行后端）。**忠实 tie 处理**（本版最关键对齐）：Qwen3-0.6B `tie_word_embeddings=True`（实测确认）→ ①embedding 不单独 `fully_shard`（tie 时单独 wrap 破坏权重共享，对齐 actor.py:956）；②建模型全 rank load 全量到 CPU（tie 走 meta device 会 broadcast hang，对齐 actor.py:217-226）。**5090 2卡 PASSED**：q_proj local shard=1048576=全量的一半（真分片）、loss=-2.0（数学精确 -1×dp2/gbs1）、grad_norm=308、权重 L2 变化 0.14、tie 未 hang。
+- **V7.2**：教学核心=**累积多微批梯度 == 一次大批梯度**。`train_batch`：zero_grad 一次→逐微批 `_micro_backward` 累积→末尾单次 clip+step（对齐源 `_train_core` + step 门控）。每微批 loss 乘 `dp_size/global_batch_size`：与 FSDP 反向的 dp 平均相抵→累积 N 微批==全局批「逐样本 mean 之和/gbs」单次梯度。`train_step` 保留为 gbs=1 薄封装。**5090 2卡 PASSED**：**累积等价性 max_diff=0.000e+00**（两独立累积路径梯度逐参数精确相等）；`loss=0.0` 是预期正确（两样本 adv=+1/-1 缩放后 loss 相消，但梯度不相消 grad_norm=166→演示「loss 抵消≠梯度抵消」）。
+- **V7.1 packing 暂缓（登记偏离）**：源 `pack_sequences` flat 1D + position_ids reset + `attention_mask=None`，**靠 flash-attn varlen 隔离样本**；5090 无 flash-attn 且 Blackwell sm_120 难编译，缺它会让样本间注意力**静默串扰、loss 算错**（比不做更危险）。忠实替代=用 cu_seqlens 物化**块对角 mask** 显式隔离，留能装 flash-attn 时补。不假装做了。
+- **踩坑（已修）**：①`accelerate` 缺失（`init_empty_weights` 依赖）→补进 `[train]` extra；②`_no_split_modules` 在 transformers 5.x 是 `set` 不可 `[0]` 索引→改成员测试。
+- **偏离**（v7.md 5 条三要素表）：无 packing（#1，最大，缺 flash-attn）、无 KL/entropy、DP=1 无多维并行（留 V8）、权重同步待 V7.3、单样本/小微批。
 
 ## 7. 待办 / 已知问题
 
