@@ -38,6 +38,44 @@
       "console": "integratedTerminal",
       "subProcess": true,
       "justMyCode": false
+    },
+    {
+      "name": "V7.3 · Ray + FSDP (1 GPU)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/test_v7.3_fsdp_ray.py",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "CUDA_VISIBLE_DEVICES": "2",
+        "NCCL_DEBUG": "INFO",
+        "TORCH_DISTRIBUTED_DEBUG": "DETAIL"
+      },
+      "console": "integratedTerminal",
+      "subProcess": true,
+      "justMyCode": false
+    },
+    {
+      "name": "V7.3 · Ray + FSDP (2 GPUs)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/test_v7.3_fsdp_ray.py",
+      "args": [
+        "--world",
+        "2"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "CUDA_VISIBLE_DEVICES": "2,3",
+        "NCCL_DEBUG": "INFO",
+        "TORCH_DISTRIBUTED_DEBUG": "DETAIL"
+      },
+      "console": "integratedTerminal",
+      "subProcess": true,
+      "justMyCode": false
     }
   ]
 }
