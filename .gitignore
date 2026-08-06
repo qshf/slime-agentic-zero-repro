@@ -7,3 +7,6 @@ experiments/logs/*.log
 # A2: coder 模型密钥走 .env，绝不进 git（.env.example 是模板、进 git）
 .env
 !.env.example
+
+# Obsidian IDE 状态（不进 git）
+.obsidian/
