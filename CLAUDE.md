@@ -52,7 +52,7 @@
 | 版本 | 标题 | 关键学点 | 状态 |
 |------|------|---------|------|
 | V6 | 真训练闭环（GSM8K）| 真 log_probs + 真 GRPO 组归一 + 真 torch 训练一步 + 真权重同步 | ✅ 全链路跑通（5090 端到端：真 log_probs nonzero、真 backward、weight_v 递增、真同步 disk reload；acc 0.4→0.2 变化证明权重真被改，稳定提升属训练规模/超参问题留后续）|
-| V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | 🚧 V7.0+V7.2 ✅（5090 2卡真分片：q_proj local=full/2、tie 忠实处理不 hang、累积等价性 max_diff=0）；V7.3 Ray+FSDP+权重同步**代码完成+离线全回归绿**（服务器 --world 1→2 待跑）；V7.1 packing 暂缓（5090 无 flash-attn）|
+| V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | ✅ V7.0+V7.2+V7.3 收官（5090：2卡真分片+tie忠实+累积 max_diff=0；V7.3 Ray+FSDP+权重同步 --world 1&2 端到端 PASSED——真 dist 组+DP-split+集体 save/rank0 POST，weight_v 递增、真 backward、未 hang）；V7.1 packing 暂缓（无 flash-attn，登记偏离）|
 | V8 | Megatron 并行 | TP/PP/CP/EP 概念 | 记录设计 |
 | V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
 
@@ -163,13 +163,15 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - ray worker 需带 venv site-packages 才能 import torch（V4/V5 只用标准库没暴露；见 placement_group 修正）。torch/transformers 收进 pyproject optional `[train]`（仅服务器装）。
 - **偏离**（v6.md 8 条三要素表）：单卡纯 torch 无 FSDP 多维并行、关 KL/entropy 取最纯 GRPO、权重同步 disk reload vs 源 tensor 广播、逐样本无 packing、GSM8K+calculator 替代 STEM/HLE+FAISS、只两工具、本地 parquet、acc 未稳定提升。
 
-### V7 FSDP 真训一步（2026-07-29）详见 docs/decisions/v7.md
-- **主线三第二版**：把 V6 的「单卡纯 torch 整模型」换成 **FSDP2 分片后端**（对齐源 `fsdp_utils/actor.py`）。建 `toy_rl/utils/fsdp_utils.py`（mesh/wrap/init-context/broadcast）+ `toy_rl/trainer/fsdp_trainer.py`（FSDPTrainer）。内部切刀：V7.0 基础设施 → V7.2 梯度累积 →（V7.1 packing 暂缓）→ V7.3 待做。
+### V7 FSDP 真训一步（2026-07-29 / V7.3 收官 2026-08-06）详见 docs/decisions/v7.md
+- **主线三第二版**：把 V6 的「单卡纯 torch 整模型」换成 **FSDP2 分片后端**（对齐源 `fsdp_utils/actor.py`）。建 `toy_rl/utils/fsdp_utils.py`（mesh/wrap/init-context/broadcast）+ `toy_rl/trainer/fsdp_trainer.py`（FSDPTrainer）。内部切刀：V7.0 基础设施 → V7.2 梯度累积 →（V7.1 packing 暂缓）→ V7.3 Ray+FSDP+权重同步收官。
 - **V7.0**：教学核心=**同一份 loss 数学换到分片后端**（loss 公式与 V6 torch_actor 完全相同，只换执行后端）。**忠实 tie 处理**（本版最关键对齐）：Qwen3-0.6B `tie_word_embeddings=True`（实测确认）→ ①embedding 不单独 `fully_shard`（tie 时单独 wrap 破坏权重共享，对齐 actor.py:956）；②建模型全 rank load 全量到 CPU（tie 走 meta device 会 broadcast hang，对齐 actor.py:217-226）。**5090 2卡 PASSED**：q_proj local shard=1048576=全量的一半（真分片）、loss=-2.0（数学精确 -1×dp2/gbs1）、grad_norm=308、权重 L2 变化 0.14、tie 未 hang。
 - **V7.2**：教学核心=**累积多微批梯度 == 一次大批梯度**。`train_batch`：zero_grad 一次→逐微批 `_micro_backward` 累积→末尾单次 clip+step（对齐源 `_train_core` + step 门控）。每微批 loss 乘 `dp_size/global_batch_size`：与 FSDP 反向的 dp 平均相抵→累积 N 微批==全局批「逐样本 mean 之和/gbs」单次梯度。`train_step` 保留为 gbs=1 薄封装。**5090 2卡 PASSED**：**累积等价性 max_diff=0.000e+00**（两独立累积路径梯度逐参数精确相等）；`loss=0.0` 是预期正确（两样本 adv=+1/-1 缩放后 loss 相消，但梯度不相消 grad_norm=166→演示「loss 抵消≠梯度抵消」）。
+- **V7.3 Ray+FSDP+权重同步（收官刀）**：把 `FSDPTrainer` 从 torchrun 单脚本**搬进 Ray actor**，形成真 torch.distributed 进程组，闭合 rollout→train→update_weights，权重 disk reload 同步回 SGLang。对齐源 `train_actor.py:29-71`（actor `__init__` 设 MASTER_*/RANK/LOCAL_RANK env、init_process_group 留 init() 集体 rendezvous）+ `actor_group.py:94-106`（rank0 暴露自由端口→广播给 rank>0）。**两个老 v7-plan.md 漏掉的正确性点**：①**LOCAL_RANK 恒 0 不是 rank**（Ray 独占 CUDA_VISIBLE_DEVICES，用 rank 会 invalid device）；②**权重同步=集体 save + 仅 rank0 落盘/POST**（save_pretrained 是集体 gather，每 rank 都进但落盘/POST/version 只 rank0，避免重复 reload/version 分叉）。DP-split=`samples[rank::world_size]`（对齐源 `_split_train_data_by_dp`）。**复用 train_ray.train 不建 train_fsdp.py**（同步主循环 backend 无关，纠老计划 trap）。**5090 端到端 PASSED**：`--world 1`（FSDP@GPU2）+ `--world 2`（FSDP@GPU2,3 双卡收官）都 3 轮闭环、weight_v 2→3→4、rollout 2 真 backward（loss≈-0.33、train≈13s）、rollout 0/1 组内无方差被 mask（loss=0，同 V6 GRPO 正确语义）、sync≈29s（集体 save+disk reload）、未 hang。离线全回归绿（V0-A3+V6）。
 - **V7.1 packing 暂缓（登记偏离）**：源 `pack_sequences` flat 1D + position_ids reset + `attention_mask=None`，**靠 flash-attn varlen 隔离样本**；5090 无 flash-attn 且 Blackwell sm_120 难编译，缺它会让样本间注意力**静默串扰、loss 算错**（比不做更危险）。忠实替代=用 cu_seqlens 物化**块对角 mask** 显式隔离，留能装 flash-attn 时补。不假装做了。
 - **踩坑（已修）**：①`accelerate` 缺失（`init_empty_weights` 依赖）→补进 `[train]` extra；②`_no_split_modules` 在 transformers 5.x 是 `set` 不可 `[0]` 索引→改成员测试。
-- **偏离**（v7.md 5 条三要素表）：无 packing（#1，最大，缺 flash-attn）、无 KL/entropy、DP=1 无多维并行（留 V8）、权重同步待 V7.3、单样本/小微批。
+- **偏离**（v7.md 6 条三要素表）：无 packing（#1，最大，缺 flash-attn）、无 KL/entropy、无 TP/PP/CP 多维并行（留 V8）、权重同步 disk reload vs 源 NCCL broadcast（留 V7.4/泛化 infra weight_publishing）、单节点 master=127.0.0.1、单样本/小微批+无 placement group。
+- **后续路线**（详见 `docs/decisions/v7-onward-plan.md`）：V7.4 接 infra learner_contract+trace（as spec，在 repo 忠实重写）+ 补版本戳；V7.5 退休 packing 偏离；V8 Megatron 多维并行。
 
 ## 7. 待办 / 已知问题
 
