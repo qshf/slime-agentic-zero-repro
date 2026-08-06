@@ -123,15 +123,12 @@ class FSDPTrainer:
         )
         logger.info(f"Rank {self.rank}: FSDPTrainer ready (tie={tie}, dp_size={self.dp_size})")
 
-    def _micro_backward(
+    def _microbatch_backward(
         self,
-        tokens: list[int],
-        loss_mask: list[int],
-        reward: float,
-        old_log_probs: Optional[list[float]],
+        samples: list[dict],
         global_batch_size: int,
-    ) -> float:
-        """单个微批的 forward + loss + backward（累积梯度，**不 step、不 zero_grad**）。
+    ) -> tuple[float, int]:
+        """一个多样本微批的 forward + loss + backward（累积梯度，**不 step、不 zero_grad**）。
 
         对齐源 actor.py:551-678 的 _train_step 主体（去掉 packing / step 门控）。
         loss 数学与 V6 TorchActor 完全一致：
@@ -141,66 +138,110 @@ class FSDPTrainer:
           loss   = -masked_mean(pg)                           # sum_of_sample_mean, actor.py:911
           loss   = loss * dp_size / global_batch_size         # actor.py:677（累积缩放）
 
-        缩放的意义（V7.2 教学核心）：每微批乘 dp_size/gbs，FSDP 反向自动按 dp_size 平均梯度，
-        两者相抵 → 累积 gbs 个微批的梯度 == 对全局批取「逐样本 mean 之和 / gbs」的单次梯度。
+        缩放的意义（V7.2 教学核心）：每个微批的逐样本 loss 先求和，再乘 dp_size/gbs；
+        FSDP 反向自动按 dp_size 平均梯度，两者相抵 → 累积所有微批的梯度等于全局批
+        的「逐样本 mean 之和 / gbs」。
+
+        源项目在 packing 后以一个 packed microbatch 做前向；nano 尚未实现 varlen packing，
+        所以此处按本微批的最长序列做 padding。两者的逐样本 loss / 累积语义等价，吞吐优化留 V7.1。
         """
-        if len(tokens) < 2 or sum(loss_mask) == 0:
-            return 0.0
+        trainable_samples = [
+            s for s in samples if len(s["tokens"]) >= 2 and sum(s["loss_mask"]) > 0
+        ]
+        if not trainable_samples:
+            return 0.0, 0
 
-        input_ids = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)  # [1,L]
-        tgt_mask = torch.tensor(loss_mask[1:], dtype=torch.float32, device=self.device)       # [L-1]
-        adv = torch.tensor(float(reward), device=self.device)                                 # 标量广播
-
-        old_lp = (
-            torch.tensor(old_log_probs[1:], dtype=torch.float32, device=self.device)
-            if old_log_probs is not None
-            else None
+        max_length = max(len(s["tokens"]) for s in trainable_samples)
+        input_ids = torch.full(
+            (len(trainable_samples), max_length), self.pad_id, dtype=torch.long, device=self.device
         )
+        attention_mask = torch.zeros_like(input_ids)
+        for row, s in enumerate(trainable_samples):
+            length = len(s["tokens"])
+            input_ids[row, :length] = torch.tensor(s["tokens"], dtype=torch.long, device=self.device)
+            attention_mask[row, :length] = 1
 
-        # Forward（对齐 actor.py:554）：logits[:-1] 预测 tokens[1:]。
-        logits = self.model(input_ids).logits.squeeze(0)[:-1, :].float()  # [L-1, V]
-        targets = input_ids.squeeze(0)[1:]                                 # [L-1]
-        cur_lp = torch.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)  # [L-1]
+        # Forward（对齐 actor.py:554）：每行 logits[:-1] 预测对应行 tokens[1:]。
+        logits = self.model(input_ids, attention_mask=attention_mask).logits.float()
+        sample_losses = []
+        for row, s in enumerate(trainable_samples):
+            length = len(s["tokens"])
+            tgt_mask = torch.tensor(s["loss_mask"][1:], dtype=torch.float32, device=self.device)
+            targets = input_ids[row, 1:length]
+            cur_lp = torch.log_softmax(logits[row, : length - 1], dim=-1).gather(
+                -1, targets.unsqueeze(-1)
+            ).squeeze(-1)
 
-        # ratio = exp(cur - old)；无真 old 时退化 on-policy（ratio=1）。对齐 ppo_utils.py:132。
-        old_lp = cur_lp.detach() if old_lp is None else old_lp
-        ratio = (cur_lp - old_lp).exp()
-        # GRPO：标量 adv 广播到每个 token。PPO clip（此时还是要最大化的 J）。ppo_utils.py:133-135。
-        pg = torch.min(ratio * adv, ratio.clamp(1 - self.eps_clip, 1 + self.eps_clip_high) * adv)  # [L-1]
+            old_log_probs = s.get("old_log_probs")
+            old_lp = (
+                torch.tensor(old_log_probs[1:], dtype=torch.float32, device=self.device)
+                if old_log_probs is not None
+                else cur_lp.detach()
+            )
+            ratio = (cur_lp - old_lp).exp()  # 对齐 ppo_utils.py:132。
+            adv = torch.tensor(float(s["reward"]), device=self.device)
+            # GRPO：标量 adv 广播到每个 token。PPO clip（ppo_utils.py:133-135）。
+            pg = torch.min(
+                ratio * adv,
+                ratio.clamp(1 - self.eps_clip, 1 + self.eps_clip_high) * adv,
+            )
+            # sum_of_sample_mean 的单样本项（actor.py:911）。
+            sample_losses.append(-(pg * tgt_mask).sum() / torch.clamp_min(tgt_mask.sum(), 1.0))
 
-        # masked mean over 可训 token（sum_of_sample_mean 单样本版，actor.py:911）。
-        masked = (pg * tgt_mask).sum() / torch.clamp_min(tgt_mask.sum(), 1.0)
-        loss = -masked  # optimizer 是 minimize，加负号把"最大化 J"转"最小化 L"。
-
-        # 梯度累积缩放（对齐 actor.py:677）：除以 global_batch_size、乘 dp_size 抵消 FSDP dp 平均。
-        loss = loss * self.dp_size / global_batch_size
+        # 梯度累积缩放（对齐 actor.py:677）：本地先乘 dp_size / global_batch_size。
+        # 注意 FSDP2 的 `fully_shard(...)` 会在 loss.backward() 的 autograd hook 里做
+        # DP 维梯度 reduce-scatter/平均；因此最终全局缩放是：
+        #   local_sum * dp_size / global_batch_size / dp_size = local_sum / global_batch_size
+        # 若这里不乘 dp_size，FSDP 再平均一次后会变成 1 / (global_batch_size * dp_size)。
+        loss = torch.stack(sample_losses).sum() * self.dp_size / global_batch_size
         loss.backward()  # 累积到 .grad，不清零
-        return float(loss.detach())
+        return float(loss.detach()), len(trainable_samples)
+
+    def _micro_backward(
+        self,
+        tokens: list[int],
+        loss_mask: list[int],
+        reward: float,
+        old_log_probs: Optional[list[float]],
+        global_batch_size: int,
+    ) -> float:
+        """单样本兼容入口，委托给多样本 `_microbatch_backward()`。"""
+        loss, _ = self._microbatch_backward(
+            [{"tokens": tokens, "loss_mask": loss_mask, "reward": reward, "old_log_probs": old_log_probs}],
+            global_batch_size,
+        )
+        return loss
 
     def train_batch(
         self,
         samples: list[dict],
         global_batch_size: Optional[int] = None,
+        microbatch_size: int = 1,
     ) -> dict:
         """梯度累积一步：zero_grad → 逐微批 backward 累积 → 单次 clip+step。
 
         对齐源 actor.py:521-532 + 684-693 的 _train_core 累积循环：本地按微批遍历、
-        梯度累积到 grad_accum 边界才 optimizer.step()。nano V7.2 每样本即一个微批
-        （无 packing，留 V7.1），一个 train_batch 即一个累积窗口 → 末尾 step 一次。
+        梯度累积到 grad_accum 边界才 optimizer.step()。nano 的一个 train_batch 即一个累积窗口，
+        `microbatch_size` 个样本组成一个 padding 微批，窗口末尾只 step 一次。
 
-        samples: [{tokens, loss_mask, reward, old_log_probs?}, ...]（本 rank 的本地微批）。
+        samples: [{tokens, loss_mask, reward, old_log_probs?}, ...]（本 rank 的本地样本）。
         global_batch_size: 全局批大小（用于缩放）；默认取 self.global_batch_size。
+        microbatch_size: 每个微批的样本数；默认 1，保持 V7.0 单样本入口兼容。
         """
+        if microbatch_size < 1:
+            raise ValueError(f"microbatch_size must be positive, got {microbatch_size}")
         gbs = global_batch_size if global_batch_size is not None else self.global_batch_size
 
         self.optimizer.zero_grad(set_to_none=True)  # 累积窗口开始，清零一次（actor.py:523）
         loss_sum, trained = 0.0, 0
-        for s in samples:
-            l = self._micro_backward(
-                s["tokens"], s["loss_mask"], s["reward"], s.get("old_log_probs"), gbs
+        num_microbatches = 0
+        for start in range(0, len(samples), microbatch_size):
+            l, trained_in_microbatch = self._microbatch_backward(
+                samples[start:start + microbatch_size], gbs
             )
             loss_sum += l
-            trained += 1 if l != 0.0 else 0
+            trained += trained_in_microbatch
+            num_microbatches += 1
 
         # 累积窗口结束：clip + step 一次（actor.py:686-690）。
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
@@ -210,7 +251,7 @@ class FSDPTrainer:
             "loss": loss_sum,
             "grad_norm": float(grad_norm),
             "trained_samples": trained,
-            "num_microbatches": len(samples),
+            "num_microbatches": num_microbatches,
         }
 
     def train_step(

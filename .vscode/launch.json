@@ -1,0 +1,43 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "V7.0 · FSDP 2 GPUs",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "torch.distributed.run",
+      "args": [
+        "--standalone",
+        "--nproc_per_node=2",
+        "scripts/test_v7.0_fsdp_single.py"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal",
+      "subProcess": true,
+      "justMyCode": false
+    },
+    {
+      "name": "V7.2 · FSDP Gradient Accumulation (2 GPUs)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "torch.distributed.run",
+      "args": [
+        "--standalone",
+        "--nproc_per_node=2",
+        "scripts/test_v7.2_grad_accum.py"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "console": "integratedTerminal",
+      "subProcess": true,
+      "justMyCode": false
+    }
+  ]
+}
