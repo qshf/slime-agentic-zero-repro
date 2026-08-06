@@ -52,7 +52,7 @@
 | 版本 | 标题 | 关键学点 | 状态 |
 |------|------|---------|------|
 | V6 | 真训练闭环（GSM8K）| 真 log_probs + 真 GRPO 组归一 + 真 torch 训练一步 + 真权重同步 | ✅ 全链路跑通（5090 端到端：真 log_probs nonzero、真 backward、weight_v 递增、真同步 disk reload；acc 0.4→0.2 变化证明权重真被改，稳定提升属训练规模/超参问题留后续）|
-| V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | 🚧 V7.0+V7.2 ✅（5090 2卡真分片：q_proj local=full/2、tie 忠实处理不 hang、累积等价性 max_diff=0）；V7.1 packing 暂缓（5090 无 flash-attn）；V7.3 Ray+权重同步待做 |
+| V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | 🚧 V7.0+V7.2 ✅（5090 2卡真分片：q_proj local=full/2、tie 忠实处理不 hang、累积等价性 max_diff=0）；V7.3 Ray+FSDP+权重同步**代码完成+离线全回归绿**（服务器 --world 1→2 待跑）；V7.1 packing 暂缓（5090 无 flash-attn）|
 | V8 | Megatron 并行 | TP/PP/CP/EP 概念 | 记录设计 |
 | V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
 

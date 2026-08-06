@@ -34,12 +34,15 @@ def create_placement_groups(args: Args) -> dict:
     """对齐源 create_placement_groups（placement_group.py:79）：分配资源 + 让 ray 就绪。
 
     偏离（见 v4.md）：源用 `PlacementGroupSchedulingStrategy` 把 actor/engine 钉到
-    `{"GPU":1,"CPU":1}` bundle；nano trainer 是 fake（CPU）、SGLang 在独立 docker，没有要 ray
-    调度的 GPU，故只 `ray.init(num_gpus=0)`，返回占位 dict 保持形状（下游不依赖其内容）。
+    `{"GPU":1,"CPU":1}` bundle；nano fake/torch trainer 无需 Ray 调度 GPU，故 `ray.init(num_gpus=0)`。
+    V7.3 fsdp 后端需 Ray 给训练 actor 分卡 → `ray.init(num_gpus=fsdp_world_size)`（让 Ray 看得到卡，
+    每个 num_gpus=1 的 actor 独占一张；driver 侧用 CUDA_VISIBLE_DEVICES 限定到 SGLang 未占的空闲卡）。
     """
     if not ray.is_initialized():
+        # fsdp 后端要 Ray 调度 GPU 给训练 actor；fake/torch 无 GPU 调度需求（=0）。
+        num_gpus = args.fsdp_world_size if args.train_backend == "fsdp" else 0
         ray.init(
-            num_gpus=0,
+            num_gpus=num_gpus,
             ignore_reinit_error=True,
             log_to_driver=False,  # 压掉 worker 日志刷屏，测试输出更干净
             runtime_env={"env_vars": {"PYTHONPATH": _WORKER_PYTHONPATH}},

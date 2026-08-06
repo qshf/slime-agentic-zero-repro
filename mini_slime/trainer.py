@@ -1,17 +1,19 @@
-"""V3/V6: Trainer —— "谁负责训" 的角色。
+"""V3/V6/V7.3: Trainer —— "谁负责训" 的角色。
 
 对齐源项目 actor（slime/backends/fsdp_utils/actor.py）的**角色与签名**：
   - train(rollout_id, rollout_data) : actor.py:437，消费 RolloutManager 产的 train_data dict
   - update_weights()                : actor.py:725，训练后把权重同步回推理引擎
 
-两个后端（args.train_backend）：
+三个后端（args.train_backend）：
   - "fake"（V0-A3/离线，默认）：不 forward/backward，只消费 train_data 结构 + 产可断言指标。
-  - "torch"（V6.3）：真 forward/backward/optimizer 一步，loss 公式对齐源 ppo_utils.compute_policy_loss
+  - "torch"（V6.3）：单卡真 forward/backward/optimizer 一步，loss 对齐源 ppo_utils.compute_policy_loss
     + fsdp_utils/actor.py 的 sum_of_sample_mean。单卡纯 torch（不 FSDP/offload，见 v6.md 偏离表）。
+  - "fsdp"（V7.3）：FSDP2 分片后端跑在 Ray actor 里、真 torch.distributed 进程组。loss 数学与
+    torch 后端**完全相同**（同一 GRPO policy gradient），只换执行后端为分片 + 跨 rank DP。
 
-偏离说明（docs/decisions/{v3,v6}.md 偏离表）：
-  - fake 后端不算真梯度（主线一聚焦系统骨架）；V6.3 torch 后端补真训练一步。
-  - torch 后端单卡、无 FSDP 多维并行/CPU offload、关 KL/entropy（nano 取最简，语义是纯 GRPO policy gradient）。
+偏离说明（docs/decisions/{v3,v6,v7}.md 偏离表）：
+  - fake 后端不算真梯度（主线一聚焦系统骨架）；torch 补单卡真训练一步；fsdp 补分布式分片。
+  - 关 KL/entropy（nano 取最简，语义是纯 GRPO policy gradient）。
 """
 
 from __future__ import annotations
@@ -22,24 +24,71 @@ from mini_slime.args import Args
 from mini_slime.weight_sync import WeightUpdater
 
 
+def _rollout_data_to_samples(rollout_data: dict) -> list[dict]:
+    """列式 rollout_data → 逐样本 list（FSDPTrainer.train_batch 的入参格式）。
+
+    RolloutManager 产列式 `{tokens:[[..]], loss_masks, rewards, rollout_log_probs}`
+    （rollout_manager.py:102-108）；FSDPTrainer.train_batch 要 `list[dict{tokens,loss_mask,
+    reward,old_log_probs}]`（fsdp_trainer.py:227）。这层转置放在 Trainer（backend 适配层），
+    让 FSDPTrainer 不认识 nano 列格式——与 V6 Trainer 把列 dict 交给 TorchActor 一致的分层。
+
+    rollout_log_probs 空 [] → old_log_probs=None（退化 on-policy）：_microbatch_backward 对
+    None 走 ratio=1，对 [] 会 tensor([]) 维度不匹配，故空列表须归一为 None。
+    """
+    tokens = rollout_data["tokens"]
+    loss_masks = rollout_data["loss_masks"]
+    rewards = rollout_data["rewards"]
+    log_probs = rollout_data.get("rollout_log_probs") or [None] * len(tokens)
+    samples = []
+    for i in range(len(tokens)):
+        lp = log_probs[i] if log_probs[i] else None  # 空 [] 或 None → None
+        samples.append(
+            {"tokens": tokens[i], "loss_mask": loss_masks[i], "reward": rewards[i], "old_log_probs": lp}
+        )
+    return samples
+
+
 class Trainer:
     """训练器角色。对齐源 actor（train / update_weights 签名）。"""
 
-    def __init__(self, args: Args) -> None:
+    def __init__(self, args: Args, rank: int = 0, world_size: int = 1) -> None:
         self.args = args
-        self._torch_actor = None
+        self.rank = rank            # V7.3 fsdp：本 rank 号（fake/torch 恒 0）
+        self.world_size = world_size  # V7.3 fsdp：DP world_size（fake/torch 恒 1）
+        self._torch_actor = None    # V6 单卡 torch 后端
+        self._fsdp_trainer = None   # V7.3 FSDP 分片后端
+
         if args.train_backend == "torch":
-            # 延迟导入：torch/transformers 只在服务器 V6.3 装（optional [train]）。
+            # 延迟导入：torch/transformers 只在服务器装（optional [train]）。
             from mini_slime.torch_actor import TorchActor
 
             self._torch_actor = TorchActor(args)
+        elif args.train_backend == "fsdp":
+            # FSDPTrainer.__init__ 读 actor 设的 RANK/WORLD_SIZE/LOCAL_RANK env 并 dist.init_process_group
+            #（各 rank 集体 rendezvous）。故本 Trainer 必须在 actor.init() 阶段构造（见 actor_group.py）。
+            from toy_rl.trainer.fsdp_trainer import FSDPTrainer
+
+            self._fsdp_trainer = FSDPTrainer(
+                model_path=args.train_model_path,
+                lr=args.train_lr,
+                eps_clip=args.eps_clip,
+                eps_clip_high=args.eps_clip_high,
+                clip_grad=args.clip_grad,
+                global_batch_size=args.global_batch_size,
+            )
+            # FSDPTrainer 自己知道真实 rank（从 dist 读），以它为准。
+            self.rank = self._fsdp_trainer.rank
+            self.world_size = self._fsdp_trainer.world_size
+
         # 权重同步委托给独立角色（对齐源 actor 持有权重同步机制）。
-        # torch 后端把可训模型交给 WeightUpdater 落盘供 SGLang reload。
+        # torch/fsdp 后端把可训模型交给 WeightUpdater 落盘供 SGLang reload。
+        train_actor = self._fsdp_trainer if self._fsdp_trainer is not None else self._torch_actor
         self.weight_updater = WeightUpdater(
-            save_path=args.weight_save_path if args.train_backend == "torch" else None,
-            torch_actor=self._torch_actor,
+            save_path=args.weight_save_path if args.train_backend in ("torch", "fsdp") else None,
+            torch_actor=train_actor,
+            rank=self.rank,  # V7.3：fsdp 的 save 是集体操作，但落盘 + SGLang POST 只 rank0
         )
-        if args.train_backend == "torch":
+        if args.train_backend in ("torch", "fsdp"):
             # 训练后落盘的权重由 SGLang 从 disk 热重载（disk reload 最小路径，见 weight_sync 注释）。
             self.weight_updater.generate_url = args.sglang_generate_url
 
@@ -52,7 +101,8 @@ class Trainer:
         """对齐源 actor.train(rollout_id, rollout_data)：消费 train_data dict。
 
         fake：不 forward/backward，只消费数据结构、产出可断言指标（+ V5 sleep 旋钮模拟耗时）。
-        torch：真 PPO policy-gradient 一步，返回真 loss。
+        torch：单卡真 PPO policy-gradient 一步。
+        fsdp：本 rank 训自己那片（DP split）——真分片 + 跨 rank 梯度 reduce。
         """
         rewards = rollout_data["rewards"]
         n_trainable = sum(sum(m) for m in rollout_data["loss_masks"])
@@ -68,10 +118,26 @@ class Trainer:
             metrics.update(self._torch_actor.train_step(rollout_data))
             return metrics
 
+        if self._fsdp_trainer is not None:
+            # 列 dict → 逐样本 list，再按 rank DP-split（对齐源 _split_train_data_by_dp：
+            # 跨步分片，rank r 拿 samples[r::world_size]）。gbs = 全局样本数，缩放让累积梯度=全局批 mean。
+            all_samples = _rollout_data_to_samples(rollout_data)
+            gbs = max(len(all_samples), 1)
+            local_samples = all_samples[self.rank :: self.world_size]
+            if local_samples:
+                metrics.update(self._fsdp_trainer.train_batch(local_samples, global_batch_size=gbs))
+            else:
+                metrics.update({"loss": 0.0, "grad_norm": 0.0, "trained_samples": 0})
+            return metrics
+
         if self.args.fake_train_seconds > 0:
             time.sleep(self.args.fake_train_seconds)
         return metrics
 
     def update_weights(self) -> None:
-        """对齐源 actor.update_weights()：训练后把权重同步回推理引擎（委托 WeightUpdater）。"""
+        """对齐源 actor.update_weights()：训练后把权重同步回推理引擎（委托 WeightUpdater）。
+
+        fsdp：save_pretrained 是**集体操作**（各 rank gather 分片到 rank0），故每个 rank 都要进
+        （RayTrainGroup.update_weights fan-out 已保证）；WeightUpdater 内部只让 rank0 落盘 + POST。
+        """
         self.weight_updater.update_weights()
