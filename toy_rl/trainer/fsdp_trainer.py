@@ -69,7 +69,10 @@ class FSDPTrainer:
         self.fp16 = fp16
         self.cpu_offload = cpu_offload
 
-        # torchrun 已设好 RANK/WORLD_SIZE/LOCAL_RANK 环境变量；init_process_group 读它们。
+        # 启动器已在每个训练进程内设好 RANK/WORLD_SIZE/LOCAL_RANK：
+        #   - V7.0/V7.2 torchrun 路径由 torchrun 设置；
+        #   - V7.3 Ray 路径由 TrainRayActor 在各 actor 进程内设置。
+        # init_process_group 读取这些 env 完成 rendezvous。
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 
