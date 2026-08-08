@@ -24,7 +24,8 @@ from torch.distributed.tensor import DTensor
 
 from toy_rl.trainer.fsdp_trainer import FSDPTrainer
 
-MODEL_PATH = "/home/ubuntu/models/Qwen/Qwen3-0.6B"
+import os
+MODEL_PATH = os.environ.get("NANO_MODEL_PATH", "/home/ubuntu/models/Qwen/Qwen3-0.6B")
 
 
 def _make_sample(trainer: FSDPTrainer):

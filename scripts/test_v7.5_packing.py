@@ -36,7 +36,8 @@ from torch.distributed.tensor import DTensor
 from toy_rl.trainer.data_packing import build_block_diagonal_causal_mask, pack_sequences
 from toy_rl.trainer.fsdp_trainer import FSDPTrainer
 
-MODEL_PATH = "/home/ubuntu/models/Qwen/Qwen3-0.6B"
+import os
+MODEL_PATH = os.environ.get("NANO_MODEL_PATH", "/home/ubuntu/models/Qwen/Qwen3-0.6B")
 
 
 def _make_samples(trainer: FSDPTrainer) -> list[dict]:

@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -51,7 +52,7 @@ def _server_args(world_size: int) -> Args:
         orchestra_expert_base_url="http://localhost:30000/v1",
         orchestra_expert_model="Qwen/Qwen3-0.6B",
         sglang_generate_url="http://localhost:30000/generate",
-        train_model_path="/home/ubuntu/models/Qwen/Qwen3-0.6B",
+        train_model_path=os.environ.get("NANO_MODEL_PATH", "/home/ubuntu/models/Qwen/Qwen3-0.6B"),
         data_source_path="toy_rl.agent.toolorchestra.gsm8k_data.load_data_source",
         custom_generate_function_path="toy_rl.agent.toolorchestra.rollout.generate",
         custom_rm_path="toy_rl.agent.toolorchestra.rollout.reward_func",
