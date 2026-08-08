@@ -113,26 +113,57 @@ class Trainer:
             "trainable_tokens": n_trainable,
             "total_tokens": n_total,
         }
+        # V7.4 learner_trace（opt-in）：可测相位计时 + token 分母（源锚点 infra LearnerTrace）。
+        # model_tokens = 全序列长度之和；compute 相位把 forward+backward 合并计（repo 未拆 log-prob 独立
+        # 前向，见 learner_metrics 偏离）。default off → 不加这些键，V0-V7.3 metric dict 不变。
+        trace = self.args.learner_trace
+        t_prep = 0.0
 
         if self._torch_actor is not None:
+            t0 = time.perf_counter() if trace else 0.0
             metrics.update(self._torch_actor.train_step(rollout_data))
+            if trace:
+                self._fill_trace(metrics, rollout_data, batch_prep=0.0, compute=time.perf_counter() - t0)
             return metrics
 
         if self._fsdp_trainer is not None:
             # 列 dict → 逐样本 list，再按 rank DP-split（对齐源 _split_train_data_by_dp：
             # 跨步分片，rank r 拿 samples[r::world_size]）。gbs = 全局样本数，缩放让累积梯度=全局批 mean。
+            t0 = time.perf_counter() if trace else 0.0
             all_samples = _rollout_data_to_samples(rollout_data)
             gbs = max(len(all_samples), 1)
             local_samples = all_samples[self.rank :: self.world_size]
+            t_prep = (time.perf_counter() - t0) if trace else 0.0
+            t1 = time.perf_counter() if trace else 0.0
             if local_samples:
                 metrics.update(self._fsdp_trainer.train_batch(local_samples, global_batch_size=gbs))
             else:
                 metrics.update({"loss": 0.0, "grad_norm": 0.0, "trained_samples": 0})
+            if trace:
+                self._fill_trace(metrics, rollout_data, batch_prep=t_prep, compute=time.perf_counter() - t1)
             return metrics
 
         if self.args.fake_train_seconds > 0:
             time.sleep(self.args.fake_train_seconds)
+        if trace:
+            self._fill_trace(metrics, rollout_data, batch_prep=0.0, compute=0.0)
         return metrics
+
+    def _fill_trace(self, metrics: dict, rollout_data: dict, batch_prep: float, compute: float) -> None:
+        """把可测相位 + 分母塞进 metrics，供主循环组装 LearnerTrace（V7.4，opt-in）。
+
+        只填本层可测的：batch_preparation（列→list+DP-split）、forward_backward（compute 合并）。
+        optimizer/log_prob 未拆 → 0.0（登记偏离）；weight_publish 由主循环包 update_weights 补。
+        rollout_policy_version 取本批共享值（None=未戳时留 None，主循环判空跳过 trace）。
+        """
+        versions = rollout_data.get("rollout_policy_versions") or []
+        shared = {v for v in versions if v is not None}
+        metrics["_trace"] = {
+            "model_tokens": sum(len(t) for t in rollout_data["tokens"]),
+            "batch_preparation_seconds": batch_prep,
+            "forward_backward_seconds": compute,
+            "rollout_policy_version": (shared.pop() if len(shared) == 1 else None),
+        }
 
     def update_weights(self) -> None:
         """对齐源 actor.update_weights()：训练后把权重同步回推理引擎（委托 WeightUpdater）。

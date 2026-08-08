@@ -100,10 +100,12 @@ def custom_convert(args, samples: list) -> dict:
     # 3. 按 turn 拆独立训练样本（orchestrator 每轮一条）。
     tokens_list, response_lengths, loss_masks = [], [], []
     rewards, log_probs_list = [], []
+    policy_versions = []  # V7.4：每个 turn-row 继承父 Sample 的 rollout 版本（与其它列 1:1 对齐）
     for i, sample in enumerate(samples):
         turns = sample.metadata.get("turns")
         norm_r = normalized[i]
         should_mask = not keep_mask[i]
+        pv = sample.rollout_policy_version  # 父样本版本，拆出的每个 turn-row 都继承它
 
         if not turns:
             # 无 turns（不该发生在 A3/V6 路径）：整条按单序列处理。
@@ -112,6 +114,7 @@ def custom_convert(args, samples: list) -> dict:
             loss_masks.append([0] * len(sample.loss_mask) if should_mask else sample.loss_mask)
             rewards.append(norm_r)
             log_probs_list.append(sample.rollout_log_probs)
+            policy_versions.append(pv)
             continue
 
         # 有 turns：每个 turn 拆成独立训练样本。
@@ -139,6 +142,7 @@ def custom_convert(args, samples: list) -> dict:
             loss_masks.append(full_loss_mask)
             rewards.append(norm_r)
             log_probs_list.append(full_log_probs)
+            policy_versions.append(pv)  # V7.4：本 turn-row 继承父样本版本
 
     return {
         "tokens": tokens_list,
@@ -146,4 +150,5 @@ def custom_convert(args, samples: list) -> dict:
         "rewards": rewards,
         "response_lengths": response_lengths,
         "rollout_log_probs": log_probs_list,
+        "rollout_policy_versions": policy_versions,  # V7.4：与其它列逐行对齐（长度 = turn-row 数）
     }

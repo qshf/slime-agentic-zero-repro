@@ -64,18 +64,23 @@ class RolloutManager:
         group = self.args.n_samples_per_prompt if self.custom_convert else 1
         return [copy.deepcopy(s) for s in base for _ in range(group)]
 
-    async def generate(self, rollout_id: int) -> dict:
+    async def generate(self, rollout_id: int, rollout_policy_version: int | None = None) -> dict:
         """对齐源 rollout.py:539 def generate(rollout_id)：产出一批训练数据 dict。
 
         源: _get_rollout_data → _convert_samples_to_train_data → _split_train_data_by_dp
         V3: 逐条跑 generate hook（真 SGLang rollout）+ reward hook → _convert（不切 DP）
         A1: 数据源直接给 Sample（可能带 metadata["context"]），hook 就地回填 tokens/loss_mask/reward。
+
+        V7.4（infra 缺口 1）：rollout_policy_version = 产生本批 rollout 时推理引擎上的权重版本
+        （主循环在调用前从 trainer 取当前 weight_version 传入）。戳到每条 Sample 上，供 learner_contract
+        算 staleness / 校验单一版本。None（V0-A3/离线不传）时不戳，行为不变。
         """
         samples: list[Sample] = []
         for s in self._next_batch(rollout_id):
             s = await self.generate_rollout(self.args, s)              # 真 SGLang rollout（复用 V1/V2 loop）
             reward_result = await self.reward_func(self.args, s)       # per-sample reward hook
             s.reward = reward_result["reward"]
+            s.rollout_policy_version = rollout_policy_version          # V7.4：戳当时的权重版本（None=不戳）
             # 保存 reward_features 供 custom_convert 使用（V6.2 GRPO 需要 correctness）
             if not isinstance(s.metadata, dict):
                 s.metadata = {}
@@ -105,6 +110,8 @@ class RolloutManager:
             "rewards": [s.reward for s in samples],
             "response_lengths": [sum(s.loss_mask) if s.loss_mask else len(s.tokens) for s in samples],
             "rollout_log_probs": [s.rollout_log_probs for s in samples],
+            # V7.4（infra 缺口 1）：每条样本的 rollout 版本（None=未戳，V0-A3 透明）。
+            "rollout_policy_versions": [s.rollout_policy_version for s in samples],
         }
 
     def pid(self) -> int:

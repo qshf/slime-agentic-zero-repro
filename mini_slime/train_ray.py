@@ -39,11 +39,20 @@ def train(args: Args) -> list[dict]:
     actor_model.update_weights()
 
     metrics_log: list[dict] = []
+    traces: list = []  # V7.4：opt-in learner trace（分相位计时）
     for rollout_id in range(args.num_rollout):
         # 1) 产数据：另一进程的 RolloutManager actor（对齐 rollout_data_ref = ray.get(...generate.remote)）
+        #    V7.4（缺口 1）：把当时的权重版本传给 generate，戳到每条 Sample（None-safe，默认路径不启用校验）。
         t0 = time.time()
-        rollout_data = ray.get(rollout_manager.generate.remote(rollout_id))
+        cur_version = actor_model.weight_version()
+        rollout_data = ray.get(rollout_manager.generate.remote(rollout_id, cur_version))
         t_gen = time.time() - t0
+
+        # V7.4 learner_contract（opt-in）：把 train_data 过一遍 LearnerSample 校验（不改数据，失败即抛）。
+        if getattr(args, "learner_contract_validate", False):
+            from mini_slime.learner_contract import validate_train_data
+
+            validate_train_data(rollout_data)
 
         # 2) 训：fan-out 到 worker actor 们，ray.get 是同步点（对齐 ray.get(actor_model.async_train(...))）
         t0 = time.time()
@@ -68,6 +77,28 @@ def train(args: Args) -> list[dict]:
         }
         if "loss" in m:  # V6.3 torch 后端：透传真训练 loss（fake 后端无此键）
             metrics["loss"] = m["loss"]
+        # V7.4 learner_trace（opt-in）：用 trainer 回传的可测相位 + 主循环的 publish 计时组装 LearnerTrace。
+        if getattr(args, "learner_trace", False) and m.get("_trace") is not None:
+            from mini_slime.learner_metrics import LearnerTrace
+
+            tr = m["_trace"]
+            rollout_pv = tr["rollout_policy_version"]
+            if rollout_pv is not None:  # 未戳版本则跳过 trace（int 契约要求非空）
+                trace = LearnerTrace(
+                    rollout_id=rollout_id,
+                    rollout_policy_version=rollout_pv,
+                    trainer_policy_version=metrics["weight_version"],
+                    samples=m.get("trained_samples", 0),
+                    model_tokens=tr["model_tokens"],
+                    trainable_tokens=m["trainable_tokens"],
+                    batch_preparation_seconds=tr["batch_preparation_seconds"],
+                    log_prob_seconds=0.0,          # repo 融合 log-prob 进 forward（偏离，见 learner_metrics）
+                    forward_backward_seconds=tr["forward_backward_seconds"],
+                    optimizer_seconds=0.0,         # 未与 fwd/bwd 拆分（偏离）
+                    weight_publish_seconds=t_sync,
+                )
+                traces.append(trace)
+                metrics["policy_version_gap"] = trace.to_dict()["policy_version_gap"]
         metrics_log.append(metrics)
         print(
             f"[rollout {rollout_id}] "
@@ -76,6 +107,11 @@ def train(args: Args) -> list[dict]:
             f"tokens={metrics['tokens_per_rollout']} "
             f"weight_v={metrics['weight_version']}"
         )
+
+    if getattr(args, "learner_trace", False) and traces:
+        from mini_slime.learner_metrics import summarize_learner_traces
+
+        print(f"[learner_trace] {summarize_learner_traces(traces)}")
 
     return metrics_log
 

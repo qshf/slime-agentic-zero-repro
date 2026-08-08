@@ -53,6 +53,7 @@
 |------|------|---------|------|
 | V6 | 真训练闭环（GSM8K）| 真 log_probs + 真 GRPO 组归一 + 真 torch 训练一步 + 真权重同步 | ✅ 全链路跑通（5090 端到端：真 log_probs nonzero、真 backward、weight_v 递增、真同步 disk reload；acc 0.4→0.2 变化证明权重真被改，稳定提升属训练规模/超参问题留后续）|
 | V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | ✅ V7.0+V7.2+V7.3 收官（5090：2卡真分片+tie忠实+累积 max_diff=0；V7.3 Ray+FSDP+权重同步 --world 1&2 端到端 PASSED——真 dist 组+DP-split+集体 save/rank0 POST，weight_v 递增、真 backward、未 hang）；V7.1 packing 暂缓（无 flash-attn，登记偏离）|
+| V7.4 | 接零风险 infra + 版本戳 | learner ABI / 阶段 trace / staleness | ✅ 代码完成+离线全回归绿（learner_contract 校验视图 + learner_metrics 阶段 trace + 缺口1版本戳；全 opt-in/additive，纯 CPU 可验无需服务器；6/6 CPU 不变量测试 PASSED，gap=1 真 staleness）|
 | V8 | Megatron 并行 | TP/PP/CP/EP 概念 | 记录设计 |
 | V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
 
@@ -172,6 +173,13 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **踩坑（已修）**：①`accelerate` 缺失（`init_empty_weights` 依赖）→补进 `[train]` extra；②`_no_split_modules` 在 transformers 5.x 是 `set` 不可 `[0]` 索引→改成员测试。
 - **偏离**（v7.md 6 条三要素表）：无 packing（#1，最大，缺 flash-attn）、无 KL/entropy、无 TP/PP/CP 多维并行（留 V8）、权重同步 disk reload vs 源 NCCL broadcast（留 V7.4/泛化 infra weight_publishing）、单节点 master=127.0.0.1、单样本/小微批+无 placement group。
 - **后续路线**（详见 `docs/decisions/v7-onward-plan.md`）：V7.4 接 infra learner_contract+trace（as spec，在 repo 忠实重写）+ 补版本戳；V7.5 退休 packing 偏离；V8 Megatron 多维并行。
+
+### V7.4 接零风险 infra + 版本戳（2026-08-08）详见 docs/decisions/v7.4.md
+- **主线三·infra 落地第一刀**：把 infra（`agentic-rl-infra-lab`）明言「零风险、无新 GPU 行为」的两契约按「infra as spec」在 repo 内**忠实重写**，用其 CPU 不变量验收。三件事：①**learner_contract**（`mini_slime/learner_contract.py`，LearnerSample token→causal-target(T-1) 坐标系 + 单一 rollout 版本校验）；②**learner_metrics**（`mini_slime/learner_metrics.py`，Trainer 扁平 metric → 分相位 trace）；③**缺口 1 版本戳**（每条 Sample 戳 rollout 时权重版本 → off-policy staleness 有真实来源）。
+- **关键设计（Plan agent 校验后定）**：①**learner_contract 是校验视图不是数据变换**——训练器照旧内部 `[1:]` 右移消费 loss_mask，`validate_train_data` 只 opt-in 把同批数据过一遍 LearnerSample 校验（右移一致+单一版本），失败即抛，**不改训练器消费字段** → 零回归（若改成变换要重写两条 hot path，高风险，否决）；②**版本源=`WeightUpdater.version` int**（repo 权威源，单调），主循环调 generate 前取 `weight_version()` 传入，**不依赖** SGLang meta 串（未验证、是 "default"），不动 solver/GenOutput；③**custom_convert 拆 turn → 每 turn-row 继承父版本**（版本列长度=turn-row 数，逐行对齐）。
+- **全 opt-in/additive（零回归保证）**：`Sample.rollout_policy_version` 默认 None；新列只被 opt-in 校验消费；两新模块默认不引用；Args `learner_contract_validate`/`learner_trace` 默认 False；`generate` 新参带缺省 → V3/V5/测试零改。
+- 验证：`test_v7.4_learner_abi.py` **纯 CPU PASSED（6/6）**——causal 右移逐值对齐 `_pad_batch`、单一版本拒混版本、`sum(target_mask)==sum(loss_mask)` 分母恒等、LearnerTrace 不变量+`policy_version_gap`、版本戳端到端（内置每行戳/custom_convert 拆 turn 每行继承）、未戳版本被拒、opt-in trace 闭环 `gap=1`（trainer_v2−rollout_v1 真 staleness）。V0/V2/V3/V4/V5/V6/A1/A2/A3 全回归绿。**本版无新 GPU 行为、无需服务器**（infra「零风险」正是此意）。
+- **偏离**（v7.4.md 5 条三要素表）：advantages 逐 token 未物化（gap 2，repo GRPO 逐序列标量广播）、log_prob_seconds=0.0（repo 融合 log-prob 进 forward，无独立 pass）、optimizer_seconds=0.0（Trainer 层粗计未拆 fwd/bwd）、版本单 int vs 源 list[str]、learner_contract 为校验视图非变换。
 
 ## 7. 待办 / 已知问题
 

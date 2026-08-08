@@ -108,3 +108,9 @@ class Args:
     # SGLang 原生 /generate 端点（真 token_ids + log_probs，替换 A3 chat 端点）。
     sglang_generate_url: str = "http://localhost:30001/generate"
     weight_save_path: str = "/home/ubuntu/models/nano_v6_ckpt"  # 权重同步走 disk reload 的落盘路径
+
+    # --- V7.4 infra 落地开关（默认 off → V0-V7.3 零回归；opt-in 才启用）---
+    #     learner_contract：把 train_data 过一遍 LearnerSample 校验（右移一致 + 单一 rollout 版本）。
+    #     learner_trace：把 Trainer 扁平 metric 升级成分相位 trace（batch/fwd-bwd/opt/publish 计时）。
+    learner_contract_validate: bool = False
+    learner_trace: bool = False

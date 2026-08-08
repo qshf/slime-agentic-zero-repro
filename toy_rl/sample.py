@@ -44,6 +44,15 @@ class Sample:
     # --- reward_func 产生的打分 ---
     reward: float | None = None   # 标量奖励; 源项目也支持 dict(多组件 reward), 主线二 A3 再引入
 
+    # --- rollout 时的策略版本号（V7.4 起，infra 缺口 1）---
+    rollout_policy_version: int | None = None
+    #   产生这条 rollout 时推理引擎上的权重版本（= 当时 trainer/WeightUpdater 的 version int）。
+    #   infra learner_contract 用它算 off-policy staleness（trainer_version - rollout_version）、
+    #   并拒绝混版本 batch（require_single_rollout_policy_version）。
+    #   偏离源：源 Sample.weight_versions 是 list[str]（从 SGLang meta_info["weight_version"] 累积）；
+    #   nano 取单 int（repo 权威版本源是 WeightUpdater.version，单调 int），更贴 infra int 契约。
+    #   V0-A3/离线不戳 → None（validate 前会短路过滤，不进 LearnerSample）。
+
     # --- 附带元信息 ---
     metadata: dict = field(default_factory=dict)
     #   对齐源项目 Sample.metadata: 放不进训练序列、但 reward/eval/日志需要的东西。
