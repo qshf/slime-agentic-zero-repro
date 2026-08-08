@@ -54,7 +54,7 @@
 | V6 | 真训练闭环（GSM8K）| 真 log_probs + 真 GRPO 组归一 + 真 torch 训练一步 + 真权重同步 | ✅ 全链路跑通（5090 端到端：真 log_probs nonzero、真 backward、weight_v 递增、真同步 disk reload；acc 0.4→0.2 变化证明权重真被改，稳定提升属训练规模/超参问题留后续）|
 | V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | ✅ V7.0+V7.2+V7.3 收官（5090：2卡真分片+tie忠实+累积 max_diff=0；V7.3 Ray+FSDP+权重同步 --world 1&2 端到端 PASSED——真 dist 组+DP-split+集体 save/rank0 POST，weight_v 递增、真 backward、未 hang）；V7.5 补 packing 退休偏离 #1 |
 | V7.4 | 接零风险 infra + 版本戳 | learner ABI / 阶段 trace / staleness | ✅ 代码完成+离线全回归绿（learner_contract 校验视图 + learner_metrics 阶段 trace + 缺口1版本戳；全 opt-in/additive，纯 CPU 可验无需服务器；6/6 CPU 不变量测试 PASSED，gap=1 真 staleness）|
-| V7.5 | sequence packing（退休偏离 #1）| flat + 块对角 mask 隔离 / loss-grad 等价 | 🚧 代码完成+离线全回归绿（opt-in `train_packing`，默认 off 零回归；显式块对角 4D mask 替 flash-attn varlen；HF 4D-mask early-exit 直通 + eager/sdpa 硬断言）；服务器等价验证待跑（world=1，bf16<0.08 / fp32<1e-3）|
+| V7.5 | sequence packing（退休偏离 #1）| flat + 块对角 mask 隔离 / loss-grad 等价 | ✅ 5090 world=1 PASSED（fp32 数学精确：loss 2.4e-7 / grad rel_L2 1.7e-4 / cosine 0.99999999 → 隔离无泄漏；bf16 loss 1.7e-4 + cosine 0.9946）；opt-in `train_packing` 默认 off 零回归；显式块对角 4D mask 替 flash-attn varlen |
 | V8 | Megatron 并行 | TP/PP/CP/EP 概念 | 记录设计 |
 | V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
 
@@ -188,7 +188,8 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **两个必须对的正确性点（源级确认）**：①**transformers 5.x 直通 4D mask**——`create_causal_mask` → `_preprocess_mask_arguments` 对 `len(shape)==4` early-exit 原样返回（不重推因果），`eager_attention_forward` 当加性 bias（用 `finfo.min` 不用 `-inf`，避免全屏蔽行 NaN；dtype 匹配激活；position_ids 必传）；②**仅 eager/sdpa honor 4D mask**（flash/flex 无视 → 静默串扰）→ `_packed_backward` **硬断言**后端 ∈{eager,sdpa}。
 - **loss 数学抽共用**：`_grpo_sample_loss` 从 `_microbatch_backward` 抽出，padding/packing 两路共用（bit-identical，是等价断言的根本）；两路唯一差别只在"怎么算 cur_lp"。**跨边界 target 不泄漏**：段内 `logits[start:end-1]` 预测 `tokens[start+1:end]`，与 padding `[1:]` 右移逐值一致（双重隔离：mask + shift）。
 - **fp32 副证靠 `compute_dtype` 非 `model.float()`**：FSDP2 `MixedPrecisionPolicy(param_dtype=bf16)` 强制 bf16 前向无论存储 dtype；给 `apply_fsdp2` 加 `param_dtype`、`FSDPTrainer` 加 `compute_dtype`，fp32 副证传 `float32` 真关混合精度、mask dtype 随之 fp32 → 证明算法数学精确。
-- 验证：离线全回归绿（opt-in 默认 off，V0/V2/V3/V4/V5/V6/A1/A2/A3/V7.4 各 `--offline` PASSED）。**服务器 5090（world=1）待跑**：`torchrun --nproc_per_node=1 scripts/test_v7.5_packing.py`（bf16 主门 `<0.08`）+ `--fp32`（副证 `<1e-3`）——断言 padding vs packing 的 loss 与逐参数 grad `max_abs_error < TOL` + 块对角 mask 结构。
+- 验证：离线全回归绿（opt-in 默认 off，V0/V2/V3/V4/V5/V6/A1/A2/A3/V7.4 各 `--offline` PASSED）。**5090 world=1（GPU2）PASSED**：**fp32 = 数学精确证明**（loss diff 2.4e-7、grad 全局 rel_L2 1.7e-4、cosine 0.99999999——padding 逐行 [B,L] 与 packing 单条 [1,T] 前向逐值一致 → **块对角 mask 隔离无泄漏**，真泄漏会在 fp32 也留 O(1) 痕迹）；**bf16 主门**（loss diff 1.7e-4、cosine 0.9946；magnitude rel_L2 10.9% 是 28 层前向 bf16 舍入累积、非 bug）。
+- **度量教训**：初版沿用 infra spike 的绝对 `0.08` bar（那是**单层**注意力的 bar），搬到 28 层整模型的逐参数 max_abs/max_rel 会被小信号参数（k_proj，bf16 噪声≈信号）放大到虚高（一度 0.83）。正确度量=**全局 rel_L2 + cosine**（向量级、大信号主导）+ **fp32 才是精确证明、bf16 只到舍入**的分层 gate。
 - **偏离**（v7.md：#1 退休、#6 更新、**#7 新增**）：#7 = 隔离机制用显式 O(T²) 块对角 mask 非 varlen O(T) 内核（消 padding 浪费✔、不得块级稀疏✘；T≤~3k 无 OOM；装 flash-attn 后换 varlen 得全部吞吐）。
 
 ## 7. 待办 / 已知问题
