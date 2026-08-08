@@ -1,4 +1,4 @@
-"""V7.0/V7.2: FSDPTrainer —— FSDP2 后端的真训练一步（含梯度累积）。
+"""V7.0/V7.2/V7.5: FSDPTrainer —— FSDP2 后端的真训练一步（含梯度累积 + 可选 packing）。
 
 对齐源 slime/backends/fsdp_utils/actor.py：
   - init      ← actor.py:48-154：setup mesh → 建模型(tie 分支) → apply_fsdp2 → rank0 广播 → AdamW
@@ -7,7 +7,7 @@
 
 与 V6 mini_slime/torch_actor.py 的关系：**loss 公式完全相同**（同一 GRPO policy gradient），
 差别只在 **执行后端**——V6 是单卡整模型 + padding batch，V7 是 FSDP 分片 + 单样本前向
-（packing 留 V7.1）。这样对照能看清"同一份 loss 数学，换到分布式后端上跑"。
+（V7.5 起补 packing）。这样对照能看清"同一份 loss 数学，换到分布式后端上跑"。
 
 V7.0 最小切片（单样本，2 卡真分片）：
   - 忠实 tie 处理（Qwen3-0.6B tie=True → 全 rank CPU 全量建模，见 fsdp_utils.get_init_weight_context）
@@ -21,9 +21,16 @@ V7.2 增量（梯度累积）：
     累积 N 微批 == 全局批「逐样本 mean 之和 / gbs」的单次梯度（V7.2 教学核心）
   - train_step 保留为 gbs=1 单微批的 train_batch 薄封装（V7.0 入口兼容）
 
-偏离源项目（V7.0/V7.2，登记见 docs/decisions/v7.md）：
-  - 无 sequence packing（每样本即一个微批，留 V7.1——需 flash-attn varlen，5090 未装）；无 Ray（留 V7.3）
-  - cpu_offload=False（显存够）；无 ref model / KL / entropy（继承 V6 --no-ref，取最纯 GRPO）
+V7.5 增量（sequence packing，opt-in train_packing）：
+  - _grpo_sample_loss：把 GRPO 单样本 loss 抽成 padding/packing 共用方法（两路 loss 数学 bit-identical）。
+  - _packed_backward：多样本 flat 成 [1,T] 单微批 + 显式块对角 4D mask 隔离段间注意力
+    （源靠 flash-attn varlen，5090 无 → 物化 mask，见 toy_rl/trainer/data_packing）。
+  - 与 padding 路径 loss/grad 逐值等价（scripts/test_v7.5_packing 验：bf16<0.08 / fp32<1e-3）；
+    退休 v7.md 偏离 #1、新增偏离 #7（显式 O(T²) mask vs varlen O(T)）。
+
+偏离源项目（登记见 docs/decisions/v7.md）：
+  - V7.5 前无 packing；V7.5 用显式块对角 mask 替代 varlen（无 flash-attn/TE），隔离等价、吞吐部分等价。
+  - cpu_offload=False（显存够）；无 ref model / KL / entropy（继承 V6 --no-ref，取最纯 GRPO）；无 Ray（V7.3 接）。
   - 一个 train_batch 即一个累积窗口（源用 grad_accum 边界列表支持窗口内多次 step，nano 简化为窗口=批）
 """
 
@@ -59,6 +66,8 @@ class FSDPTrainer:
         global_batch_size: int = 1,
         fp16: bool = False,
         cpu_offload: bool = False,
+        train_packing: bool = False,
+        compute_dtype: Optional[torch.dtype] = None,
     ):
         self.model_path = model_path
         self.lr = lr
@@ -68,6 +77,11 @@ class FSDPTrainer:
         self.global_batch_size = global_batch_size
         self.fp16 = fp16
         self.cpu_offload = cpu_offload
+        # V7.5：opt-in sequence packing（默认 False → V7.0/V7.2 padding 路径 byte-for-byte 不动）。
+        self.train_packing = train_packing
+        # V7.5：forward 计算 dtype = FSDP MixedPrecision 的 param_dtype（默认 fp16/bf16 由 fp16 定；
+        # compute_dtype=torch.float32 关混合精度做 fp32 等价副证）。packing 的显式 mask dtype 须匹配它。
+        self.compute_dtype = compute_dtype or (torch.float16 if fp16 else torch.bfloat16)
 
         # 启动器已在每个训练进程内设好 RANK/WORLD_SIZE/LOCAL_RANK：
         #   - V7.0/V7.2 torchrun 路径由 torchrun 设置；
@@ -110,7 +124,7 @@ class FSDPTrainer:
 
         # 5) apply_fsdp2（对齐 actor.py:103）。
         logger.info(f"Rank {self.rank}: apply_fsdp2")
-        model = apply_fsdp2(model, mesh=self.mesh, cpu_offload=cpu_offload, fp16=fp16)
+        model = apply_fsdp2(model, mesh=self.mesh, cpu_offload=cpu_offload, fp16=fp16, param_dtype=self.compute_dtype)
 
         # 6) rank0 广播全量权重进各 rank 分片（对齐 actor.py:105-107）。
         model = load_full_state_dict_fsdp(model, full_state, cpu_offload=cpu_offload)
@@ -125,6 +139,29 @@ class FSDPTrainer:
             else (self.tokenizer.eos_token_id or 0)
         )
         logger.info(f"Rank {self.rank}: FSDPTrainer ready (tie={tie}, dp_size={self.dp_size})")
+
+    def _grpo_sample_loss(
+        self,
+        cur_lp: torch.Tensor,
+        old_lp: torch.Tensor,
+        adv: torch.Tensor,
+        tgt_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """单样本 GRPO policy-gradient loss（padding 与 packing 两路共用，V7.5）。
+
+        对齐 ppo_utils.py:132-135 + sum_of_sample_mean（actor.py:911）：
+          ratio = exp(cur_lp - old_lp)
+          pg    = min(ratio·adv, clip(ratio,1±eps)·adv)      # GRPO 标量 adv 广播到每 token
+          loss  = -(pg·tgt_mask).sum() / clamp_min(tgt_mask.sum(), 1)
+        抽成共用方法，让 padding/packing 两条前向路径的**loss 数学 bit-identical**——V7.5 等价
+        断言（loss/grad max_abs<TOL）成立的根本保证，也让两路更清晰（唯一差别只在"怎么算出 cur_lp"）。
+        """
+        ratio = (cur_lp - old_lp).exp()  # 对齐 ppo_utils.py:132。
+        pg = torch.min(
+            ratio * adv,
+            ratio.clamp(1 - self.eps_clip, 1 + self.eps_clip_high) * adv,
+        )
+        return -(pg * tgt_mask).sum() / torch.clamp_min(tgt_mask.sum(), 1.0)
 
     def _microbatch_backward(
         self,
@@ -181,15 +218,9 @@ class FSDPTrainer:
                 if old_log_probs is not None
                 else cur_lp.detach()
             )
-            ratio = (cur_lp - old_lp).exp()  # 对齐 ppo_utils.py:132。
             adv = torch.tensor(float(s["reward"]), device=self.device)
-            # GRPO：标量 adv 广播到每个 token。PPO clip（ppo_utils.py:133-135）。
-            pg = torch.min(
-                ratio * adv,
-                ratio.clamp(1 - self.eps_clip, 1 + self.eps_clip_high) * adv,
-            )
-            # sum_of_sample_mean 的单样本项（actor.py:911）。
-            sample_losses.append(-(pg * tgt_mask).sum() / torch.clamp_min(tgt_mask.sum(), 1.0))
+            # GRPO 单样本 loss（padding/packing 共用同一数学，V7.5）。
+            sample_losses.append(self._grpo_sample_loss(cur_lp, old_lp, adv, tgt_mask))
 
         # 梯度累积缩放（对齐 actor.py:677）：本地先乘 dp_size / global_batch_size。
         # 注意 FSDP2 的 `fully_shard(...)` 会在 loss.backward() 的 autograd hook 里做
@@ -215,6 +246,79 @@ class FSDPTrainer:
         )
         return loss
 
+    def _packed_backward(
+        self,
+        samples: list[dict],
+        global_batch_size: int,
+    ) -> tuple[float, int]:
+        """一个 flat pack 的 forward + loss + backward（V7.5，packing 路径；累积梯度、不 step）。
+
+        与 `_microbatch_backward`（padding 路径）**唯一差别** = "怎么算 cur_lp"：
+          - padding：每样本一行 [B,L]、按行 2D mask、逐行 logits[:len-1]。
+          - packing：所有样本 flat 成一条 [1,T]、position_ids 每段 reset、**显式块对角 4D mask**
+                     隔离段间注意力（源靠 flash-attn varlen，5090 无 → 物化 mask，见 data_packing）。
+        loss 数学（GRPO ratio/clip/masked-mean/dp_size 缩放）走**同一** `_grpo_sample_loss`，
+        故两路 loss/grad 逐值等价（V7.5 等价断言的根本）。
+
+        源对照（slime actor.py:801-812 _get_model_inputs_args）：input_ids=[1,T]、position_ids=[1,T]、
+        源 attention_mask=None（靠 varlen 内核隔离）；nano 改传显式块对角 mask。
+        """
+        from toy_rl.trainer.data_packing import (
+            build_block_diagonal_causal_mask,
+            pack_sequences,
+        )
+
+        pack = pack_sequences(samples)
+        if pack is None:  # 无可训练样本，与 _microbatch_backward 空返回对称。
+            return 0.0, 0
+
+        # 4D 显式 mask 仅在 eager/sdpa 后端被当加性 bias（flash/flex 会无视 → 静默串扰）。
+        # 硬断言：宁可炸也不要静默算错 loss（本版最危险的失败模式）。
+        attn_impl = getattr(self.model.config, "_attn_implementation", "eager")
+        assert attn_impl in ("eager", "sdpa"), (
+            f"packing 的显式块对角 mask 只在 eager/sdpa 被 honor，当前后端={attn_impl}"
+            "（flash/flex 会无视 4D mask、样本间串扰 → loss 错）"
+        )
+
+        cu = pack["cu_seqlens"]
+        total = cu[-1]
+        input_ids = torch.tensor(pack["tokens"], dtype=torch.long, device=self.device)[None]  # [1,T]
+        position_ids = torch.tensor(pack["position_ids"], dtype=torch.long, device=self.device)[None]
+        # mask dtype 须匹配激活（= FSDP MixedPrecision param_dtype = self.compute_dtype）。
+        attn_mask = build_block_diagonal_causal_mask(cu, total, self.device, self.compute_dtype)
+
+        logits = self.model(
+            input_ids, position_ids=position_ids, attention_mask=attn_mask
+        ).logits[0].float()  # [T,V]
+
+        old_lp_flat = pack["old_log_probs"]  # flat 长 T 或 None
+        num_segments = len(cu) - 1
+        sample_losses = []
+        for seg in range(num_segments):
+            start, end = cu[seg], cu[seg + 1]
+            # 段内因果：logits[start:end-1] 预测 tokens[start+1:end]（边界 token 对下一段首 token
+            # 的预测**从不形成** → 跨段 target 不泄漏，与 padding 路径 [1:] 右移逐值一致）。
+            seg_mask = pack["loss_masks"][start:end]
+            tgt_mask = torch.tensor(seg_mask[1:], dtype=torch.float32, device=self.device)
+            targets = input_ids[0, start + 1 : end]
+            cur_lp = torch.log_softmax(logits[start : end - 1], dim=-1).gather(
+                -1, targets.unsqueeze(-1)
+            ).squeeze(-1)
+
+            if old_lp_flat is not None:
+                old_lp = torch.tensor(
+                    old_lp_flat[start + 1 : end], dtype=torch.float32, device=self.device
+                )
+            else:
+                old_lp = cur_lp.detach()
+            adv = torch.tensor(float(pack["rewards"][seg]), device=self.device)
+            sample_losses.append(self._grpo_sample_loss(cur_lp, old_lp, adv, tgt_mask))
+
+        # 缩放与 padding 路径完全相同（对齐 actor.py:677；FSDP dp 平均相抵，见 _microbatch_backward）。
+        loss = torch.stack(sample_losses).sum() * self.dp_size / global_batch_size
+        loss.backward()
+        return float(loss.detach()), num_segments
+
     def train_batch(
         self,
         samples: list[dict],
@@ -230,16 +334,20 @@ class FSDPTrainer:
         samples: [{tokens, loss_mask, reward, old_log_probs?}, ...]（本 rank 的本地样本）。
         global_batch_size: 全局批大小（用于缩放）；默认取 self.global_batch_size。
         microbatch_size: 每个微批的样本数；默认 1，保持 V7.0 单样本入口兼容。
+
+        V7.5：`self.train_packing` → 每个微批走 packing 前向（flat + 块对角 mask），否则 padding。
+        两路 loss 数学一致（_grpo_sample_loss），只换"怎么算 cur_lp"；默认 padding 不变。
         """
         if microbatch_size < 1:
             raise ValueError(f"microbatch_size must be positive, got {microbatch_size}")
         gbs = global_batch_size if global_batch_size is not None else self.global_batch_size
+        backward = self._packed_backward if self.train_packing else self._microbatch_backward
 
         self.optimizer.zero_grad(set_to_none=True)  # 累积窗口开始，清零一次（actor.py:523）
         loss_sum, trained = 0.0, 0
         num_microbatches = 0
         for start in range(0, len(samples), microbatch_size):
-            l, trained_in_microbatch = self._microbatch_backward(
+            l, trained_in_microbatch = backward(
                 samples[start:start + microbatch_size], gbs
             )
             loss_sum += l

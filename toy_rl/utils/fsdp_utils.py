@@ -56,7 +56,7 @@ def get_init_weight_context(tie_word_embeddings: bool, rank: int):
     return cpu_init
 
 
-def apply_fsdp2(model, mesh, cpu_offload: bool = False, fp16: bool = False):
+def apply_fsdp2(model, mesh, cpu_offload: bool = False, fp16: bool = False, param_dtype=None):
     """按 _no_split_modules 把 decoder 层逐个 fully_shard，再 shard 顶层。对齐源 actor.py:933-984。
 
     Args:
@@ -64,6 +64,8 @@ def apply_fsdp2(model, mesh, cpu_offload: bool = False, fp16: bool = False):
         mesh: 1D dp DeviceMesh
         cpu_offload: True 则参数/梯度/优化器 offload 到 CPU（源默认 False）
         fp16: True 用 fp16 参数，否则 bf16（源默认 bf16）
+        param_dtype: 显式指定 forward 计算 dtype，覆盖 fp16 推导（V7.5：fp32 等价副证用
+            torch.float32 关掉混合精度，去 bf16 舍入噪声）；None 时按 fp16 推导（V7.0/V7.2 不变）。
 
     对齐要点：
       - 选 wrap 的模块 = _no_split_modules 里的类（decoder 层）**加上** Embedding——但
@@ -90,10 +92,13 @@ def apply_fsdp2(model, mesh, cpu_offload: bool = False, fp16: bool = False):
     ]
     logger.info(f"FSDP wrapping {len(modules)} modules (layers={layer_cls_to_wrap}, tie={tie})")
 
-    # 对齐源 actor.py:959-966：param bf16/fp16，reduce 恒 fp32。
-    param_dtype = torch.float16 if fp16 else torch.bfloat16
-    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=torch.float32)
-    logger.info(f"FSDP MixedPrecision: param_dtype={param_dtype}, reduce_dtype=float32")
+    # 对齐源 actor.py:959-966：param bf16/fp16，reduce 恒 fp32。V7.5：param_dtype 可显式覆盖（fp32 副证）。
+    if param_dtype is None:
+        param_dtype = torch.float16 if fp16 else torch.bfloat16
+    # reduce 恒 fp32（fp32 计算时也一致）。
+    reduce_dtype = torch.float32
+    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    logger.info(f"FSDP MixedPrecision: param_dtype={param_dtype}, reduce_dtype={reduce_dtype}")
 
     fsdp_kwargs = {"mp_policy": mp_policy, "offload_policy": offload_policy, "mesh": mesh}
 

@@ -99,6 +99,10 @@ class Args:
     # "fsdp"=FSDP2 分片后端跑在 Ray actor 里、真 torch.distributed 进程组（V7.3）。
     train_backend: str = "fake"
     fsdp_world_size: int = 1      # V7.3 FSDP 后端的 DP world_size（Ray 起几个训练 actor / 用几张卡）
+    # V7.5 opt-in sequence packing（默认 False → V7.0/V7.2 padding 路径不变、零回归）。
+    #   开则 FSDPTrainer 走 packing 前向（flat 单微批 + 显式块对角 mask 隔离段间注意力）；
+    #   源靠 flash-attn varlen 隔离，5090 无 → 物化块对角 mask，隔离等价、吞吐部分等价（见 v7.5.md 偏离 #7）。
+    train_packing: bool = False
     train_model_path: str = "/home/ubuntu/models/Qwen/Qwen3-0.6B"  # 训练侧可训模型（单卡先用 0.6B）
     train_lr: float = 1e-6
     eps_clip: float = 0.2         # PPO clip 下界 1-eps_clip

@@ -52,8 +52,9 @@
 | 版本 | 标题 | 关键学点 | 状态 |
 |------|------|---------|------|
 | V6 | 真训练闭环（GSM8K）| 真 log_probs + 真 GRPO 组归一 + 真 torch 训练一步 + 真权重同步 | ✅ 全链路跑通（5090 端到端：真 log_probs nonzero、真 backward、weight_v 递增、真同步 disk reload；acc 0.4→0.2 变化证明权重真被改，稳定提升属训练规模/超参问题留后续）|
-| V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | ✅ V7.0+V7.2+V7.3 收官（5090：2卡真分片+tie忠实+累积 max_diff=0；V7.3 Ray+FSDP+权重同步 --world 1&2 端到端 PASSED——真 dist 组+DP-split+集体 save/rank0 POST，weight_v 递增、真 backward、未 hang）；V7.1 packing 暂缓（无 flash-attn，登记偏离）|
+| V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | ✅ V7.0+V7.2+V7.3 收官（5090：2卡真分片+tie忠实+累积 max_diff=0；V7.3 Ray+FSDP+权重同步 --world 1&2 端到端 PASSED——真 dist 组+DP-split+集体 save/rank0 POST，weight_v 递增、真 backward、未 hang）；V7.5 补 packing 退休偏离 #1 |
 | V7.4 | 接零风险 infra + 版本戳 | learner ABI / 阶段 trace / staleness | ✅ 代码完成+离线全回归绿（learner_contract 校验视图 + learner_metrics 阶段 trace + 缺口1版本戳；全 opt-in/additive，纯 CPU 可验无需服务器；6/6 CPU 不变量测试 PASSED，gap=1 真 staleness）|
+| V7.5 | sequence packing（退休偏离 #1）| flat + 块对角 mask 隔离 / loss-grad 等价 | 🚧 代码完成+离线全回归绿（opt-in `train_packing`，默认 off 零回归；显式块对角 4D mask 替 flash-attn varlen；HF 4D-mask early-exit 直通 + eager/sdpa 硬断言）；服务器等价验证待跑（world=1，bf16<0.08 / fp32<1e-3）|
 | V8 | Megatron 并行 | TP/PP/CP/EP 概念 | 记录设计 |
 | V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
 
@@ -180,6 +181,15 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **全 opt-in/additive（零回归保证）**：`Sample.rollout_policy_version` 默认 None；新列只被 opt-in 校验消费；两新模块默认不引用；Args `learner_contract_validate`/`learner_trace` 默认 False；`generate` 新参带缺省 → V3/V5/测试零改。
 - 验证：`test_v7.4_learner_abi.py` **纯 CPU PASSED（6/6）**——causal 右移逐值对齐 `_pad_batch`、单一版本拒混版本、`sum(target_mask)==sum(loss_mask)` 分母恒等、LearnerTrace 不变量+`policy_version_gap`、版本戳端到端（内置每行戳/custom_convert 拆 turn 每行继承）、未戳版本被拒、opt-in trace 闭环 `gap=1`（trainer_v2−rollout_v1 真 staleness）。V0/V2/V3/V4/V5/V6/A1/A2/A3 全回归绿。**本版无新 GPU 行为、无需服务器**（infra「零风险」正是此意）。
 - **偏离**（v7.4.md 5 条三要素表）：advantages 逐 token 未物化（gap 2，repo GRPO 逐序列标量广播）、log_prob_seconds=0.0（repo 融合 log-prob 进 forward，无独立 pass）、optimizer_seconds=0.0（Trainer 层粗计未拆 fwd/bwd）、版本单 int vs 源 list[str]、learner_contract 为校验视图非变换。
+
+### V7.5 sequence packing（退休偏离 #1，2026-08-08）详见 docs/decisions/v7.5.md
+- **主线三·退休 V7 唯一未闭合的正确性偏离**：给 `FSDPTrainer` 加 **opt-in** packing 前向路径（`args.train_packing`，默认 off 零回归），用 infra spike 的验收范式（packed vs padded 的 **loss/grad 逐值等价**）证明隔离精确 → 诚实退休偏离 #1。建 `toy_rl/trainer/data_packing.py`（`pack_sequences` + `build_block_diagonal_causal_mask`）+ `FSDPTrainer._packed_backward`。
+- **为什么必须偏离源（三方硬件都缺）**：源靠 **flash-attn varlen** 隔离（`attention_mask=None` + reset position_ids）；infra spike 靠 **TransformerEngine** cu_seqlens；5090 是 Blackwell sm_120 **两者皆无**。照搬 `attention_mask=None` → 整个 pack 走满因果注意力、**样本间静默串扰、loss 算错**。nano 改传**显式物化 `[1,1,T,T]` 块对角因果 mask**（infra 文档承认这是源 varlen 路径的 "conceptual equivalent"）。隔离语义等价、吞吐部分等价（消 padding 浪费，但付 O(T²) mask、不得 varlen 块级稀疏）。
+- **两个必须对的正确性点（源级确认）**：①**transformers 5.x 直通 4D mask**——`create_causal_mask` → `_preprocess_mask_arguments` 对 `len(shape)==4` early-exit 原样返回（不重推因果），`eager_attention_forward` 当加性 bias（用 `finfo.min` 不用 `-inf`，避免全屏蔽行 NaN；dtype 匹配激活；position_ids 必传）；②**仅 eager/sdpa honor 4D mask**（flash/flex 无视 → 静默串扰）→ `_packed_backward` **硬断言**后端 ∈{eager,sdpa}。
+- **loss 数学抽共用**：`_grpo_sample_loss` 从 `_microbatch_backward` 抽出，padding/packing 两路共用（bit-identical，是等价断言的根本）；两路唯一差别只在"怎么算 cur_lp"。**跨边界 target 不泄漏**：段内 `logits[start:end-1]` 预测 `tokens[start+1:end]`，与 padding `[1:]` 右移逐值一致（双重隔离：mask + shift）。
+- **fp32 副证靠 `compute_dtype` 非 `model.float()`**：FSDP2 `MixedPrecisionPolicy(param_dtype=bf16)` 强制 bf16 前向无论存储 dtype；给 `apply_fsdp2` 加 `param_dtype`、`FSDPTrainer` 加 `compute_dtype`，fp32 副证传 `float32` 真关混合精度、mask dtype 随之 fp32 → 证明算法数学精确。
+- 验证：离线全回归绿（opt-in 默认 off，V0/V2/V3/V4/V5/V6/A1/A2/A3/V7.4 各 `--offline` PASSED）。**服务器 5090（world=1）待跑**：`torchrun --nproc_per_node=1 scripts/test_v7.5_packing.py`（bf16 主门 `<0.08`）+ `--fp32`（副证 `<1e-3`）——断言 padding vs packing 的 loss 与逐参数 grad `max_abs_error < TOL` + 块对角 mask 结构。
+- **偏离**（v7.md：#1 退休、#6 更新、**#7 新增**）：#7 = 隔离机制用显式 O(T²) 块对角 mask 非 varlen O(T) 内核（消 padding 浪费✔、不得块级稀疏✘；T≤~3k 无 OOM；装 flash-attn 后换 varlen 得全部吞吐）。
 
 ## 7. 待办 / 已知问题
 

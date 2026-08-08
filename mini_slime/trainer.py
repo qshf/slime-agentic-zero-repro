@@ -75,6 +75,7 @@ class Trainer:
                 eps_clip_high=args.eps_clip_high,
                 clip_grad=args.clip_grad,
                 global_batch_size=args.global_batch_size,
+                train_packing=args.train_packing,  # V7.5：opt-in packing（默认 False）
             )
             # FSDPTrainer 自己知道真实 rank（从 dist 读），以它为准。
             self.rank = self._fsdp_trainer.rank
