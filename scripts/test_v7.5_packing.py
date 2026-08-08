@@ -45,12 +45,17 @@ def _make_samples(trainer: FSDPTrainer) -> list[dict]:
     for prompt, response, reward in specs:
         p_ids = trainer.tokenizer.encode(prompt)
         r_ids = trainer.tokenizer.encode(response, add_special_tokens=False)
+        tokens = p_ids + r_ids
+        # 给合成 old_log_probs（非 None）→ ratio=exp(cur_lp-old_lp)≠1 → **loss 值也依赖 logits**
+        # （on-policy None 时 ratio≡1、loss 变成常数、只有 grad 测前向；这里让 loss 也真正测前向）。
+        # 两路仍必须逐值匹配：old_lp 按段/行切片方式不同，正是要验的对齐点。
+        old_lp = [-0.5 * (i % 3) for i in range(len(tokens))]
         samples.append(
             {
-                "tokens": p_ids + r_ids,
+                "tokens": tokens,
                 "loss_mask": [0] * len(p_ids) + [1] * len(r_ids),
                 "reward": reward,
-                "old_log_probs": None,  # on-policy：去掉 old_lp 这一差异源
+                "old_log_probs": old_lp,
             }
         )
     return samples
@@ -112,8 +117,11 @@ def _test_structure(rank: int) -> int:
     return failed
 
 
-def _test_equivalence(trainer: FSDPTrainer, tol: float, rank: int) -> int:
-    """part (b)：padding vs packing 的 loss/grad 逐值等价（本版核心）。"""
+def _test_equivalence(trainer: FSDPTrainer, tol: float, rel_tol: float, rank: int) -> int:
+    """part (b)：padding vs packing 的 loss/grad 等价（本版核心）。
+
+    loss 用绝对阈值 tol；grad 用**相对**阈值 rel_tol（全模型梯度跨多量级，绝对阈值不可比）。
+    """
     failed = 0
 
     def check(cond, msg):
@@ -143,17 +151,27 @@ def _test_equivalence(trainer: FSDPTrainer, tol: float, rank: int) -> int:
     check(loss_diff < tol, f"loss 等价：|{loss_p:.6f} - {loss_k:.6f}| = {loss_diff:.3e} < {tol}")
     check(trained_p == trained_k == len(samples), f"trained_samples 一致={trained_p}/{trained_k}")
 
-    max_grad_diff, worst = 0.0, ""
+    # 逐参数**相对**误差：max|g_P-g_K| / (max|g_P|+eps)。绝对误差不可比——全模型梯度跨多个量级
+    # （tied embed_tokens/lm_head 的梯度对全词表求和、量级远大于单层 MLP），共用一个绝对阈值会误判。
+    # 相对误差才是隔离等价的正确度量（真隔离泄漏会在 fp32 也持续，roundoff 则随 dtype 收缩）。
+    max_rel, worst_rel = 0.0, ""
+    max_abs, worst_abs = 0.0, ""
     for name in grads_p:
         if name not in grads_k:
             failed += 1
             if rank == 0:
                 print(f"  FAIL: 参数 {name} 在 packing 路径无梯度")
             continue
-        d = (grads_p[name] - grads_k[name]).abs().max().item()
-        if d > max_grad_diff:
-            max_grad_diff, worst = d, name
-    check(max_grad_diff < tol, f"逐参数 grad 等价：max_abs_error={max_grad_diff:.3e} < {tol}（worst={worst}）")
+        gp, gk = grads_p[name], grads_k[name]
+        abs_err = (gp - gk).abs().max().item()
+        rel_err = abs_err / (gp.abs().max().item() + 1e-8)
+        if abs_err > max_abs:
+            max_abs, worst_abs = abs_err, name
+        if rel_err > max_rel:
+            max_rel, worst_rel = rel_err, name
+    if rank == 0:
+        print(f"  [info] grad max_abs={max_abs:.3e}（{worst_abs}）；max_rel={max_rel:.3e}（{worst_rel}）")
+    check(max_rel < rel_tol, f"逐参数 grad 相对等价：max_rel_error={max_rel:.3e} < {rel_tol}（worst={worst_rel}）")
     return failed
 
 
@@ -168,14 +186,17 @@ def main() -> int:
         compute_dtype=torch.float32 if fp32 else None,
     )
     rank = trainer.rank
-    tol = 1e-3 if fp32 else 0.08
+    # loss 用绝对阈值；grad 用相对阈值（跨多量级参数不可用绝对阈值）。
+    # bf16：28 层前向累积舍入 → loss 松、grad 相对 5%；fp32：数学精确 → 都收紧两个量级。
+    tol = 1e-4 if fp32 else 1e-2       # loss 绝对
+    rel_tol = 1e-4 if fp32 else 5e-2   # grad 相对
 
     if rank == 0:
-        print(f"=== V7.5 packing 等价性（{'fp32 副证' if fp32 else 'bf16 主门'}，TOL={tol}）===")
+        print(f"=== V7.5 packing 等价性（{'fp32 副证' if fp32 else 'bf16 主门'}，loss_tol={tol} rel_tol={rel_tol}）===")
 
     failed = 0
     failed += _test_structure(rank)
-    failed += _test_equivalence(trainer, tol, rank)
+    failed += _test_equivalence(trainer, tol, rel_tol, rank)
 
     if rank == 0:
         print(f"[V7.5] {'PASSED' if failed == 0 else f'FAILED ({failed})'}")
