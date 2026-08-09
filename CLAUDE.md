@@ -56,7 +56,7 @@
 | V7.4 | 接零风险 infra + 版本戳 | learner ABI / 阶段 trace / staleness | ✅ 代码完成+离线全回归绿（learner_contract 校验视图 + learner_metrics 阶段 trace + 缺口1版本戳；全 opt-in/additive，纯 CPU 可验无需服务器；6/6 CPU 不变量测试 PASSED，gap=1 真 staleness）|
 | V7.5 | sequence packing（退休偏离 #1）| flat + 块对角 mask 隔离 / loss-grad 等价 | ✅ 5090 world=1 PASSED（fp32 数学精确：loss 2.4e-7 / grad rel_L2 1.7e-4 / cosine 0.99999999 → 隔离无泄漏；bf16 loss 1.7e-4 + cosine 0.9946）；opt-in `train_packing` 默认 off 零回归；显式块对角 4D mask 替 flash-attn varlen |
 | V7.6 | FA2 varlen packing（退休偏离 #7）| varlen 隔离 / negative control 验收范式 | ✅ 5090 world=1 PASSED（varlen 真 dispatch 28 次、cu_seqlens 与手工值一致；fa2 vs padding loss Δ=0 / cosine 0.99999999；**negative control 判别力 8721×**）；回到源 `attention_mask=None` 写法 |
-| V8 | Megatron 并行 | TP/PP/CP/EP 概念 | 记录设计 |
+| V8 | Megatron 并行（TP）| 层内切分 / vocab-parallel / Megatron→HF 权重转换 | ✅ V8.0+V8.1 收官（5090 单卡 torchrun：**fp32 精确门** TP=2 vs TP=1 loss Δ=0、grad rel_L2 1.9e-5、cosine 1.00000000；bf16 门 loss Δ=5.1e-6、cosine 0.99909；转换往返 max_abs_diff=**0**；全 28 层复跑同样过。PP/CP/EP 单卡实测硬阻断，记录设计）|
 | V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
 
 ## 4. 环境前置
@@ -202,6 +202,15 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - 验证：**5090 world=1 PASSED**——varlen 真 dispatch 28 次（=每层一次）、`cu_seqlens=[0,22,41,63,80]` 与手工值一致、`max_seqlen=22` 一致。回归：V7.5 `"mask"` bf16 主门 + fp32 副证均复验绿；离线全回归绿（V0/V2/V3/V4/V5/V6/A1/A2/A3/V7.4）。
 - **环境三坑（均实测，配方见 docs/ops/server-env-bench5090.md）**：①容器 `flash_attn` namespace 被 **FA4 b15** 占（import 成功但无 `__version__`）须先卸载；②**缺 `accelerate`**（tie 分支依赖，不装 FSDPTrainer 起不来）；③**wheel 不能单文件 bind mount**（挂载改名破坏命名规则）须挂目录。装完 FA2 会让 **TE import 崩** → 务必 `--rm` 临时容器，别污染 `bench5090`。
 - **偏离**（v7.md：**#7 退休**、**#8 新增**）：#8 = 等价验收精度为 bf16 + negative control 而非 fp32 逐值精确（①源不做此验收直接信内核；②FA2 拒收 fp32；③**不完全等价**——未证 fp32 精确，那份证明只属 mask 路径）。**"双机统一"作废**：A100 实例已释放，本版只在单卡 5090 验证，A100 补跑列入待办不作完成条件。
+
+### V8 Megatron 并行（TP，2026-08-09）详见 docs/decisions/v8.md
+- **主线三第三版**：把训练后端从 **FSDP（1D DP 分片）** 扩到 **Megatron TP（层内张量切分）**，并补上 Megatron 特有、FSDP 没有的那条 RL 接缝——**Megatron 分片权重 → HF 格式**。建 `toy_rl/trainer/{megatron_trainer,megatron_to_hf}.py`。**收敛点 = V8.1**（用户拍板；V8.2 Ray 闭环不做，与 V7.3 高度同构）。**零回归**：4 个文件全新增，既有路径一行未改。
+- **教学核心 1 = 换并行轴，同一份 loss 数学**：`_grpo_sample_loss` 与 V7 `FSDPTrainer` **逐字相同**。FSDP 切「参数存储」、前向 all-gather 回全量层、通信在**层边界**、单层须放得下；TP 切「参数计算」（qkv/mlp 按列/行切）、**不 gather**各算部分结果、通信在**层内部**（col→row 之间 all-reduce 激活）、单层也可跨卡。**vocab-parallel logits**（源 `model_provider.py:177` `parallel_output=True`）：logits 保持 `[S,V/tp]` 分片从不 gather（V=151936），log_prob 必须走 `fused_vocab_parallel_cross_entropy`（实测与全量 log_softmax `max_abs_err=0.000e+00`）。
+- **教学核心 2 = Megatron→HF 权重转换**（slime-agentic 相对纯 Megatron 教程的真正增量）：FSDP 的 `save_pretrained` 天然吐 HF，Megatron 的**名和形状都不是 HF 的**，必须 TP-gather + 拆 qkv/gate + 改名 + 去 vocab padding。三处最易错都单独断言：①**GLU 重排**（fc1 朴素 cat 会拼成 `[gate0,up0,gate1,up1]`，正确是 `[gate0,gate1,up0,up1]`）；②**qkv 按 `num_query_groups` 拆 GQA**（不是三等分）；③**名字集合双向比对**（源那 10 个转换文件最常见的 bug 类型）。反向映射（HF→Megatron）nano 自有，是正向的**严格逆**，两者互为验证——这正是逐值精确门的判别力来源。
+- **验收（5090 单卡 torchrun，`--layers 4` + 全 28 层各跑一遍）**：V8.0 **分层 gate**（沿用 v7.5 度量教训）——**fp32 精确证明**：loss Δ=**0.000e+00**、grad rel_L2=**1.935e-05**、cosine=**1.00000000**（全 28 层：1.033e-05 / 1.00000000 / loss Δ=4.02e-07）；bf16 档（训练实际 dtype）loss Δ=5.066e-06、cosine=0.99908911，rel_L2 5.1e-02 仅报 info。V8.1 **往返 max_abs_diff=0.000e+00**（无容差硬门，纯 reshape/split/cat/rename）+ 名字集合完全一致 + GLU 重排逐值相等 + 转出权重被 HF 模型载入无 unexpected/missing 且前向 finite（TP=1/TP=2/全 28 层都过）。离线全回归 V0-A3+V7.4 全绿。
+- **三个踩坑（都是真调试出来的）**：①**dropout 未关 → 等价门假阳性**：`TransformerConfig` 默认 `dropout=0.1`，而 `model_parallel_cuda_manual_seed` **故意**让各 TP rank 持不同 dropout RNG → TP=1/TP=2 丢弃不同单元，实测 cosine 仅 **0.25**、grad_norm 差 11×，**不是 TP 切错纯是随机性**；修=显式设 0（也更忠实，HF Qwen3 `attention_dropout=0.0`）。②**fused kernel 原地改输入**：它 in-place 减 max，而 nano 逐样本切 `logits[row,:L-1]` 共享同一 base storage → autograd 版本计数报错；**bf16 时 `.float()` 隐式拷贝把问题盖住，只有 fp32 才暴露**；修=显式 `.float().clone()`（源不需要：它整批 pack 成一条 `[S,B,V]` 喂 kernel）。③**漏 `finalize_model_grads`（本版最实质的正确性发现）**：源 `finalize_model_grads.py:403-405` 对 `q/k_layernorm` 做 **SUM all-reduce**——qk-layernorm 作用在**每个头**上而头被 TP 切开，各 rank 的梯度是**部分和**；漏掉时「前向 loss Δ 恰为 0、梯度却系统性偏 1.8e-2 且最差正是 `q_norm.weight`」=**漏规约的指纹**；补上后 rel_L2 1.8e-2 → **1.9e-5（约 930×）**。**这条坑 bf16 抓不到（5e-2 会被当舍入放过）——fp32 副证的价值就在这里。**
+- **PP/CP/EP 记录设计不实现（单卡实测硬阻断，非偷懒）**：PP 需 CUDA p2p 而 **gloo 不支持**（`gloo::IoException`）、EP 需 all_to_all 而 **gloo 无**（且 0.6B 是 dense）、CP 单卡=1 无可验内容。接缝按源留好（显式 `pipeline_model_parallel_size=1`），≥2 卡 + NCCL 可直接补。
+- **偏离**（v8.md 11 条三要素表）：gloo 而非 NCCL（单卡多 rank 被 NCCL 硬拒，语义等价性能不等价）、只用 `megatron.core` 不走 `megatron.training.init`、只做 TP、local spec 的 layernorm 命名（TE 装不了，两种名字都认+自动判定）、**`partition_stride=2` 对 GLU fc1 放行**（源无条件 assert==1 与它自己的重排分支语义冲突）、`_finalize_model_grads` 只做 qk-layernorm 一条分支、torch AdamW 而非 `DistributedOptimizer`、反向映射 nano 自有、只做 Qwen3 dense、无 packing/KL/entropy、权重同步止于转出 HF state_dict 未接 SGLang。
 
 ## 7. 待办 / 已知问题
 
