@@ -99,11 +99,20 @@ class Args:
     # "fsdp"=FSDP2 分片后端跑在 Ray actor 里、真 torch.distributed 进程组（V7.3）。
     train_backend: str = "fake"
     fsdp_world_size: int = 1      # V7.3 FSDP 后端的 DP world_size（Ray 起几个训练 actor / 用几张卡）
-    # V7.5 opt-in sequence packing（默认 False → V7.0/V7.2 padding 路径不变、零回归）。
-    #   开则 FSDPTrainer 走 packing 前向（flat 单微批 + 显式块对角 mask 隔离段间注意力）；
-    #   源靠 flash-attn varlen 隔离，5090 无 → 物化块对角 mask，隔离等价、吞吐部分等价（见 v7.5.md 偏离 #7）。
-    train_packing: bool = False
+    # V7.5/V7.6 opt-in sequence packing（默认 False → V7.0/V7.2 padding 路径不变、零回归）。
+    # 三态（V7.6 从 bool 扩成字符串；False/"" 仍是默认关闭，V7.5 的 True 等价于 "mask"）：
+    #   False/""  padding：逐样本一行 [B,L]（V7.0/V7.2 路径）。
+    #   "fa2"     FA2 varlen：flat [1,T] + attention_mask=None，靠 reset 的 position_ids 反推
+    #             cu_seqlens 在内核里隔离段（**对齐源** actor.py:801-812 + arguments.py:29）。
+    #   "mask"    显式块对角 4D mask（V7.5）：无 FA2 环境的 fallback，且是唯一能做 fp32
+    #             精确等价证明的路径（FA2 内核只收 fp16/bf16）——见 v7.6.md。
+    train_packing: "bool | str" = False
     train_model_path: str = "/home/ubuntu/models/Qwen/Qwen3-0.6B"  # 训练侧可训模型（单卡先用 0.6B）
+    # HF attention 后端（对齐源 fsdp_utils/arguments.py:29 `attn_implementation`）。
+    # 源默认 "flash_attention_2"；nano 默认 "sdpa" 因 V7.0-V7.5 环境无 FA2，且 "mask" packing
+    # 路径要求 eager/sdpa（4D mask 只在这两个后端被 honor）。train_packing="fa2" 时须显式设成
+    # "flash_attention_2"（_packed_backward 有硬断言拦截，不会静默退化）。
+    attn_implementation: str = "sdpa"
     train_lr: float = 1e-6
     eps_clip: float = 0.2         # PPO clip 下界 1-eps_clip
     eps_clip_high: float = 0.2    # PPO clip 上界 1+eps_clip_high（对齐源 compute_policy_loss）

@@ -18,7 +18,7 @@
 
 - **源项目**：`/Users/qshf/my-project/slime-agentic`（github: LMIS-ORG/slime-agentic，分支 main。只读，用于对照）
 - **nano 项目**：`/Users/qshf/my-project/slime-agentic-zero-repro`（git 已 init，主分支 main）
-- **当前活跃分支**：`v7`
+- **当前活跃分支**：`v8`
 - **分支准则（每版必须遵守）**：**每个版本切一个 `vN` 分支，从上一版分支的末端切出；当版的全部提交——实施计划 doc + 代码实现 + 验证结果——都落在 `vN` 上，绝不提交到别的版本分支**。判断法：提交前先 `git branch --show-current`，确认在当版分支。反例（已修）：V4 的计划/实现/调试提交错落在 `v3` 分支上——已把 `v3` 回退到其最后一个 V3 提交、V4 全部收进 `v4` 分支。
 - **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/slime-agentic-zero-repro`，git 管理）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
 - **服务器 git 恢复准则（每版必须遵守）**：服务器 checkout 是 **git 管理**的（当前目录 `/home/ubuntu/slime-agentic-zero-repro`，旧的 `zj` 已弃用）。**当服务器所在版本与要跑的版本不匹配时，用 git 从远程仓库恢复到目标版本**（`git fetch origin && git reset --hard origin/<vN>`），**绝不用 rsync 往 git 工作树上盖**——rsync 会把本地其它版本的文件混进 checkout（tracked 被改、v4 文件混进 v3），污染分支状态。反例（已修）：本次调试把本地 v4 工作树 rsync 盖到服务器 v3 checkout，事后 `git restore` + `git clean` 才复原成干净 v3。**已落地（2026-07-22）**：服务器已配 github SSH key（`~/.ssh/id_ed25519`，公钥已加到 github）、remote 已换 SSH，`git fetch origin && git reset --hard origin/<vN>` 实测可用（HTTPS 443 仍超时，故必须走 SSH）。
@@ -55,6 +55,7 @@
 | V7 | FSDP 真训一步 | 分片 / tie / 梯度累积 | ✅ V7.0+V7.2+V7.3 收官（5090：2卡真分片+tie忠实+累积 max_diff=0；V7.3 Ray+FSDP+权重同步 --world 1&2 端到端 PASSED——真 dist 组+DP-split+集体 save/rank0 POST，weight_v 递增、真 backward、未 hang）；V7.5 补 packing 退休偏离 #1 |
 | V7.4 | 接零风险 infra + 版本戳 | learner ABI / 阶段 trace / staleness | ✅ 代码完成+离线全回归绿（learner_contract 校验视图 + learner_metrics 阶段 trace + 缺口1版本戳；全 opt-in/additive，纯 CPU 可验无需服务器；6/6 CPU 不变量测试 PASSED，gap=1 真 staleness）|
 | V7.5 | sequence packing（退休偏离 #1）| flat + 块对角 mask 隔离 / loss-grad 等价 | ✅ 5090 world=1 PASSED（fp32 数学精确：loss 2.4e-7 / grad rel_L2 1.7e-4 / cosine 0.99999999 → 隔离无泄漏；bf16 loss 1.7e-4 + cosine 0.9946）；opt-in `train_packing` 默认 off 零回归；显式块对角 4D mask 替 flash-attn varlen |
+| V7.6 | FA2 varlen packing（退休偏离 #7）| varlen 隔离 / negative control 验收范式 | ✅ 5090 world=1 PASSED（varlen 真 dispatch 28 次、cu_seqlens 与手工值一致；fa2 vs padding loss Δ=0 / cosine 0.99999999；**negative control 判别力 8721×**）；回到源 `attention_mask=None` 写法 |
 | V8 | Megatron 并行 | TP/PP/CP/EP 概念 | 记录设计 |
 | V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
 
@@ -191,6 +192,16 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - 验证：离线全回归绿（opt-in 默认 off，V0/V2/V3/V4/V5/V6/A1/A2/A3/V7.4 各 `--offline` PASSED）。**5090 world=1（GPU2）PASSED**：**fp32 = 数学精确证明**（loss diff 2.4e-7、grad 全局 rel_L2 1.7e-4、cosine 0.99999999——padding 逐行 [B,L] 与 packing 单条 [1,T] 前向逐值一致 → **块对角 mask 隔离无泄漏**，真泄漏会在 fp32 也留 O(1) 痕迹）；**bf16 主门**（loss diff 1.7e-4、cosine 0.9946；magnitude rel_L2 10.9% 是 28 层前向 bf16 舍入累积、非 bug）。
 - **度量教训**：初版沿用 infra spike 的绝对 `0.08` bar（那是**单层**注意力的 bar），搬到 28 层整模型的逐参数 max_abs/max_rel 会被小信号参数（k_proj，bf16 噪声≈信号）放大到虚高（一度 0.83）。正确度量=**全局 rel_L2 + cosine**（向量级、大信号主导）+ **fp32 才是精确证明、bf16 只到舍入**的分层 gate。
 - **偏离**（v7.md：#1 退休、#6 更新、**#7 新增**）：#7 = 隔离机制用显式 O(T²) 块对角 mask 非 varlen O(T) 内核（消 padding 浪费✔、不得块级稀疏✘；T≤~3k 无 OOM；装 flash-attn 后换 varlen 得全部吞吐）。
+
+### V7.6 FA2 varlen packing（退休偏离 #7，2026-08-09）详见 docs/decisions/v7.6.md
+- **前提变化推翻 #7**：V7.5 登记 #7 的理由是「5090 sm_120 无 flash-attn」；实测**官方预编译 wheel `flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312` 本身含 sm_120 kernel**，`--no-deps` 秒装即可用（源码编译是旧机弯路）。故把隔离机制换回源写法。
+- **实施三处（loss 数学一行未动）**：①`train_packing` 三态化（`False`=padding / `"fa2"`=varlen / `"mask"`=V7.5 块对角降为 fallback；`True` 归一到 `"mask"` 保兼容）；②补 `attn_implementation` 参数（**对齐源 actor.py:96 + arguments.py:29**，nano 默认 `"sdpa"` 因 mask 路径需 eager/sdpa）；③`_packed_backward` 的 fa2 分支传 `attention_mask=None` + 每段 reset 的 position_ids——**与源 actor.py:801-812 逐字对应**，transformers 5.x 由 position_ids 反推 cu_seqlens 并 dispatch 到 `flash_attn_varlen_func`（实测反推值与 `pack_sequences` 手工值逐值一致，故不必手动喂）。
+- **`position_ids` 双职（本版教学核心）**：既定位 RoPE 又**定义段边界**。varlen 下它是唯一隔离信息来源（`attention_mask=None`），"每段 reset"从 V7.5 的锦上添花变成**正确性必需**——写错即静默串扰。故加**三重硬断言**（后端==FA2、flash-attn 可用、position_ids 真被判成 packed）。第三条**直接调上游 `_is_packed_sequence`** 而非自写单调性判据：varlen 是否启用由上游那函数说了算，自写判据一旦与上游不一致会出现「断言过了但 varlen 没启用」的最坏情况。长度=1 的段不误判（实测 `[1,1]`/`[3,1]`/`[1,3]`/`[2,1,2]` 全对；单段 `[7]` 正确放行）。
+- **验收范式必须换（本版最实质的发现）**：**FA2 内核只收 fp16/bf16**（`RuntimeError: FlashAttention only support fp16 and bf16 data type`）→ V7.5「fp32 才是精确证明」那个硬门在 fa2 路径**物理不可达**，而 bf16 magnitude rel_L2 达 10.9%（舍入非 bug）**无判别力**。改用 **negative control**：把 reset 的 position_ids 换成单调递增 → 上游判非 packed → varlen 不启用 → 真串扰。实测**正例 rel_L2=1.33e-04 / cosine=0.99999999 vs 反例 rel_L2=1.16 / cosine=0.4148 → 判别力 8721×**（隔 4 个数量级）。**反例若"通过"则度量无判别力、整轮验收作废**（已写进测试逻辑，顺带堵了 infra doc 04 §3b.4 那类假阴性）。
+- **证据边界（诚实，不写过头）**：**fp32 逐值精确证明只属 `"mask"` 路径**（V7.5，本版回归复验仍绿）；**fa2 自身证据 = negative control + 与 padding 路径 bf16 逐值一致**（loss Δ=0.000e+00、cosine 0.99999999），**不宣称继承 mask 路径的 fp32 精确性**——两路走不同内核。
+- 验证：**5090 world=1 PASSED**——varlen 真 dispatch 28 次（=每层一次）、`cu_seqlens=[0,22,41,63,80]` 与手工值一致、`max_seqlen=22` 一致。回归：V7.5 `"mask"` bf16 主门 + fp32 副证均复验绿；离线全回归绿（V0/V2/V3/V4/V5/V6/A1/A2/A3/V7.4）。
+- **环境三坑（均实测，配方见 docs/ops/server-env-bench5090.md）**：①容器 `flash_attn` namespace 被 **FA4 b15** 占（import 成功但无 `__version__`）须先卸载；②**缺 `accelerate`**（tie 分支依赖，不装 FSDPTrainer 起不来）；③**wheel 不能单文件 bind mount**（挂载改名破坏命名规则）须挂目录。装完 FA2 会让 **TE import 崩** → 务必 `--rm` 临时容器，别污染 `bench5090`。
+- **偏离**（v7.md：**#7 退休**、**#8 新增**）：#8 = 等价验收精度为 bf16 + negative control 而非 fp32 逐值精确（①源不做此验收直接信内核；②FA2 拒收 fp32；③**不完全等价**——未证 fp32 精确，那份证明只属 mask 路径）。**"双机统一"作废**：A100 实例已释放，本版只在单卡 5090 验证，A100 补跑列入待办不作完成条件。
 
 ## 7. 待办 / 已知问题
 

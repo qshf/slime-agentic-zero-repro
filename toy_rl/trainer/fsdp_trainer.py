@@ -22,14 +22,25 @@ V7.2 增量（梯度累积）：
   - train_step 保留为 gbs=1 单微批的 train_batch 薄封装（V7.0 入口兼容）
 
 V7.5 增量（sequence packing，opt-in train_packing）：
-  - _grpo_sample_loss：把 GRPO 单样本 loss 抽成 padding/packing 共用方法（两路 loss 数学 bit-identical）。
+  - _grpo_sample_loss：把 GRPO 单样本 loss 抽成 padding/packing 共用方法（各路 loss 数学 bit-identical）。
   - _packed_backward：多样本 flat 成 [1,T] 单微批 + 显式块对角 4D mask 隔离段间注意力
-    （源靠 flash-attn varlen，5090 无 → 物化 mask，见 toy_rl/trainer/data_packing）。
-  - 与 padding 路径 loss/grad 逐值等价（scripts/test_v7.5_packing 验：bf16<0.08 / fp32<1e-3）；
+    （源靠 flash-attn varlen，当时 5090 无 → 物化 mask，见 toy_rl/trainer/data_packing）。
+  - 与 padding 路径 loss/grad 逐值等价（scripts/test_v7.5_packing 验：fp32 loss 2.4e-7 / cosine 0.99999999）；
     退休 v7.md 偏离 #1、新增偏离 #7（显式 O(T²) mask vs varlen O(T)）。
+
+V7.6 增量（FA2 varlen packing，退休偏离 #7）：
+  - train_packing 三态化：False(padding) / "mask"(V7.5 块对角) / "fa2"(FA2 varlen，**对齐源**)。
+  - "fa2" 路径传 attention_mask=None + 每段 reset 的 position_ids，transformers 5.x 由此反推
+    cu_seqlens 并 dispatch 到 flash_attn_varlen_func —— 与源 actor.py:801-812 逐字对应。
+  - 新增 attn_implementation 参数（对齐源 actor.py:96 / arguments.py:29）。
+  - 三重硬断言（后端==FA2、flash-attn 可用、position_ids 真被判成 packed）：fa2 路径的
+    attention_mask=None 一旦落到非 FA2 后端就是**静默**满因果注意力、段间串扰、loss 错。
+  - 验收改用 negative control（FA2 内核拒收 fp32 → V7.5 那套 fp32 精确门在此路径不可用），
+    见 scripts/test_v7.6_fa2_packing.py 与 docs/decisions/v7.6.md 偏离 #8。
 
 偏离源项目（登记见 docs/decisions/v7.md）：
   - V7.5 前无 packing；V7.5 用显式块对角 mask 替代 varlen（无 flash-attn/TE），隔离等价、吞吐部分等价。
+    **V7.6 起 "fa2" 模式回到源写法，#7 退休**；"mask" 降为无 FA2 环境的 fallback + fp32 数值对照。
   - cpu_offload=False（显存够）；无 ref model / KL / entropy（继承 V6 --no-ref，取最纯 GRPO）；无 Ray（V7.3 接）。
   - 一个 train_batch 即一个累积窗口（源用 grad_accum 边界列表支持窗口内多次 step，nano 简化为窗口=批）
 """
@@ -53,6 +64,56 @@ from toy_rl.utils.fsdp_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_packing_mode(train_packing: "bool | str") -> Optional[str]:
+    """三态 train_packing → None(padding) / "mask" / "fa2"（V7.6）。
+
+    V7.5 用 bool（True=块对角 mask）；V7.6 加 FA2 varlen 后扩成字符串，故 True 归一到 "mask"
+    保持旧调用点语义不变（零回归）。
+    """
+    if train_packing is False or train_packing is None or train_packing == "":
+        return None
+    if train_packing is True:
+        return "mask"  # V7.5 兼容：布尔 True == 显式块对角 mask
+    mode = str(train_packing).lower()
+    if mode not in ("mask", "fa2"):
+        raise ValueError(f"train_packing 只支持 False/'mask'/'fa2'，收到 {train_packing!r}")
+    return mode
+
+
+def _assert_varlen_will_engage(position_ids: torch.Tensor, num_segments: int) -> None:
+    """断言 transformers 真会把这条 pack 判成 packed（→ 走 flash_attn_varlen_func）。
+
+    **为什么不自己写单调性判据**：varlen 是否启用完全由 transformers 的
+    `_is_packed_sequence`（modeling_flash_attention_utils.py:528-541）说了算——它检查
+    `batch==1 且 position_ids 非「从 min 开始逐 1 递增」`。自己另写一套"看着等价"的判据，
+    一旦与上游不一致就会出现**断言过了但 varlen 没启用**的最坏情况（attention_mask=None
+    落到满因果注意力 → 段间静默串扰 → loss 悄悄算错）。故直接调上游那个函数，判据永远同源；
+    上游不可导入时才退回**镜像其语义**的等价实现（同样是 diff-based，不是"严格递增"）。
+
+    **长度=1 的段不会误判**（本函数与上游共同保证）：pack 的 position_ids 每段从 0 重数，
+    故段边界处 diff = 0 - (L_prev - 1) = 1 - L_prev。它等于 1 仅当 L_prev == 0（空段，
+    pack_sequences 已过滤 len<2，更不会产生空段）。L_prev == 1 时 diff = 0 ≠ 1 → 照样被检出。
+    真正**不该**触发断言的只有 num_segments == 1（整条 pack 就是一条序列，position_ids
+    本就是 0..T-1 单调，此时无段可隔离、退化成普通因果前向是正确行为）——故单段直接放行。
+    """
+    if num_segments <= 1:
+        return  # 单段：无需隔离，position_ids 本就单调，非 packed 是正确语义。
+
+    try:
+        from transformers.modeling_flash_attention_utils import _is_packed_sequence
+
+        detected = bool(_is_packed_sequence(position_ids, batch_size=position_ids.shape[0]))
+    except ImportError:  # 上游改名/换版本：镜像其语义（diff!=1 处即段边界）。
+        first = position_ids[:, :1] - 1
+        detected = bool((torch.diff(position_ids, prepend=first, dim=-1) != 1).any())
+
+    assert detected, (
+        f"position_ids 未被 transformers 判成 packed（num_segments={num_segments}），"
+        "varlen 隔离不会生效、attention_mask=None 会退化成满因果注意力 → 段间串扰、loss 算错。"
+        "检查 pack_sequences 是否按段 reset 了 position_ids。"
+    )
+
+
 class FSDPTrainer:
     """FSDP2 后端训练器。对齐源 actor.py 的 init + _train_step。"""
 
@@ -66,8 +127,9 @@ class FSDPTrainer:
         global_batch_size: int = 1,
         fp16: bool = False,
         cpu_offload: bool = False,
-        train_packing: bool = False,
+        train_packing: "bool | str" = False,
         compute_dtype: Optional[torch.dtype] = None,
+        attn_implementation: str = "sdpa",
     ):
         self.model_path = model_path
         self.lr = lr
@@ -77,8 +139,11 @@ class FSDPTrainer:
         self.global_batch_size = global_batch_size
         self.fp16 = fp16
         self.cpu_offload = cpu_offload
-        # V7.5：opt-in sequence packing（默认 False → V7.0/V7.2 padding 路径 byte-for-byte 不动）。
-        self.train_packing = train_packing
+        # V7.5/V7.6：opt-in sequence packing（默认 off → V7.0/V7.2 padding 路径 byte-for-byte 不动）。
+        # 三态归一：False/""→None(padding)、True→"mask"（V7.5 兼容）、"mask"/"fa2" 原样。
+        self.packing_mode = _normalize_packing_mode(train_packing)
+        self.train_packing = self.packing_mode is not None  # V7.5 布尔语义保留给外部只读
+        self.attn_implementation = attn_implementation
         # V7.5：forward 计算 dtype = FSDP MixedPrecision 的 param_dtype（默认 fp16/bf16 由 fp16 定；
         # compute_dtype=torch.float32 关混合精度做 fp32 等价副证）。packing 的显式 mask dtype 须匹配它。
         self.compute_dtype = compute_dtype or (torch.float16 if fp16 else torch.bfloat16)
@@ -115,7 +180,15 @@ class FSDPTrainer:
         tie = self.config.tie_word_embeddings
         init_context = get_init_weight_context(tie, self.rank)
         with init_context():
-            model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+            # attn_implementation 对齐源 actor.py:96（源默认 flash_attention_2）。
+            # 后端决定 packing 能用哪条隔离路径："fa2" 要 flash_attention_2（varlen 内核隔离），
+            # "mask" 要 eager/sdpa（4D mask 只在这两个后端被当加性 bias）——两者都在
+            # _packed_backward 里硬断言，避免静默走成满因果注意力。
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                attn_implementation=self.attn_implementation,
+            )
         model.train()
 
         # 4) FSDP wrap 前先抓全量 state_dict（对齐 actor.py:101；meta rank 上此 dict 是空/meta，
@@ -138,7 +211,8 @@ class FSDPTrainer:
             if self.tokenizer.pad_token_id is not None
             else (self.tokenizer.eos_token_id or 0)
         )
-        logger.info(f"Rank {self.rank}: FSDPTrainer ready (tie={tie}, dp_size={self.dp_size})")
+        logger.info(f"Rank {self.rank}: FSDPTrainer ready (tie={tie}, dp_size={self.dp_size}, "
+                    f"packing={self.packing_mode or 'off'}, attn={self.attn_implementation})")
 
     def _grpo_sample_loss(
         self,
@@ -251,17 +325,21 @@ class FSDPTrainer:
         samples: list[dict],
         global_batch_size: int,
     ) -> tuple[float, int]:
-        """一个 flat pack 的 forward + loss + backward（V7.5，packing 路径；累积梯度、不 step）。
+        """一个 flat pack 的 forward + loss + backward（V7.5/V7.6，packing 路径；累积梯度、不 step）。
 
         与 `_microbatch_backward`（padding 路径）**唯一差别** = "怎么算 cur_lp"：
           - padding：每样本一行 [B,L]、按行 2D mask、逐行 logits[:len-1]。
-          - packing：所有样本 flat 成一条 [1,T]、position_ids 每段 reset、**显式块对角 4D mask**
-                     隔离段间注意力（源靠 flash-attn varlen，5090 无 → 物化 mask，见 data_packing）。
+          - packing：所有样本 flat 成一条 [1,T]、position_ids 每段 reset，段间隔离二选一：
+              * "fa2"（V7.6，**对齐源**）：attention_mask=None，transformers 从 reset 的
+                position_ids 反推 cu_seqlens → flash_attn_varlen_func 在内核里跳过跨段计算（O(N)）。
+              * "mask"（V7.5，fallback）：显式物化 [1,1,T,T] 块对角因果 mask（O(T²)），
+                无 FA2 环境可用，且是唯一能做 **fp32** 精确等价证明的路径（FA2 只收 fp16/bf16）。
         loss 数学（GRPO ratio/clip/masked-mean/dp_size 缩放）走**同一** `_grpo_sample_loss`，
-        故两路 loss/grad 逐值等价（V7.5 等价断言的根本）。
+        故三路（padding / mask / fa2）loss/grad 等价（V7.5/V7.6 等价断言的根本）。
 
         源对照（slime actor.py:801-812 _get_model_inputs_args）：input_ids=[1,T]、position_ids=[1,T]、
-        源 attention_mask=None（靠 varlen 内核隔离）；nano 改传显式块对角 mask。
+        attention_mask=None（靠 varlen 内核隔离）——**"fa2" 模式与之逐字对应**；"mask" 是 V7.5 在
+        无 FA2 硬件下的忠实替代（登记偏离 #7，V7.6 起降为 fallback）。
         """
         from toy_rl.trainer.data_packing import (
             build_block_diagonal_causal_mask,
@@ -272,27 +350,43 @@ class FSDPTrainer:
         if pack is None:  # 无可训练样本，与 _microbatch_backward 空返回对称。
             return 0.0, 0
 
-        # 4D 显式 mask 仅在 eager/sdpa 后端被当加性 bias（flash/flex 会无视 → 静默串扰）。
-        # 硬断言：宁可炸也不要静默算错 loss（本版最危险的失败模式）。
-        attn_impl = getattr(self.model.config, "_attn_implementation", "eager")
-        assert attn_impl in ("eager", "sdpa"), (
-            f"packing 的显式块对角 mask 只在 eager/sdpa 被 honor，当前后端={attn_impl}"
-            "（flash/flex 会无视 4D mask、样本间串扰 → loss 错）"
-        )
-
         cu = pack["cu_seqlens"]
         total = cu[-1]
+        num_segments = len(cu) - 1
         input_ids = torch.tensor(pack["tokens"], dtype=torch.long, device=self.device)[None]  # [1,T]
         position_ids = torch.tensor(pack["position_ids"], dtype=torch.long, device=self.device)[None]
-        # mask dtype 须匹配激活（= FSDP MixedPrecision param_dtype = self.compute_dtype）。
-        attn_mask = build_block_diagonal_causal_mask(cu, total, self.device, self.compute_dtype)
+
+        attn_impl = getattr(self.model.config, "_attn_implementation", "eager")
+        if self.packing_mode == "fa2":
+            # 三重硬断言：fa2 路径传 attention_mask=None，任一环节没到位都会**静默**退化成
+            # 满因果注意力（段间串扰、loss 错）——本版最危险的失败模式，宁可炸也不静默算错。
+            assert attn_impl == "flash_attention_2", (
+                f"train_packing='fa2' 要求 FA2 后端，当前 _attn_implementation={attn_impl}"
+                "（attention_mask=None 落到 eager/sdpa 会变成满因果注意力 → 段间串扰）"
+            )
+            from transformers.utils import is_flash_attn_2_available
+
+            assert is_flash_attn_2_available(), (
+                "flash-attn 不可用（未安装/版本不符）——attention_mask=None 会退化成满因果注意力。"
+                "容器内需先 `pip uninstall -y flash-attn-4` 再装 FA2 wheel，见 docs/ops/server-env-bench5090.md"
+            )
+            _assert_varlen_will_engage(position_ids, num_segments)
+            # 对齐源 actor.py:807：attention_mask=None，段边界信息全在 reset 的 position_ids 里。
+            attn_mask = None
+        else:
+            # V7.5 "mask"：4D 显式 mask 仅在 eager/sdpa 被当加性 bias（flash/flex 会无视 → 串扰）。
+            assert attn_impl in ("eager", "sdpa"), (
+                f"packing 的显式块对角 mask 只在 eager/sdpa 被 honor，当前后端={attn_impl}"
+                "（flash/flex 会无视 4D mask、样本间串扰 → loss 错）"
+            )
+            # mask dtype 须匹配激活（= FSDP MixedPrecision param_dtype = self.compute_dtype）。
+            attn_mask = build_block_diagonal_causal_mask(cu, total, self.device, self.compute_dtype)
 
         logits = self.model(
             input_ids, position_ids=position_ids, attention_mask=attn_mask
         ).logits[0].float()  # [T,V]
 
         old_lp_flat = pack["old_log_probs"]  # flat 长 T 或 None
-        num_segments = len(cu) - 1
         sample_losses = []
         for seg in range(num_segments):
             start, end = cu[seg], cu[seg + 1]
@@ -335,13 +429,13 @@ class FSDPTrainer:
         global_batch_size: 全局批大小（用于缩放）；默认取 self.global_batch_size。
         microbatch_size: 每个微批的样本数；默认 1，保持 V7.0 单样本入口兼容。
 
-        V7.5：`self.train_packing` → 每个微批走 packing 前向（flat + 块对角 mask），否则 padding。
-        两路 loss 数学一致（_grpo_sample_loss），只换"怎么算 cur_lp"；默认 padding 不变。
+        V7.5/V7.6：`self.packing_mode` → 每个微批走 packing 前向（"fa2"=varlen / "mask"=块对角），
+        None 则走 padding。三路 loss 数学一致（_grpo_sample_loss），只换"怎么算 cur_lp"；默认 padding 不变。
         """
         if microbatch_size < 1:
             raise ValueError(f"microbatch_size must be positive, got {microbatch_size}")
         gbs = global_batch_size if global_batch_size is not None else self.global_batch_size
-        backward = self._packed_backward if self.train_packing else self._microbatch_backward
+        backward = self._packed_backward if self.packing_mode else self._microbatch_backward
 
         self.optimizer.zero_grad(set_to_none=True)  # 累积窗口开始，清零一次（actor.py:523）
         loss_sum, trained = 0.0, 0
