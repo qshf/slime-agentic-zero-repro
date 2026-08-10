@@ -74,25 +74,30 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-# megatron 的 `--attention-backend X` 就是翻译成 TE 的三个 NVTE_* env
-# （mcore language_module.py:124-140 的 check_and_set_env_variable）。
+# megatron 的 `--attention-backend X` 落到 `TransformerConfig.attention_backend`，
+# 由 mcore 在建模型时翻译成 TE 的三个 NVTE_* env
+# （mcore language_module.py:105-124 的 `_set_attention_backend` / `check_and_set_env_variable`）。
 # 源**所有** megatron 训练脚本的 MISC_ARGS 都带 `--attention-backend flash`
 # （run-qwen3-4B.sh:139 等），理由见源 docs/zh/developer_guide/debug.md:15：
 # 「避免 CP 下 fused attention 的数值不稳定」。sm_120 上实测这不是"不稳定"而是**确定错**
 # （fused 的 THD backward `dq` cosine 只有 0.356，上游 TE#3333），故 nano 把源的
-# 配置约定**编码成代码里的断言**（见 `_assert_attention_backend`）。
-_NVTE_ENV = {
-    "flash": {"NVTE_FLASH_ATTN": "1", "NVTE_FUSED_ATTN": "0", "NVTE_UNFUSED_ATTN": "0"},
-    "fused": {"NVTE_FLASH_ATTN": "0", "NVTE_FUSED_ATTN": "1", "NVTE_UNFUSED_ATTN": "0"},
-    "unfused": {"NVTE_FLASH_ATTN": "0", "NVTE_FUSED_ATTN": "0", "NVTE_UNFUSED_ATTN": "1"},
-}
+# 配置约定**编码成代码里的断言**（见 `observed_attention_backend` + CP>1 的硬断言）。
+#
+# **不要自己去 set 那三个 env**（初版这么写，实测直接炸）：mcore 会**校验** env 与
+# `config.attention_backend` 一致，不一致就 assert 退出；且本项目的容器镜像已经把
+# `NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 NVTE_UNFUSED_ATTN=0` 烤进了镜像默认值，
+# 与 mcore 的默认 `auto`（期望 1/1/1）冲突 —— 所以**必须显式设 config 字段**，
+# 让 mcore 自己去写 env。这也正是源的做法（传 arg，不碰 env）。
+_ATTN_BACKENDS = ("flash", "fused", "unfused", "local", "auto")
 
 
-def set_attention_backend(backend: str) -> None:
-    """请求 TE 用哪个 attention 后端。**必须在建模型/跑前向之前调用**。"""
-    if backend not in _NVTE_ENV:
-        raise ValueError(f"attention_backend={backend!r} 须是 {sorted(_NVTE_ENV)} 之一")
-    os.environ.update(_NVTE_ENV[backend])
+def _attn_backend_enum(name: str):
+    """`"flash"` → `AttnBackend.flash`（对齐 megatron `--attention-backend` 的取值集合）。"""
+    from megatron.core.transformer.enums import AttnBackend
+
+    if name not in _ATTN_BACKENDS:
+        raise ValueError(f"attention_backend={name!r} 须是 {_ATTN_BACKENDS} 之一")
+    return getattr(AttnBackend, name)
 
 
 def observed_attention_backend() -> str:
@@ -126,6 +131,7 @@ def _build_transformer_config(
     pp_size: int = 1,
     cp_size: int = 1,
     variable_seq_lengths: bool = False,
+    attention_backend: str = "flash",
 ):
     """HF config → Megatron TransformerConfig（对齐源 model_provider.py 的字段映射）。
 
@@ -149,6 +155,9 @@ def _build_transformer_config(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=cp_size,
+        # ≡ megatron 的 `--attention-backend`（源所有 megatron 脚本都传 flash）。
+        # mcore 建模型时据此设 NVTE_*，并校验现有 env 与之一致 —— 故必须走这里而不是自己设 env。
+        attention_backend=_attn_backend_enum(attention_backend),
         # PP 的 p2p 收发缓冲按这个 dtype 分配（不设则 1F1B 调度直接报错）。
         pipeline_dtype=params_dtype,
         # thd(packing) 下每个微批的 T 不同，PP 的 recv 形状必须动态协商。
@@ -222,8 +231,6 @@ class MegatronTrainer:
                 f"CP>1 必须走 flash 后端（当前 {attention_backend!r}）——"
                 "fused(cuDNN) 的 THD backward 在 sm_120 上静默算错（TE#3333）"
             )
-        if self.use_te_spec:
-            set_attention_backend(attention_backend)  # 必须在建模型之前
 
         # 通信后端：单卡多 rank 只能 gloo（NCCL 拒绝 duplicate GPU）；多卡传 "nccl"。
         if not dist.is_initialized():
@@ -303,6 +310,7 @@ class MegatronTrainer:
             pp_size=self.pp_size,
             cp_size=self.cp_size,
             variable_seq_lengths=(qkv_format == "thd" and self.pp_size > 1),
+            attention_backend=attention_backend,
         )
         self.params_dtype = params_dtype
         self.num_layers = self.config.num_layers
