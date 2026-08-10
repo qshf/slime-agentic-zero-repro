@@ -100,6 +100,23 @@ def _attn_backend_enum(name: str):
     return getattr(AttnBackend, name)
 
 
+def _clear_nvte_backend_env() -> None:
+    """建模型前**清掉**继承来的 NVTE_* —— 让 mcore 按 `config.attention_backend` 自己写。
+
+    这不是"自己设 env"（那正是上面注释里说不能干的事），而是相反：把**别处留下的陈旧值**
+    清掉，好让 mcore 的 `check_and_set_env_variable`（它接受 `current_value is None`）
+    唯一地由 config 决定结果。
+
+    非清不可的实证：本项目的 `agentic-rl-infra-lab:fa2-mcore` 镜像把
+    `NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 NVTE_UNFUSED_ATTN=0` 烤进了默认 env
+    （给 CP 用的），于是任何**非 flash** 的请求都会撞上
+    `AssertionError: NVTE_FLASH_ATTN set to 1, but expected 0 for attention backend type unfused`
+    —— 而 fp32 档恰恰只能走 unfused（FA2 内核拒收 fp32）。清掉之后两条路径都能选。
+    """
+    for k in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+        os.environ.pop(k, None)
+
+
 def observed_attention_backend() -> str:
     """读回 **TE 实际选中的**后端（不是我们请求的那个）。跑过一次真前向后才有值。
 
@@ -322,6 +339,7 @@ class MegatronTrainer:
         #    只有 last stage 有 output_layer + final_layernorm**（PP 把模型纵向切开）。
         from megatron.core.models.gpt import GPTModel
 
+        _clear_nvte_backend_env()  # 见该函数 docstring：清陈旧 env，让 config 唯一决定后端
         if self.use_te_spec:
             from megatron.core.models.gpt.gpt_layer_specs import (
                 get_gpt_layer_with_transformer_engine_spec as _layer_spec,
