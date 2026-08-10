@@ -104,17 +104,59 @@ CP=2 的 BSHD/THD 两行也各自内联报告，均为 `FlashAttention(2.8.3)`�
 
 ---
 
-## 4. 镜像区分（5090 后端隔离）
+## 4. 镜像：收敛到单一 `fa2-mcore`（2026-08-10 改写）
 
-三后端装一起会抢 `flash_attn` 包名 + 底层 cuDNN 库，5090 上按后端拆镜像（infra doc 04 §3b.0）：
+**本节原来的多 tag 方案已作废**。原方案基于一条实测推翻了的前提——infra `docs/ops/docker-env-a100-vs-5090.md` §4
+写的「**FA2 + TE 互斥**：FA2 wheel 覆盖 `flash_attn` namespace → TE import 崩」。
 
-| 镜像 tag | 装什么 | 跑哪路 |
+**那条只在「留下 `flash_attn_4-*.dist-info`」时成立**。TE `backends.py` 里有**两个独立的 try 块**，
+各自靠**包元数据**判断装没装，却 import **同一个 `flash_attn/` 目录**：
+
+| 块 | 判据 | import |
 |---|---|---|
-| `te-cudnn-system-spike` | TE + system cuDNN | TE cuDNN（`NVTE_FLASH_ATTN=0`）——仅 forward 对照 |
-| `fa4-spike`（`FROM te-spike`） | FA4 b25 + SDPA | FA4 / SDPA 同进程 |
-| （fa4-spike 内临时 pip 装 FA2 wheel） | FA2 2.8.3 | FA2 varlen——装完 `flash_attn` 即变 FA2，与 TE 互斥，隔离最后跑 |
+| FA2（`:96-109`） | `get_pkg_version("flash-attn")` | `from flash_attn.flash_attn_interface import flash_attn_varlen_func` |
+| FA4（`:163-169`） | `get_pkg_version("flash-attn-4")` | `from flash_attn.cute.interface import ...` |
 
-repo 训练镜像基底沿用 infra 的 `te-cudnn-system-spike`（TE 只作对照层）；真训练前装 FA2 wheel。若频繁在 TE/FA2 间切，固化两个 tag（`te-cudnn-system-spike` + `fa2-system-spike`）避免反复 pip uninstall/install。
+`pip install --no-deps` FA2 只把 `flash_attn/` 的内容换成 FA2 的（`flash_attn.cute` 随之消失），
+**不动 `flash_attn_4-*.dist-info`** → `get_pkg_version("flash-attn-4")` 仍返回 `4.0.0b15`、
+不抛 `PackageNotFoundError` → TE 走进 `:167` 的 `else` 去 import 已不存在的 `flash_attn.cute`
+→ `ModuleNotFoundError`（**该 try 只捕获 `PackageNotFoundError`，这个异常没人接**）→ `import transformer_engine` 崩。
+**元数据说 FA4 在、文件系统说不在，TE 信元数据。连 dist-info 一起删则两者共存无碍**
+（容器实测：`flash-attn 2.8.3` / `flash-attn-4 PackageNotFoundError`）。
+
+**订正结论**：TE 与 FA2 **从不互斥**——TE 有一整块专为 FA2 写的路径，还为 Blackwell 单设版本下限
+（`backends.py:101` `version_required_blackwell`，正对 sm_120）。真正互斥的是 **FA2 ↔ FA4**
+（同抢 `flash_attn` 顶层包名）。之前那次崩是**卸载不干净**，被误诊成了软件冲突。
+
+于是 5090 上只留一个镜像：
+
+| 镜像 tag | 装什么 | 跑什么 |
+|---|---|---|
+| **`agentic-rl-infra-lab:fa2-mcore`** | TE 2.17 + megatron-core 0.18.2 + **FA2 2.8.3** + accelerate | 全部——V7.6 packing、V8 Megatron TP、V8.2 CP，及后端对照（`NVTE_*` 可覆盖） |
+
+配方入库在 infra 仓库：`docker/Dockerfile.fa2-mcore` + `docker/build_fa2_mcore.sh`
+（`FROM te-cudnn-system-spike` → 删 FA4 目录**与 dist-info** → 装 FA2 → 装 accelerate →
+`ENV NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 NVTE_UNFUSED_ATTN=0`）。
+
+**为何必须是「TE 与 FA2 同镜像」而不是二选一**：CP 只有 TE 后端支持
+（mcore `dot_product_attention.py:57-59` 对 local spec 直接 assert `cp==1`），
+而 sm_120 上 TE 的 cuDNN fused THD backward 是坏的（§3，TE#3333）→ CP 必须走 flash 后端 →
+**同时需要 TE 与 FA2**。infra `scripts/06_attn_backend_throughput.py` 那种
+`from flash_attn import flash_attn_varlen_func` 的直调路径在这里用不上（它绕开 TE，也就绕开了 CP）；
+nano 走的是 TE 内部那行 `backends.py:109 from flash_attn.flash_attn_interface import flash_attn_varlen_func`。
+
+**验收（2026-08-10，镜像由入库脚本重建后复验，数字与合并前逐位相同）**：
+
+| 检查 | 结果 |
+|---|---|
+| 三者共存 | `FA2 2.8.3` / `TE 2.17.0` / `megatron-core ok` |
+| **FA2 真被调用**（给 `flash_attn_varlen_func` 打计数器，同 V7.6 验 varlen 那招） | `[before] varlen=0` → `[after] varlen=1`；TE 自报 `use_flash_attention=1  flash_attention_backend=Version('2.8.3')` |
+| C0 后端断言 | TE 自选 `FlashAttention(2.8.3)` |
+| C1 forward / C2 backward | `max_abs_diff=0.000e+00` / `dq` cosine `1.00000000` |
+| C4 CP=2 BSHD / THD | PASS `\|dq\|=106.6186` / PASS `\|dq\|=102.6641` |
+| negative control（`TAG=flash` + env 请求 fused） | `❌ 后端不符`、`EXIT=1` ← 断言仍有判别力，且证明 `ENV` 是默认值非锁 |
+
+**版本号字符串不算证据**：`FlashAttention(2.8.3)` 只证明 TE 看见了这个包；计数器才证明 kernel 被调进。
 
 ---
 
@@ -126,7 +168,7 @@ repo 训练镜像基底沿用 infra 的 `te-cudnn-system-spike`（TE 只作对�
 | packing 隔离 | FA2 cu_seqlens | 同 |
 | FA4 探索 | 不涉及（A100 架构拒绝） | opt-in flag，5090-only |
 | TE cuDNN | 两机均降为 forward 对照 | **backward 禁用**（bug），本文记明 |
-| 镜像 | 训练镜像基底 + FA2 wheel | 按后端多 tag（对照用） |
+| 镜像 | 训练镜像基底 + FA2 wheel | **单一 `fa2-mcore`**（TE+megatron+FA2 共存，§4） |
 
 **核心**：5090 不再需要独立代码分支。所有专属项要么是 opt-in flag（FA4），要么是禁令/备忘（TE bug、镜像），主线代码与 A100 完全共享。
 
@@ -134,6 +176,7 @@ repo 训练镜像基底沿用 infra 的 `te-cudnn-system-spike`（TE 只作对�
 
 ## 6. 待办
 
-- [ ] FA4 后续版本（> b25）若吞吐反超 FA2，重估是否升为 5090 首选。
+- [ ] FA4 后续版本（> b25）若吞吐反超 FA2，重估是否升为 5090 首选。**注意**：`fa2-mcore` 里 FA2 与 FA4 仍互斥（同占 `flash_attn` 包名），若要试 FA4 需另建 tag。
 - [ ] TE#3333 若 maintainer 修复或要求补验（其他 head_dim/dtype/mask，或另租 sm_80 交叉确认），按 infra investigations README 的复现命令跑。
-- [ ] 是否固化 `fa2-system-spike` 镜像 tag。
+- [x] ~~是否固化 `fa2-system-spike` 镜像 tag~~ → 已固化为 **`fa2-mcore`**（§4），并把配方入库到 infra `docker/`。5090 上其余 lab 镜像（`fa2-spike`/`te-spike`/`te-spike-deps`）已删。
+- [ ] infra `docs/ops/docker-env-a100-vs-5090.md` §4 那行「FA2 + TE ❌ 互斥」需按 §4 的 dist-info 机制订正（该仓库正在改结构，未擅动）。
