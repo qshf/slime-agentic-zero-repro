@@ -13,6 +13,11 @@ Megatron 的参数**名和形状都不是 HF 的**——`decoder.layers.0.self_a
   - `megatron_to_hf/__init__.py:22 convert_to_hf` —— 先 remove_padding 再改名的顺序
   - `update_weight/common.py:15 all_gather_param` —— 按 `param.partition_dim` TP-gather
     （含 **linear_fc1 的 GLU 重排** 这个最易错的点，见 `all_gather_param` docstring）
+  - `update_weight/common.py:207 _named_params_and_buffers_global` —— PP 下把**局部层号**
+    映射回全局层号（见 `to_global_layer_name`）
+  - `update_weight/hf_weight_iterator_direct.py:66-77` —— **PP>1 时跨 stage broadcast 参数**
+    （V8.1 只做了 TP-gather，因为 PP=1 时单 rank 持有全部层；PP>1 时任何单 rank 都拿不到
+     完整模型 —— 这才是这条 RL 接缝在多维并行下的真实复杂度）
 
 偏离源项目（登记见 docs/decisions/v8.md）：
   - **只做 Qwen3 dense 一种**（源 10 个模型 + MoE/MLA/quant 分支）：nano 只跑 Qwen3-0.6B，
@@ -117,6 +122,50 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
 _LAYER_RE = re.compile(r"decoder\.layers\.(\d+)\.(.+)")
 
 
+def to_global_layer_name(name: str, layer_offset: int) -> str:
+    """`decoder.layers.{本 stage 内的局部序号}` → `decoder.layers.{全局序号}`。
+
+    **PP>1 时非做不可**：mcore 的 `named_parameters()` 用的是**本 stage 内的局部序号**
+    （stage1 的第一层同样叫 `decoder.layers.0`），直接拿去改名会把 stage1 的 layer 0
+    写成 `model.layers.0` 而与 stage0 的撞名。源 `update_weight/common.py:207`
+    `_named_params_and_buffers_global` 做的正是这件事（`layer_idx + layer_offset`），
+    offset 由 mcore 的 `get_transformer_layer_offset(config)` 给出。
+    """
+    if layer_offset == 0:
+        return name
+    match = _LAYER_RE.match(name)
+    if not match:
+        return name
+    idx, rest = match.groups()
+    return f"decoder.layers.{int(idx) + layer_offset}.{rest}"
+
+
+def _local_params_by_global_name(model, tie: bool) -> dict[str, torch.nn.Parameter]:
+    """本 rank 持有的参数，键改成**全局名**（PP 层号已偏移；tie 的 output_layer 已剔除）。"""
+    from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+    offset = get_transformer_layer_offset(model.config)
+    out: dict[str, torch.nn.Parameter] = {}
+    for name, param in model.named_parameters():
+        clean = to_global_layer_name(strip_param_name_prefix(name), offset)
+        if tie and clean == "output_layer.weight":
+            continue  # tie：HF 侧无独立 lm_head，由 embed_tokens 共享
+        out[clean] = param
+    return out
+
+
+def _full_shape(name: str, param: torch.nn.Parameter) -> tuple[int, ...]:
+    """该参数 **TP-gather 之后**的全量形状（PP broadcast 要按它预分配接收缓冲）。"""
+    from megatron.core import mpu
+
+    shape = list(param.shape)
+    if getattr(param, "tensor_model_parallel", False) and (
+        getattr(param, "parallel_mode", None) != "duplicated"
+    ):
+        shape[param.partition_dim] *= mpu.get_tensor_model_parallel_world_size()
+    return tuple(shape)
+
+
 def convert_qwen3_to_hf(hf_config, name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
     """单个 **已 gather 成全量** 的 Megatron 参数 → 一个或多个 HF 参数（名, 张量）。
 
@@ -184,19 +233,58 @@ def convert_qwen3_to_hf(hf_config, name: str, param: torch.Tensor) -> list[tuple
 
 
 def megatron_to_hf_state_dict(model, hf_config, tie: bool) -> dict[str, torch.Tensor]:
-    """整个 Megatron 模型 → HF state_dict（TP-gather + remove_padding + 改名）。
+    """整个 Megatron 模型 → HF state_dict（TP-gather + PP-broadcast + remove_padding + 改名）。
 
     对齐源 `convert_to_hf`（`__init__.py:22`）：**先 remove_padding 再改名**。
     tie 时源不产出 `lm_head.weight`（HF 侧由 embed_tokens 共享）——nano 同样跳过。
+
+    **PP>1 时这条 RL 接缝的复杂度才完整（V8.1 只见到了一半）**：PP=1 时**一个 rank 持有
+    全部层**，TP-gather 完就齐了；PP>1 时 layer 0..k 在 stage0、k+1.. 在 stage1，
+    **任何单个 rank 都拿不到完整模型**，必须先跨 PP broadcast
+    （源 `update_weight/hf_weight_iterator_direct.py:66-77` 的 `broadcast params across pp ranks`）。
+    源的做法是先用 `all_gather_object` 在 PP 组里交换 `ParamInfo`（名/形状/dtype/src_rank），
+    再对每个参数从它的 `src_rank` 广播 —— nano 逐字照搬这个两步法。
+
+    **集体操作**：所有 rank 都要进，且要以**相同顺序**遍历同一份全局名字表
+    （故 `sorted(...)`，与源 `param_infos = sorted(..., key=lambda info: info.name)` 同理）。
     """
+    from megatron.core import mpu
+
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    local = _local_params_by_global_name(model, tie)
+    vocab = hf_config.vocab_size
     out: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        clean = strip_param_name_prefix(name)
-        if tie and clean == "output_layer.weight":
-            continue  # tie：HF 侧无独立 lm_head，由 embed_tokens 共享
-        full = all_gather_param(clean, param)
-        full = remove_padding(clean, full, hf_config.vocab_size)
-        for hf_name, hf_param in convert_qwen3_to_hf(hf_config, clean, full):
+
+    if pp_size == 1:
+        for name in sorted(local):
+            full = remove_padding(name, all_gather_param(name, local[name]), vocab)
+            for hf_name, hf_param in convert_qwen3_to_hf(hf_config, name, full):
+                out[hf_name] = hf_param.detach().clone()
+        return out
+
+    pp_group = mpu.get_pipeline_model_parallel_group()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    pp_ranks = dist.get_process_group_ranks(pp_group)  # 按 pp_rank 顺序排列的全局 rank
+
+    meta = {n: (_full_shape(n, p), p.dtype) for n, p in local.items()}
+    gathered: list = [None] * pp_size
+    dist.all_gather_object(gathered, meta, group=pp_group)
+    owner: dict[str, tuple[int, tuple, torch.dtype]] = {}
+    for src_pp, m in enumerate(gathered):
+        for n, (shape, dtype) in m.items():
+            owner.setdefault(n, (src_pp, shape, dtype))
+
+    for name in sorted(owner):
+        src_pp, shape, dtype = owner[name]
+        if src_pp == pp_rank:
+            # TP-gather 是 **TP 组内**的集体操作，只有持有该参数的那个 stage 会进——
+            # 而 TP 组本就不跨 stage（rank 布局 order='tp-cp-ep-dp-pp'），故不会失配。
+            full = all_gather_param(name, local[name]).contiguous()
+        else:
+            full = torch.empty(shape, dtype=dtype, device=torch.cuda.current_device())
+        dist.broadcast(full, src=pp_ranks[src_pp], group=pp_group)
+        full = remove_padding(name, full, vocab)
+        for hf_name, hf_param in convert_qwen3_to_hf(hf_config, name, full):
             out[hf_name] = hf_param.detach().clone()
     return out
 
@@ -219,6 +307,10 @@ def hf_to_megatron_state_dict(
     tie: bool,
     padded_vocab_size: Optional[int] = None,
     fused_layernorm: bool = False,
+    layer_offset: int = 0,
+    include_embedding: bool = True,
+    include_final_norm: bool = True,
+    include_output_layer: Optional[bool] = None,
 ) -> dict[str, torch.Tensor]:
     """HF state_dict → 本 rank 的 Megatron 分片 state_dict。**正向映射的严格逆**。
 
@@ -231,6 +323,14 @@ def hf_to_megatron_state_dict(
     反向必须**产出模型实际用的那一种**，故有 `fused_layernorm` 开关（由 `load_hf_into_megatron`
     按模型真实参数名自动判定，不靠猜）。
 
+    **PP 相关的四个参数**（V8.2 新增，PP=1 时全部退化成 V8 的行为）：
+      - `num_layers` 是**本 stage 的局部层数**，`layer_offset` 把它映射回 HF 的全局层号；
+      - `include_embedding` / `include_final_norm` 分别对应 `pre_process` / `post_process`
+        —— PP 把模型纵向切开后，只有 first stage 有输入嵌入、只有 last stage 有 final_layernorm；
+      - `include_output_layer=None`（默认）= `not tie`，即 V8 的行为：tie 时 mcore 在
+        `pre_process=True` 的 stage 上**不分配** `output_layer.weight`（由嵌入共享）。
+        PP>1 的 last stage（`pre_process=False`）**会真的分配一份**，那时调用方必须显式传 True。
+
     分片规则与 `all_gather_param` 的 gather 规则一一对应：
       - column-parallel（qkv/fc1/embedding）：沿 dim0 切；**fc1 必须 gate、up 分别切再拼**
       - row-parallel（o_proj/fc2）：沿 dim1 切
@@ -242,31 +342,34 @@ def hf_to_megatron_state_dict(
     num_query_groups = hf_config.num_key_value_heads
     value_num_per_group = hf_config.num_attention_heads // num_query_groups
     vocab_size = hf_config.vocab_size
+    if include_output_layer is None:
+        include_output_layer = not tie
 
     out: dict[str, torch.Tensor] = {}
 
-    embed = hf_state["model.embed_tokens.weight"]
-    if padded_vocab_size is not None and padded_vocab_size > vocab_size:
+    def _pad_vocab(t: torch.Tensor) -> torch.Tensor:
+        if padded_vocab_size is None or padded_vocab_size <= vocab_size:
+            return t
         pad = torch.zeros(
-            padded_vocab_size - vocab_size, embed.shape[1], dtype=embed.dtype, device=embed.device
+            padded_vocab_size - vocab_size, t.shape[1], dtype=t.dtype, device=t.device
         )
-        embed = torch.cat([embed, pad], dim=0)
-    out["embedding.word_embeddings.weight"] = _tp_shard(embed, 0, tp_rank, tp_size)
-    out["decoder.final_layernorm.weight"] = hf_state["model.norm.weight"]
-    if not tie:
-        lm_head = hf_state["lm_head.weight"]
-        if padded_vocab_size is not None and padded_vocab_size > vocab_size:
-            pad = torch.zeros(
-                padded_vocab_size - vocab_size,
-                lm_head.shape[1],
-                dtype=lm_head.dtype,
-                device=lm_head.device,
-            )
-            lm_head = torch.cat([lm_head, pad], dim=0)
+        return torch.cat([t, pad], dim=0)
+
+    embed = _pad_vocab(hf_state["model.embed_tokens.weight"])
+    if include_embedding:
+        out["embedding.word_embeddings.weight"] = _tp_shard(embed, 0, tp_rank, tp_size)
+    if include_final_norm:
+        out["decoder.final_layernorm.weight"] = hf_state["model.norm.weight"]
+    if include_output_layer:
+        # tie 且 PP>1：last stage **真的**持有一份 `output_layer.weight`（`pre_process=False`
+        # 时 mcore 不再 skip 分配），且建模型时被 `setup_embeddings_and_output_layer` 填成 0
+        # 等着 embedding 组同步 —— 而 nano 是在建完模型之后才载权重，**必须自己把它填上**，
+        # 否则 last stage 的输出投影全是零（loss 恒定、梯度全错，且形状全对故不报错）。
+        lm_head = _pad_vocab(hf_state["lm_head.weight"]) if not tie else embed
         out["output_layer.weight"] = _tp_shard(lm_head, 0, tp_rank, tp_size)
 
     for i in range(num_layers):
-        p, m = f"model.layers.{i}", f"decoder.layers.{i}"
+        p, m = f"model.layers.{i + layer_offset}", f"decoder.layers.{i}"
 
         # qkv 融合：按 KV group 交错回 [groups, vpg+2, head_dim, hidden]，与正向的 view 逆着来。
         q = hf_state[f"{p}.self_attn.q_proj.weight"].view(
@@ -311,21 +414,30 @@ def hf_to_megatron_state_dict(
 
 
 def load_hf_into_megatron(model, hf_state: dict[str, torch.Tensor], hf_config, tie: bool) -> None:
-    """把 HF state_dict 载入已建好的 Megatron 模型（本 rank 分片）。"""
+    """把 HF state_dict 载入已建好的 Megatron 模型（本 rank 分片、本 stage 的层）。
+
+    PP>1 时 `model.decoder.layers` 只有本 stage 的那几层，且层号是**局部**的；
+    `get_transformer_layer_offset(config)` 给出它们对应的 HF 全局层号
+    （与 `to_global_layer_name` 用的是同一个 offset —— 载入与导出必须用同一套坐标，
+    否则会出现「载对了、导出时错位」这种两头都看不出的静默 bug）。
+    """
     from megatron.core import mpu
+    from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
     tp_rank = mpu.get_tensor_model_parallel_rank()
     tp_size = mpu.get_tensor_model_parallel_world_size()
 
-    # 从模型自身读 padded vocab（megatron.core 不加 padding，但换配置时这里就有值）。
-    padded_vocab = model.embedding.word_embeddings.weight.shape[0] * tp_size
+    own = {strip_param_name_prefix(n): p for n, p in model.named_parameters()}
+    num_layers = len(model.decoder.layers) if model.decoder is not None else 0
+    layer_offset = get_transformer_layer_offset(model.config)
 
-    num_layers = len(model.decoder.layers)
-    own = dict(model.named_parameters())
+    # 从模型自身读 padded vocab（megatron.core 不加 padding，但换配置时这里就有值）。
+    # PP>1 时非 first stage 没有 embedding，改由 output_layer 推（两者 vocab 维一致）。
+    vocab_param = own.get("embedding.word_embeddings.weight") or own.get("output_layer.weight")
+    padded_vocab = vocab_param.shape[0] * tp_size if vocab_param is not None else None
+
     # 按模型**实际**参数名判定 layernorm 命名风格（TE 融合式 vs local 独立式），不靠猜。
-    fused_ln = "decoder.layers.0.self_attention.linear_qkv.layer_norm_weight" in {
-        strip_param_name_prefix(n) for n in own
-    }
+    fused_ln = "decoder.layers.0.self_attention.linear_qkv.layer_norm_weight" in own
     mega_state = hf_to_megatron_state_dict(
         hf_state,
         hf_config,
@@ -335,9 +447,15 @@ def load_hf_into_megatron(model, hf_state: dict[str, torch.Tensor], hf_config, t
         tie,
         padded_vocab_size=padded_vocab,
         fused_layernorm=fused_ln,
+        layer_offset=layer_offset,
+        # 三个 include 都按**模型实际有没有**判定，而不是按 pre/post_process 推断——
+        # tie 与 PP 组合时 mcore 的分配规则有 skip 分支（见 hf_to_megatron_state_dict 的
+        # `include_output_layer` 说明），问模型本人最可靠。
+        include_embedding="embedding.word_embeddings.weight" in own,
+        include_final_norm="decoder.final_layernorm.weight" in own,
+        include_output_layer="output_layer.weight" in own,
     )
 
-    own = {strip_param_name_prefix(n): p for n, p in own.items()}
     with torch.no_grad():
         for name, tensor in mega_state.items():
             param = own.get(name)
