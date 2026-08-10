@@ -433,7 +433,11 @@ def load_hf_into_megatron(model, hf_state: dict[str, torch.Tensor], hf_config, t
 
     # 从模型自身读 padded vocab（megatron.core 不加 padding，但换配置时这里就有值）。
     # PP>1 时非 first stage 没有 embedding，改由 output_layer 推（两者 vocab 维一致）。
-    vocab_param = own.get("embedding.word_embeddings.weight") or own.get("output_layer.weight")
+    # 注意用显式 `is not None` 而不是 `a or b` —— 对张量取布尔值会抛
+    # `Boolean value of Tensor with more than one value is ambiguous`。
+    vocab_param = own.get("embedding.word_embeddings.weight")
+    if vocab_param is None:
+        vocab_param = own.get("output_layer.weight")
     padded_vocab = vocab_param.shape[0] * tp_size if vocab_param is not None else None
 
     # 按模型**实际**参数名判定 layernorm 命名风格（TE 融合式 vs local 独立式），不靠猜。
