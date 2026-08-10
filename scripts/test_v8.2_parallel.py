@@ -257,8 +257,8 @@ def main() -> int:
             f"attention 后端是 flash（实选 {backend}）—— CP 的正确性前提",
         )
 
-    check(metrics["trained_samples"] > 0 or not trainer.is_last_stage,
-          f"last stage 上有样本参与训练（trained={metrics['trained_samples']}）")
+    check(metrics["trained_samples"] == gbs,
+          f"全部 {gbs} 条样本参与训练（trained={metrics['trained_samples']}）")
     check(torch.isfinite(torch.tensor(loss)).item(), f"loss 有限：{loss:.6f}")
 
     grads = _grads_in_hf_layout(trainer)

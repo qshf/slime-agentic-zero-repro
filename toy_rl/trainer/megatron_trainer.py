@@ -859,9 +859,20 @@ class MegatronTrainer:
         loss_sum = sum(float(x["loss"]) for x in losses_reduced)
         trained = sum(int(x["trained_samples"]) for x in losses_reduced)
         if self.dp_cp_size > 1:
-            t = torch.tensor([loss_sum], device=self.device)
+            t = torch.tensor([loss_sum, float(trained)], device=self.device)
             dist.all_reduce(t, op=dist.ReduceOp.AVG, group=self.dp_cp_group)
-            loss_sum = float(t[0])
+            loss_sum, trained = float(t[0]), int(round(float(t[1])))
+        if self.pp_size > 1:
+            # **PP 下非 last stage 的 `losses_reduced` 是空的**（mcore schedules 只在
+            # last stage 调 loss_func），照直返回会让 rank 0（first stage）报 loss=0 ——
+            # 那不是算错，是"这个数在别的进程里"。源在 last stage 上记日志
+            # （loss.py:431 / model.py:279 都有 `is_pipeline_last_stage` 守卫）；
+            # nano 多广播一步，让任一 rank 都能拿到同一个数，验收脚本才不必关心自己是哪个 stage。
+            # **纯报告用**，与梯度无关。
+            t = torch.tensor([loss_sum, float(trained)], device=self.device)
+            dist.broadcast(t, src=dist.get_process_group_ranks(self.pp_group)[-1],
+                           group=self.pp_group)
+            loss_sum, trained = float(t[0]), int(round(float(t[1])))
 
         return {
             "loss": loss_sum,
