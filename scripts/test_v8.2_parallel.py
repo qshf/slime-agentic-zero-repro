@@ -204,6 +204,14 @@ def main() -> int:
     ap.add_argument("--backend", type=str, default="gloo", choices=["gloo", "nccl"])
     ap.add_argument("--qkv-format", type=str, default="bshd", choices=["bshd", "thd"])
     ap.add_argument("--te-spec", action="store_true", help="强制 TE spec（CP>1 时自动开）")
+    ap.add_argument(
+        "--attn-backend",
+        type=str,
+        default="flash",
+        choices=["flash", "fused", "unfused", "local", "auto"],
+        help="≡ megatron --attention-backend。CP>1 必须 flash；"
+        "**fp32 只能走 unfused**（FA2 内核拒收 fp32）",
+    )
     ap.add_argument("--fp32", action="store_true", help="fp32 精确证明档")
     ap.add_argument("--dump", type=str, default=None)
     ap.add_argument("--compare", type=str, default=None)
@@ -230,6 +238,7 @@ def main() -> int:
         backend=args.backend,
         qkv_format=args.qkv_format,
         use_te_spec=True if args.te_spec else None,
+        attention_backend=args.attn_backend,
         params_dtype=torch.float32 if args.fp32 else torch.bfloat16,
     )
     rank = trainer.rank
@@ -282,13 +291,15 @@ def main() -> int:
     if trainer.use_te_spec:
         # **后端要断言不要假设**：NVTE_* 是请求，TE 可能否掉它；实选后端只有跑过真前向才有值。
         # CP>1 时落到 fused(cuDNN) 会**静默算错**（sm_120 上 dq cosine 0.356，TE#3333）。
+        want = {"flash": "FlashAttention", "fused": "FusedAttention",
+                "unfused": "UnfusedDotProductAttention"}.get(args.attn_backend)
         backend = observed_attention_backend()
         if rank == 0:
             print(f"  [info] TE 实选 attention 后端 = {backend}")
-        check(
-            backend.startswith("FlashAttention"),
-            f"attention 后端是 flash（实选 {backend}）—— CP 的正确性前提",
-        )
+        if want is not None:
+            check(backend.startswith(want), f"attention 后端 == 请求的 {args.attn_backend}（实选 {backend}）")
+        if trainer.cp_size > 1:
+            check(backend.startswith("FlashAttention"), "CP>1 时后端是 flash —— CP 的正确性前提")
 
     check(metrics["trained_samples"] == gbs,
           f"全部 {gbs} 条样本参与训练（trained={metrics['trained_samples']}）")
@@ -325,16 +336,16 @@ def main() -> int:
         check(worst == 0.0, f"往返逐值精确：max_abs_diff={worst:.3e} == 0（最差 {worst_name}）")
 
     # --- dump / compare ---
+    cfg = {
+        "tp": trainer.tp_size, "pp": trainer.pp_size, "cp": trainer.cp_size,
+        "backend": args.backend, "qkv_format": args.qkv_format,
+        "spec": "te" if trainer.use_te_spec else "local",
+        "attn": args.attn_backend if trainer.use_te_spec else "-",
+    }
     if args.dump and rank == 0:
         torch.save(
-            {
-                "config": {"tp": trainer.tp_size, "pp": trainer.pp_size, "cp": trainer.cp_size,
-                           "backend": args.backend, "qkv_format": args.qkv_format},
-                "loss": loss,
-                "grad_norm": gnorm,
-                "grads": grads,
-                "fp32": bool(args.fp32),
-            },
+            {"config": cfg, "loss": loss, "grad_norm": gnorm, "grads": grads,
+             "fp32": bool(args.fp32)},
             args.dump,
         )
         print(f"  [info] dumped → {args.dump}")
@@ -342,13 +353,10 @@ def main() -> int:
     if args.compare and rank == 0:
         print("[b] 与参照配置的等价（本版硬门）")
         ref = torch.load(args.compare, weights_only=False)
-        print(f"  [info] 参照 {ref['config']} vs 本次 "
-              f"{{'tp': {trainer.tp_size}, 'pp': {trainer.pp_size}, 'cp': {trainer.cp_size}}}")
-        check(
-            (ref["config"]["tp"], ref["config"]["pp"], ref["config"]["cp"])
-            != (trainer.tp_size, trainer.pp_size, trainer.cp_size),
-            "两次并行配置不同才有意义",
-        )
+        print(f"  [info] 参照 {ref['config']}\n         vs 本次 {cfg}")
+        # 「两次配置必须不同」——否则就是在跟自己比，门恒绿而毫无信息。
+        # 比的是**整份配置**而不只是 tp/pp/cp：G3a 那种「同并行度、换布局/后端」也算不同。
+        check(ref["config"] != cfg, "两次配置不同才有意义")
         check(
             bool(ref.get("fp32", False)) == bool(args.fp32),
             f"两次 dtype 一致（参照 fp32={bool(ref.get('fp32', False))} vs 本次 fp32={bool(args.fp32)}）",
