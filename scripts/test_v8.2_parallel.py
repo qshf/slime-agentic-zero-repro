@@ -277,6 +277,33 @@ def main() -> int:
             f"TP 组 {tp_ranks} 落在同一 NUMA node 内（避开 SYS 跨 root complex）",
         )
 
+    # --- G6 转换：PP>1 时 Megatron→HF 必须先跨 stage broadcast ---
+    # **必须在训练一步之前做**：`train_batch` 末尾有 `optimizer.step()`，跑完权重就被
+    # AdamW 改动了 ~lr 的量级 —— 那时再跟原始 HF ckpt 比，max_abs_diff 恰好 ≈ 1e-6(=lr)，
+    # 看起来像"转换有微小误差"，实际是"比错了对象"。（这条是踩出来的：初版把 G6 放在
+    # 训练之后，报 1.013e-06 于 `input_layernorm.weight`。）
+    if args.convert:
+        if rank == 0:
+            print("[G6] Megatron→HF 往返（PP>1 时任何单 rank 都拿不到完整模型）")
+        converted = trainer.to_hf_state_dict()
+        original = load_hf_weights(MODEL_PATH)
+        names = [n for n in converted if n in original]
+        check(
+            len(names) == len(converted),
+            f"转出的名字都在原始 HF ckpt 里（{len(names)}/{len(converted)}）",
+        )
+        # 期望每层 11 个 + embed + norm（tie 故无 lm_head）
+        expect = trainer.num_layers * 11 + 2
+        check(len(converted) == expect, f"参数个数 {len(converted)} == {expect}（含全部 stage 的层）")
+        worst_name, worst = None, 0.0
+        for n in names:
+            d = (converted[n].cpu().float() - original[n].cpu().float()).abs().max().item()
+            if d > worst:
+                worst, worst_name = d, n
+        # **无容差硬门**：转换全程只有 reshape/split/cat/rename，无浮点运算。
+        check(worst == 0.0, f"往返逐值精确：max_abs_diff={worst:.3e} == 0（最差 {worst_name}）")
+        del converted, original
+
     # --- 前向 + 反向（走 train_batch，即 mcore 的 forward_backward_func 调度）---
     if rank == 0:
         print("[a] forward + GRPO loss + backward（1F1B 调度）")
@@ -312,28 +339,6 @@ def main() -> int:
     check(gnorm > 0, f"梯度非零：global grad norm={gnorm:.4f}")
     if rank == 0:
         print(f"  [info] loss={loss:.8f}  grad_norm={gnorm:.6f}  tensors={len(grads)}")
-
-    # --- G6 转换：PP>1 时 Megatron→HF 必须先跨 stage broadcast ---
-    if args.convert:
-        if rank == 0:
-            print("[G6] Megatron→HF 往返（PP>1 时任何单 rank 都拿不到完整模型）")
-        converted = trainer.to_hf_state_dict()
-        original = load_hf_weights(MODEL_PATH)
-        names = [n for n in converted if n in original]
-        check(
-            len(names) == len(converted),
-            f"转出的名字都在原始 HF ckpt 里（{len(names)}/{len(converted)}）",
-        )
-        # 期望每层 11 个 + embed + norm（tie 故无 lm_head）
-        expect = trainer.num_layers * 11 + 2
-        check(len(converted) == expect, f"参数个数 {len(converted)} == {expect}（含全部 stage 的层）")
-        worst_name, worst = None, 0.0
-        for n in names:
-            d = (converted[n].cpu().float() - original[n].cpu().float()).abs().max().item()
-            if d > worst:
-                worst, worst_name = d, n
-        # **无容差硬门**：转换全程只有 reshape/split/cat/rename，无浮点运算。
-        check(worst == 0.0, f"往返逐值精确：max_abs_diff={worst:.3e} == 0（最差 {worst_name}）")
 
     # --- dump / compare ---
     cfg = {
