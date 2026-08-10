@@ -50,6 +50,29 @@
 - **完整调查 + 最小复现 + 上游 issue**：infra `docs/investigations/te-sm120-cudnn-bwd/README.md`、[NVIDIA/TransformerEngine#3333](https://github.com/NVIDIA/TransformerEngine/issues/3333)。
 - **为何 infra `04_megatron_te_thd_spike.py` 曾 PASSED（假阴性）**：用 `square().mean()` loss（梯度压到 ~1e-3）+ 绝对 `max_abs_error<0.08` 判据，错误梯度是"量级偏大 ~3.8×"而非 NaN，绝对值仍落阈值内蒙混。cosine/量级比才抓得到——repo 侧 V7.5 的度量教训（全局 rel_L2 + cosine）与此同源。
 
+### 3.1 补充实测（2026-08-10，V8.2 计划期）：**这条 bug 直接决定 CP 能不能用**
+
+本轮为 V8.2 验 CP 时独立复现了本条 bug，并测清了它与 CP 的相互作用（本节补的是原文没覆盖的 **CP 维度**）。
+复现脚本 [`scripts/probe_v8.2_cp_packing.py`](../../scripts/probe_v8.2_cp_packing.py)（C1–C4 四个检查，跑法见其 docstring）：
+
+| 实测 | 结果 |
+|---|---|
+| 单段 THD vs BSHD **forward**（C1） | `max_abs_diff=0.000e+00`（同一算法，逐值相等） |
+| 单段 THD vs BSHD **backward**（C2，fused） | **差 24.7×**：`dq` THD `5.325e+01` vs BSHD `2.156e+00`，cosine 仅 `0.356` ← 本条 bug 的独立复现 |
+| 同上（C2，Unfused） | `dq/dk/dv` cosine ≥ `0.99999994`、ratio `1.00×` ← **反证锅在 fused 内核** |
+| **fused 的 BSHD backward**（C3，原文未覆盖） | ✅ **正确**：fused vs unfused cosine `dq` 0.99996924 / `dk` 0.99999744 / `dv` 1.00003910，差异均 bf16 舍入量级 |
+| **Unfused + CP=2**（`NVTE_FUSED_ATTN=0 PROBE_CP=2`） | ❌ `ValueError: No dot product attention backend is available` ← **Unfused workaround 救不了 CP** |
+| **fused + CP=2 + BSHD**（C4） | ✅ 通（`|dq|=106.6`、S_local=128=256/2，日志见 `unbatched P2P op` = ring KV 交换真通信） |
+| **fused + CP=2 + THD**（C4） | ❌ `thd_second_half_lse_correction` assert ← 上游对 sm_120 的 carve-out |
+
+**新增的关键事实**：坏的只是 **THD 路径**，**BSHD 路径的 fused backward 是好的**。
+加上「CP 只有 TE 后端支持」（`dot_product_attention.py:57-59` assert）与「上游对 sm_120 显式关掉 THD-CP」
+（`context_parallel.py:1670-1674` 的 `get_device_compute_capability() != (12, 0)`），
+推出 V8.2 的设计约束：**CP 只能走 TE fused + padding(BSHD)，与 packing 互斥**。详见 [v8.2-plan.md](v8.2-plan.md) §1.1。
+
+> **不要去 patch 那个 sm_120 carve-out**：实测 patch 掉后 CP=2 THD 会"跑通"，但梯度是错的——
+> 那是把上游有意设的护栏拆掉换来一个静默错误。
+
 ---
 
 ## 4. 镜像区分（5090 后端隔离）
