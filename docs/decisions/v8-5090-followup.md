@@ -47,7 +47,14 @@
 
 - **对训练的影响**：凡在 5090 上用 TE cuDNN THD FusedAttention 训练者，backward 梯度错误 → 训练发散。**主线选 FA2 varlen 天然避开此坑**；本条是"若有人想用 TE 当训练后端"的明确禁令。
 - **Workaround（仅当非用 TE 不可）**：`NVTE_FUSED_ATTN=0 NVTE_FLASH_ATTN=0` 强制 Unfused，梯度正确但 O(N²) HBM、长序列慢，只作数值对照回退。
-- **完整调查 + 最小复现 + 上游 issue**：infra `docs/investigations/te-sm120-cudnn-bwd/README.md`、[NVIDIA/TransformerEngine#3333](https://github.com/NVIDIA/TransformerEngine/issues/3333)。
+- **完整调查 + 最小复现 + 上游 issue**：infra `docs/investigations/te-sm120-cudnn-bwd/README.md`、[NVIDIA/TransformerEngine#3333](https://github.com/NVIDIA/TransformerEngine/issues/3333)（**本项目自己报的**，2026-08-09 提交，截至 2026-08-10 仍 **open、无 maintainer 回复**）。
+- **与 [TE#2186](https://github.com/NVIDIA/TransformerEngine/issues/2186) 不是同一条 bug**（#3333 正文已作此区分，本轮复核确认）：#2186 是 **THD + CP 的 tail-padding** corner case（Hopper sm90，短序列导致某 CP rank 的后半块全是 padding → `dk/dv` 爆成 NaN，已 closed/assigned），**依赖 CP**；本条 **单卡、无 CP、单条序列即复现**，不依赖 packing 也不依赖 padding。两者只是都落在 THD 上。
+- **上游的版本门在我们这版本已"放行"，但实际仍坏（本轮新查，是 #3333 的有力补强）**：
+  `utils.py:992-999` 对 sm_120 的 THD 有一条 gate —— `cudnn_version < (9,18,1)` 时禁用 FusedAttention。
+  容器实测 `cudnn_version=(9,25,0)`，**高于该门槛故不触发**；TE 自报
+  `Available backends = {... FusedAttention=True (sub-backend 1) ...}` → `Selected backend = FusedAttention (sub-backend 1)`，
+  **即上游认为这条路在本版本已修好**，而实测 backward 仍错。
+  换言之这不是"用了上游明令不支持的组合"，而是**上游放行的配置本身是坏的**。
 - **为何 infra `04_megatron_te_thd_spike.py` 曾 PASSED（假阴性）**：用 `square().mean()` loss（梯度压到 ~1e-3）+ 绝对 `max_abs_error<0.08` 判据，错误梯度是"量级偏大 ~3.8×"而非 NaN，绝对值仍落阈值内蒙混。cosine/量级比才抓得到——repo 侧 V7.5 的度量教训（全局 rel_L2 + cosine）与此同源。
 
 ### 3.1 补充实测（2026-08-10，V8.2 计划期）：**这条 bug 直接决定 CP 能不能用**

@@ -24,6 +24,13 @@
       CP 只有 TE 后端支持（mcore dot_product_attention.py:57-59 assert cp==1）；
       而 Unfused（TE#3333 的 workaround）不支持 CP，故 CP 只能走 fused。
 
+**注意「上游放行 ≠ 算得对」**：TE `utils.py:992-999` 对 sm_120 的 THD 有一条
+`cudnn_version < (9,18,1)` 的 gate，本容器 cuDNN 9.25.0 **高于门槛故不触发**——
+TE 自报 `FusedAttention=True (sub-backend 1)` 并选中它，即上游认为这条路已修好，
+而 C2 实测 backward 仍错。想看后端选择过程加 `NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2`。
+（另：本 bug 与 TE#2186「THD+CP tail-padding NaN」不是同一条——那条依赖 CP，
+本条单卡无 CP、单段即复现。）
+
 **怎么跑**（容器 nano-mcore，镜像 agentic-rl-infra-lab:te-cudnn-system-spike）：
 
     # C1-C3：单卡，跑两遍（fused / unfused）后比对
