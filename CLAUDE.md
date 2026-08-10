@@ -6,7 +6,7 @@
 
 - **项目**：从 0 复现一个最小 Agentic RL 训练系统，**在复现中学习** slime-agentic 的系统设计。
 - **源项目**：slime-agentic —— 基于 Ray + SGLang + Megatron/FSDP 的 Agentic RL 训练框架（58K LOC）。
-- **当前阶段**：主线一（V0-V5）✅、主线二（A1/A2/A3）✅ 收官。**主线三启动**：V6 真训练闭环（GSM8K）✅ 全链路跑通——真 log_probs + 真 GRPO 组归一 + 真 torch 训练一步 + 真权重同步，5090 端到端验证机制全真实发生（acc 0.4→0.2 变化证明权重真被改，稳定提升属训练规模/超参问题留后续）。
+- **当前阶段**：主线一（V0-V5）✅、主线二（A1/A2/A3）✅ 收官。**主线三推进中**：V6 真训练闭环 ✅ → V7 FSDP ✅ → V7.4/7.5/7.6 ✅ → V8 Megatron TP ✅ → **V8.2 多卡 Megatron（TP×PP×CP）✅ 收官**（4 卡 5090：三根轴各自 + 组合的 fp32 逐值等价门全绿；CP 门因 FA2 拒 fp32 改走 bf16 + negative control）。下一版 **V9 吞吐实验**——前八版全在问「对不对」，V9 第一次问「多快」。
 
 > **铁律（每版必须遵守）**：**代码范式遵从原项目**。nano 的代码结构 / 接口签名 / 命名 / 数据流必须对齐 slime-agentic 源项目在对应位置的写法。**只允许在其基础上做得更清晰（更好），不允许比源项目更乱、更 hack、更偏离（更差）**。判断法：写任一段前先问"源项目对应位置怎么做的"，对齐它；要偏离只能朝"更清晰且语义等价"的方向，并在注释里写明为何偏离。反例（已修）：把 agent loop 抄成两份塞进 generate() 里——源项目 rollout.py 是薄适配器，loop 在 solver.py。
 >
@@ -57,8 +57,8 @@
 | V7.5 | sequence packing（退休偏离 #1）| flat + 块对角 mask 隔离 / loss-grad 等价 | ✅ 5090 world=1 PASSED（fp32 数学精确：loss 2.4e-7 / grad rel_L2 1.7e-4 / cosine 0.99999999 → 隔离无泄漏；bf16 loss 1.7e-4 + cosine 0.9946）；opt-in `train_packing` 默认 off 零回归；显式块对角 4D mask 替 flash-attn varlen |
 | V7.6 | FA2 varlen packing（退休偏离 #7）| varlen 隔离 / negative control 验收范式 | ✅ 5090 world=1 PASSED（varlen 真 dispatch 28 次、cu_seqlens 与手工值一致；fa2 vs padding loss Δ=0 / cosine 0.99999999；**negative control 判别力 8721×**）；回到源 `attention_mask=None` 写法 |
 | V8 | Megatron 并行（TP）| 层内切分 / vocab-parallel / Megatron→HF 权重转换 | ✅ V8.0+V8.1 收官（5090 单卡 torchrun：**fp32 精确门** TP=2 vs TP=1 loss Δ=0、grad rel_L2 1.9e-5、cosine 1.00000000；bf16 门 loss Δ=5.1e-6、cosine 0.99909；转换往返 max_abs_diff=**0**；全 28 层复跑同样过。PP/CP/EP 单卡实测硬阻断，记录设计）|
-| V8.2 | 多卡 Megatron（TP×PP×CP）| PP 1F1B / tie 跨 stage 梯度规约 / CP 2-chunk 对称切分 | 📋 **计划已出**（[v8.2-plan.md](docs/decisions/v8.2-plan.md)）：4 卡实测已推翻 V8 的 gloo/PP/CP 三条偏离 |
-| V9 | 吞吐实验 | Timer/FLOPs/MFU 口径 + 扫参数定位瓶颈 | 📋 **计划已出**（[v9-plan.md](docs/decisions/v9-plan.md)）：依赖 V8.2 |
+| V8.2 | 多卡 Megatron（TP×PP×CP）| PP 1F1B / tie 跨 stage 梯度规约 / CP 2-chunk 对称切分 | ✅ **收官**（5090 4 卡：G1 NCCL/G2 PP/G4 TP×PP 全部 **fp32 loss Δ=0.000e+00 + cosine=1.00000000**；G3a THD packing **fp32 Δ=0**；G3b CP=2 bf16 cosine=0.99921 + G3c 反例判红 cosine=0.588；G5 拓扑 TP 组同 NUMA；G6 PP broadcast 往返 **max_abs_diff=0**）|
+| V9 | 吞吐实验 | Timer/FLOPs/MFU 口径 + 扫参数定位瓶颈 | 📋 **计划已出**（[v9-plan.md](docs/decisions/v9-plan.md)）：V8.2 已就绪 |
 
 ## 4. 环境前置
 
@@ -213,14 +213,20 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **PP/CP/EP 记录设计不实现（单卡实测硬阻断，非偷懒）**：PP 需 CUDA p2p 而 **gloo 不支持**（`gloo::IoException`）、EP 需 all_to_all 而 **gloo 无**（且 0.6B 是 dense）、CP 单卡=1 无可验内容。接缝按源留好（显式 `pipeline_model_parallel_size=1`），≥2 卡 + NCCL 可直接补。
 - **偏离**（v8.md 11 条三要素表）：gloo 而非 NCCL（单卡多 rank 被 NCCL 硬拒，语义等价性能不等价）、只用 `megatron.core` 不走 `megatron.training.init`、只做 TP、local spec 的 layernorm 命名（TE 装不了，两种名字都认+自动判定）、**`partition_stride=2` 对 GLU fc1 放行**（源无条件 assert==1 与它自己的重排分支语义冲突）、`_finalize_model_grads` 只做 qk-layernorm 一条分支、torch AdamW 而非 `DistributedOptimizer`、反向映射 nano 自有、只做 Qwen3 dense、无 packing/KL/entropy、权重同步止于转出 HF state_dict 未接 SGLang。
 
-### V8.2 + V9 计划（2026-08-10）详见 [v8.2-plan.md](docs/decisions/v8.2-plan.md) / [v9-plan.md](docs/decisions/v9-plan.md)
+### V8.2 多卡 Megatron（TP × PP × CP，2026-08-11）详见 [v8.2.md](docs/decisions/v8.2.md)
 
-- **分支 `v9`**（从 `v8` 末端切出，按分支准则；V8.2 与 V9 同属该分支的两版）。本次只出**计划**，未写实现代码。
-- **触发点 = 硬件前提变了**：本轮在 `ssh 5090` 上跑 V7.5/V7.6/V8 全套复验（数字与文档记录一致，跨机干净复现）时发现**该机是 4 卡**——V8 那三条偏离（#1 gloo / #3a PP / #3b CP）的理由**都是「单卡物理阻断」而非「不重要」**，故全部不再成立。**4 卡 NCCL 冒烟已实测**：双卡 all_reduce ✅、**CUDA p2p send/recv ✅**（gloo 在这里直接 abort，故这条就是 PP 的物理前提）、`initialize_model_parallel(TP=1,PP=2)` ✅、`get_embedding_group()=[0,1]` ✅（tie 跨 stage 规约通路已就位）。拓扑 `nvidia-smi topo -m`：0-1 同 NUMA、2-3 同 NUMA、跨组 SYS、**无 NVLink** → 决定 rank 映射（TP 放 NODE 内、PP 跨 NODE）。
-- **V8.2 最硬的正确性点 = PP + tie 的 embedding 梯度跨 first/last stage all-reduce**（源 `finalize_model_grads.py:164 _allreduce_word_embedding_grads`）。tie 让输入嵌入与输出投影是同一份权重，PP>1 时它们在**不同进程**里，各自梯度只是部分和。**它与 V8 坑③（漏 qk-layernorm 规约）是同一类错误、同一个指纹**——loss Δ 恰为 0 而梯度系统性偏，只是最差参数从 `q_norm.weight` 变成 `embed_tokens.weight`，且**只有 fp32 档抓得到**（bf16 会当舍入放过）。故 V8.2 必跑 fp32。
-- **V8.2 的结构债**：`_microbatch_backward` 要拆成源的 `forward_step` + `loss_func` 两件（`model.py:380-429`），因为 PP 必须走 `get_forward_backward_func()` 的 1F1B 调度，**手写 send/recv 必错**。这不是为 PP 特设的改造——**源本来就是这个形状**，V8 因 PP=1 才能合成一个函数。
-- **V8.2 的 G6**：V8.1 的 Megatron→HF 转换只处理了 TP-gather，因为 PP=1 时**单 rank 持全部层**；PP>1 时任何单 rank 都拿不到完整模型，须先跨 PP broadcast（源 `hf_weight_iterator_direct.py:66-77`）。**V8.1 只见到了这条 RL 接缝的一半。**
-- **EP 维持不做，但理由更新**：从「gloo 无 all_to_all」改为「**Qwen3-0.6B 是 dense，没有 expert**」——不是做不到，是无对象。
+- **主线三第四版**：把 V8 那三条**理由都是「单卡物理阻断」**的偏离（#1 gloo / #3a PP / #3b CP）在 4 卡机上逐条退休，且**每条都用逐值证据退休**。建 `toy_rl/trainer/cp_utils.py`（2-chunk 对称切分），重构 `megatron_trainer.py`（`forward_step` + `loss_func` + `get_forward_backward_func()`），扩 `megatron_to_hf.py`（局部→全局层号 + PP broadcast）。新参数全 opt-in → V8 单卡路径**数值逐位不变**。
+- **教学核心 1 = 跨 rank 的梯度规约有三处，缺一处就「前向对、梯度错」**：①qk-layernorm 跨 TP（V8 已做）；②**tie 的 word embedding 跨 PP first/last stage**（源 `finalize_model_grads.py:164`，本版最硬的点）；③**全部梯度跨 DP×CP**（**计划里没有的新发现**——源靠 mcore DDP 自动做，nano 用 torch AdamW 无 wrapper 就没人做；CP=1 时是 no-op 故 V8 从没暴露）。三者**指纹完全一样**：loss Δ 恰为 0 而梯度系统性偏，最差参数分别指向 `q_norm.weight` / `embed_tokens.weight` / 全体。**只有 fp32 抓得到**。
+- **教学核心 2 = PP 必须用 `get_forward_backward_func()`，且这不是为 PP 特设的改造**——源 `model.py:380-429` 本来就是 `forward_step` + `loss_func` 两件，V8 因 PP=1 才能合成一个函数。重构后基线 `loss=0.19982551 / grad_norm=0.054077` 与 V8.0 的 `_microbatch_backward` **逐位相同**。
+- **验收（4 卡全空，`--layers 4`）**：G1 NCCL TP=2 / G2 PP=2 / G4 TP=2×PP=2 均 **fp32 loss Δ=0.000e+00、rel_L2 1.9e-05、cosine=1.00000000**；**G3a THD packing vs BSHD 走 fp32 精确证明**（Δ=0.000e+00、rel_L2=1.890e-07）；G3b CP=2 vs CP=1 bf16 cosine=0.99921316；**G3c negative control**（朴素连续切分替 2-chunk 对称）cosine 掉到 **0.588** → 度量有判别力；G5 拓扑 tp=[0,1]（同 NUMA）pp=[0,2]；G6 往返 **max_abs_diff=0.000e+00**（4 卡 TP×PP 与 2 卡 PP 各一遍）。V8 全门复跑与记录**逐位相同**；离线 V0–A3 + V7.4 全绿。
+- **G3 的证据边界（诚实）**：CP 只有 TE 后端支持 → CP>1 必须 flash → **FA2 内核拒收 fp32**（实测 `No dot product attention backend is available`，与 V7.6 偏离 #8 同一条物理限制）→ **CP 门不可能有 fp32 档**。故 packing 部分单独用 unfused 后端拿 fp32 精确证明，CP 部分用 bf16 + 反例。**不宣称 CP 有 fp32 精确性。**
+- **七个坑**：①镜像烤入 `NVTE_*` 与 mcore 的一致性校验冲突 → **不能自己设 env，要设 `config.attention_backend` 并清掉继承来的 env**（源就是传 arg 不碰 env）；②PP 下 `losses_reduced` 只在 last stage 有值，rank0 读到 loss=0 —— **长得像正确性 bug 但指纹相反**（真漏规约是「loss 对而梯度偏」，这里是「梯度对而 loss 缺」）；③G6 往返必须在 `optimizer.step()` **之前**比，否则 max_abs_diff 恰好 ≈ lr=1e-6 看着像转换误差；④FA2 拒 fp32；⑤mcore 原版 `finalize_model_grads` 读 `param.main_grad` + 要 `ddp_config`，无 DDP 用不了（计划 §1.5 预留的 fallback 真用上了）；⑥`own.get(a) or own.get(b)` 对张量取布尔值报歧义；⑦**tie + PP>1 时 last stage 真的分配一份 `output_layer.weight` 且被填 0**，nano 建完模型才载权重故必须自己填，否则输出投影全零且**不报错**。
+- **白捡的一条：V8 的推测被证伪**。V8 猜「源用 TE spec 时 fc1 可能不带 `partition_stride=2`」；本版两套 spec 各测（mcore 0.18.2，TP=2）——`linear_fc1.weight` 在 **local 与 TE spec 下 stride 都是 2**（`linear_qkv` 都是 1）。故源那条无条件 `assert stride==1` **在它自己的 spec 下也会炸**，nano 的放行是必需修正而非权宜。
+- **偏离**（v8.2.md：#1 退休、#3/#4/#6 部分退休、#7/#11 维持；新增 12 条 N1–N12，最实质的是 N4「CP 门只到 bf16+反例」、N5/N6「手写 finalize 与 DP×CP 规约（偏离 #7 的连带成本）」、N7「用等长 full 坐标系替代源的 CP 偏移量算术」）。
+
+### V9 计划（2026-08-10）详见 [v9-plan.md](docs/decisions/v9-plan.md)
+
+- **分支 `v9`**（从 `v8` 末端切出；V8.2 与 V9 同属该分支的两版）。V8.2 已收官，V9 尚未开工。
 - **V9 = 前八版全在问「对不对」，第一次问「多快」**。忠实复写源三件套：`timer.py:15 Timer`（单例+装饰器）、`flops_utils.py:66 calculate_fwd_flops`（逐条 seqlen，含 GQA/vocab 项）、`train_metric_utils.py:13 log_perf_data_raw`（`tflops = 3×fwd_flops/train_time`、`tok_per_s`、`wait_time_ratio`）。**FLOPs 必须按真实逐条长度算**（源 `data.py:292` 把 `total_lengths` 挂到 `Timer().seq_lens`）——用 `max_len×B` 会把 padding 浪费算成有效算力，Q3 就白测了。
 - **V9 依赖 V8.2**：gloo 走 TCP 经 CPU 中转，**现在测吞吐等于在测 TCP 栈**。V9 的五个问题各自预先写下可证伪的预期（TP 扩展效率 / PP bubble 是否符合 `(pp-1)/(m+pp-1)` / packing 到底省多少（**兑现 V7.6 偏离 #7 那句「装 flash-attn 后换 varlen 得全部吞吐」**）/ 真 trainer 上重测 V5 的 sync-vs-async（V5 那次是 `fake_train_seconds` 模拟的）/ 权重同步 disk reload 占比是否高到该换 broadcast）。
 - **V9 的方法学纪律**（性能实验的失效模式与正确性实验不同）：必 `cuda.synchronize()` 再停表（不同步测的是 launch 时间，会得出「TP=4 比 TP=1 快」）；必丢 warmup；必记 `nvidia-smi` 快照（**共享 GPU 上的吞吐数字不可比**——4 卡实测常被 `vllm-qwen36-27b` 各占 28.5G，V8 就因此 OOM）；**先写预期再测**（先测后编解释是性能工程最常见的自欺）；**V9 只测量不优化**（发现瓶颈记待办，不当场改，否则两者互相污染）。

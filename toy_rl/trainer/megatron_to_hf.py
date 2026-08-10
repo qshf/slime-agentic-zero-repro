@@ -94,11 +94,16 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
 
     # **partition_stride 的处理是 nano 相对源的一处实质修正（登记偏离）**：
     #   源 `all_gather_param` 无条件 `assert param.partition_stride == 1`，然后**再**按名字
-    #   给 linear_fc1 做 GLU 重排。但实测（megatron-core 0.18.2 + local spec）`linear_fc1.weight`
+    #   给 linear_fc1 做 GLU 重排。但实测（megatron-core 0.18.2）`linear_fc1.weight`
     #   的 `partition_stride` **就是 2** —— 照搬源的断言会在 TP>1 时直接炸。
     #   原因：stride=2 正是 Megatron 用来表达「[gate; up] 交错切分」的元数据，而源那段
     #   `chunk(2) → [gates..., ups...]` 重排**恰恰就是 stride=2 的解包逻辑**。也就是说源的
-    #   断言与它自己的重排分支语义冲突（源用 TE spec 时 fc1 可能不带该 stride，故未暴露）。
+    #   断言与它自己的重排分支语义冲突。
+    #   **V8.2 实测把这条从推测变成了结论**：V8 曾猜"源用 TE spec 时 fc1 可能不带该 stride，
+    #   故未暴露"——现在两套 spec 都测了（scripts 里的一次性探针），`local` 与
+    #   `transformer_engine` spec 下 `linear_fc1.weight` 的 `partition_stride` **都是 2**
+    #   （`linear_qkv.weight` 都是 1）。所以那个猜测**不成立**：源那条断言在它自己的
+    #   spec 下同样会炸（至少在 mcore 0.18.2 上），不是 nano 用了 local spec 才碰到的。
     #   nano 的处理：**只对已被重排逻辑覆盖的 GLU fc1 放行 stride=2，其余仍严格要求 stride=1**
     #   —— 语义等价于源的意图（重排后就是全量 [gate; up]），且不放过真正没处理的 stride 情形。
     if is_glu_fc1:
