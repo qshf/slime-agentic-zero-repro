@@ -28,8 +28,22 @@ ring attention 内部都假定了同一套切法**，token 切错就会与位置
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
+
+# **仅供验收的 negative control 开关**（`NANO_CP_NAIVE_SPLIT=1`）：把 2-chunk 对称切分
+# 换成朴素连续切分（形状完全相同、只是取的 token 不同）。
+#
+# 为什么需要它：CP 的正确性只能在 **bf16** 下验（FA2 内核拒收 fp32，实测
+# `No dot product attention backend is available`），而 bf16 的舍入噪声让"数值接近"
+# 这件事失去判别力 —— 与 V7.6 遇到的是同一个问题，解法也照搬 V7.6：
+# **先证明这套度量能把"故意写错"判红**，"写对时判绿"才有意义。
+# 朴素切分是最贴切的反例：mcore 的 RoPE（`get_pos_emb_on_this_cp_rank`）与 TE 的
+# ring attention **内部恒按 2-chunk 对称**取，token 换成朴素切分就与它们对不上，
+# 而形状、dtype、cu_seqlens 全都合法 —— 正是那种"跑得通但算错"的静默错误。
+_NAIVE_SPLIT = os.environ.get("NANO_CP_NAIVE_SPLIT", "0") == "1"
 
 
 def slice_with_cp(
@@ -72,6 +86,9 @@ def slice_with_cp(
         chunk_size = (max_seq_len + 2 * cp_size - 1) // (2 * cp_size)
 
     tokens = pad_tokens(tokens, 2 * cp_size * chunk_size - token_len)
+
+    if _NAIVE_SPLIT:  # negative control，见模块顶部说明；正常路径永远走不到这里
+        return tokens[2 * chunk_size * cp_rank : 2 * chunk_size * (cp_rank + 1)]
 
     start_1, end_1 = chunk_size * cp_rank, chunk_size * (cp_rank + 1)
     start_2, end_2 = chunk_size * (2 * cp_size - cp_rank - 1), chunk_size * (2 * cp_size - cp_rank)

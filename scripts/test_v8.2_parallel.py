@@ -16,9 +16,16 @@
     torchrun --nproc_per_node=2 scripts/test_v8.2_parallel.py --fp32 --pp 2 --backend nccl \
         --dump /tmp/v82_pp2.pt --compare /tmp/v82_base.pt
 
-    # G3 CP：TE spec + flash 后端 + THD(packing)（2 卡，CP=2）
-    torchrun --nproc_per_node=2 scripts/test_v8.2_parallel.py --fp32 --cp 2 --backend nccl \
-        --qkv-format thd --dump /tmp/v82_cp2.pt --compare /tmp/v82_base.pt
+    # G3 CP：**只能 bf16**（见下方"G3 为什么没有 fp32 档"），故拆成三步：
+    #   G3a 先证 THD(packing) + TE spec 这条前向路径本身与 bshd 等价（CP=1，隔离变量）
+    torchrun --nproc_per_node=1 scripts/test_v8.2_parallel.py --backend nccl \
+        --qkv-format thd --te-spec --dump /tmp/v82_thd1.pt --compare /tmp/v82_base_bf16.pt
+    #   G3b 再证 CP=2 与 CP=1 等价（唯一变量就是 CP）
+    torchrun --nproc_per_node=2 scripts/test_v8.2_parallel.py --cp 2 --backend nccl \
+        --qkv-format thd --dump /tmp/v82_cp2.pt --compare /tmp/v82_thd1.pt
+    #   G3c negative control：把 2-chunk 对称切分换成朴素连续切分，**必须判红**
+    torchrun --nproc_per_node=2 scripts/test_v8.2_parallel.py --cp 2 --backend nccl \
+        --qkv-format thd --negative-control --compare /tmp/v82_thd1.pt
 
     # G4/G5/G6 组合（4 卡，TP=2 × PP=2）+ 拓扑断言 + PP 下的 HF 往返
     torchrun --nproc_per_node=4 scripts/test_v8.2_parallel.py --fp32 --tp 2 --pp 2 \
@@ -36,6 +43,13 @@
 tie 的 embedding 跨 PP / 全部梯度跨 DP·CP）漏掉任何一处，指纹都是
 **「loss Δ 恰为 0，而梯度系统性偏、最差参数指向漏掉的那类」**。V8 实测：漏 qk-layernorm 时
 bf16 的 5e-2 会被当舍入放过，fp32 才把它从 1.8e-2 打到 1.9e-5（930×）。
+
+**G3 为什么没有 fp32 档（本版实测出来的证据边界）**：CP 只有 TE 后端支持，而 CP>1 必须走
+flash(FA2) 后端（fused 在 sm_120 上静默算错）—— **FA2 内核只收 fp16/bf16**，
+fp32 下 TE 直接报 `No dot product attention backend is available`（实测）。
+这与 V7.6 偏离 #8 是同一条物理限制。故 G3 改用 **bf16 + negative control** 的验收范式：
+先证明这套度量能把"故意写错的切分"判红，"写对时判绿"才有意义。
+**证据边界要诚实**：G1/G2/G4 有 fp32 逐值精确证明，G3 只到 bf16 + 反例判别力。
 """
 
 from __future__ import annotations
@@ -126,16 +140,20 @@ def _grads_in_hf_layout(trainer: MegatronTrainer) -> dict[str, torch.Tensor]:
     return out
 
 
-def _compare(ref: dict, loss: float, grads: dict, fp32: bool, check) -> None:
-    """与参照 dump 逐值比对（分层 gate）。"""
+def _compare(ref: dict, loss: float, grads: dict, fp32: bool, check, negative: bool = False) -> None:
+    """与参照 dump 逐值比对（分层 gate）。
+
+    `negative=True` 时判据**反转**：这是 negative control，正确的度量必须把
+    "故意写错的切分"判红。反例若"通过"，说明这套度量没有判别力、整轮验收作废
+    （V7.6 踩出来的教训：bf16 档的绝对阈值很容易变成一条谁都能过的线）。
+    """
     if fp32:
         rel_l2_bar, cos_bar, tier = 5e-3, 0.9999, "fp32 精确证明"
     else:
         rel_l2_bar, cos_bar, tier = None, 0.999, "bf16 舍入级"
-    print(f"  [info] gate 分层：{tier}")
+    print(f"  [info] gate 分层：{tier}{'（negative control：期望判红）' if negative else ''}")
 
     dloss = abs(ref["loss"] - loss)
-    check(dloss < 1e-4, f"loss 等价：|{ref['loss']:.8f} - {loss:.8f}| = {dloss:.3e} < 1e-4")
     check(set(ref["grads"]) == set(grads), f"梯度名字集合一致（{len(ref['grads'])} vs {len(grads)}）")
 
     common = sorted(set(ref["grads"]) & set(grads))
@@ -157,7 +175,13 @@ def _compare(ref: dict, loss: float, grads: dict, fp32: bool, check) -> None:
         norm_b += (y * y).sum().item()
     rel_l2 = (sq_diff**0.5) / max(norm_a**0.5, 1e-12)
     cos = dot / max((norm_a**0.5) * (norm_b**0.5), 1e-12)
-    print(f"  [info] grad rel_L2={rel_l2:.3e}  cosine={cos:.8f}")
+    print(f"  [info] loss |Δ|={dloss:.3e}  grad rel_L2={rel_l2:.3e}  cosine={cos:.8f}")
+
+    if negative:
+        check(cos < 0.99, f"negative control 被判红：cosine={cos:.8f} < 0.99（度量有判别力）")
+        return
+
+    check(dloss < 1e-4, f"loss 等价：|{ref['loss']:.8f} - {loss:.8f}| = {dloss:.3e} < 1e-4")
     if rel_l2_bar is not None:
         check(rel_l2 < rel_l2_bar, f"grad 全局 rel_L2={rel_l2:.3e} < {rel_l2_bar:g}")
     check(cos > cos_bar, f"grad cosine={cos:.8f} > {cos_bar:g}")
@@ -185,7 +209,16 @@ def main() -> int:
     ap.add_argument("--compare", type=str, default=None)
     ap.add_argument("--topology", action="store_true", help="G5：打印并断言各并行组 ranks")
     ap.add_argument("--convert", action="store_true", help="G6：PP 下的 Megatron→HF 往返")
+    ap.add_argument(
+        "--negative-control",
+        action="store_true",
+        help="把 CP 的 2-chunk 对称切分换成朴素连续切分，**期望等价门变红**（证明度量有判别力）",
+    )
     args = ap.parse_args()
+
+    if args.negative_control:
+        # 必须在建 trainer 之前设（cp_utils 在 import 时读它）。
+        os.environ["NANO_CP_NAIVE_SPLIT"] = "1"
 
     trainer = MegatronTrainer(
         MODEL_PATH,
@@ -320,7 +353,7 @@ def main() -> int:
             bool(ref.get("fp32", False)) == bool(args.fp32),
             f"两次 dtype 一致（参照 fp32={bool(ref.get('fp32', False))} vs 本次 fp32={bool(args.fp32)}）",
         )
-        _compare(ref, loss, grads, args.fp32, check)
+        _compare(ref, loss, grads, args.fp32, check, negative=args.negative_control)
 
     dist.barrier()
     if rank == 0:
