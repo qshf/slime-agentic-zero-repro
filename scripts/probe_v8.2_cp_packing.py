@@ -1,8 +1,21 @@
 """V8.2 前置实测：CP × packing 组合可行性（sm_120 / RTX 5090）。
 
 **为什么有这个脚本**：v8.2-plan.md 初稿把「CP=2 × FA2 varlen 是否可用」列为待实测风险 R1，
-并写了「若不通就降级 padding」。本脚本把它测清楚——结论是**降级预案成为唯一路径**，
-细节与证据见 docs/decisions/v8.2-plan.md §1.1。
+并写了「若不通就降级 padding」。本脚本把它测清楚——细节与证据见
+docs/decisions/v8.2-plan.md §1.1。
+
+**结论取决于 attention 后端**（2026-08-10 两轮实测）：
+
+  | 后端（TE 三选一）      | C1 fwd | C2 bwd            | C4 CP=2 BSHD | C4 CP=2 THD |
+  |------------------------|--------|-------------------|--------------|-------------|
+  | fused（cuDNN）         | 0.0 ✅ | **cosine 0.356 ❌**| PASS         | **assert ❌** |
+  | **flash（FA2 2.8.3）** | 0.0 ✅ | **cosine 1.000 ✅**| PASS         | **PASS ✅**   |
+  | unfused（O(N²) 参考）  | 0.0 ✅ | cosine 1.000 ✅   | **不支持 CP ❌** | 同左       |
+
+  → **CP × packing 在 flash 后端下可组合**。fused 路径那条 bug（TE#3333）是
+  cuDNN 内核专属的，换后端即绕开。这正是源项目所有 megatron 训练脚本
+  `MISC_ARGS` 里那行 `--attention-backend flash` 的作用（源 docs/zh/developer_guide/
+  debug.md:15 明写「避免 CP 下 fused attention 的数值不稳定」）。
 
 **四个检查**（每个都是独立判据，前一个失败不影响后一个的诊断价值）：
 
@@ -11,18 +24,18 @@
       这一步建立「同一算法」的基线——没有它，C2 的差异可以被辩解成「布局不同本就该不同」。
 
   C2  THD vs BSHD **backward** 逐值等价  ← 决定性判据
-      C1 既然证明了是同一算法，backward 也必须相等。实测 fused 后端差 40×
-      （上游 bug TE#3333，见 docs/decisions/v8-5090-followup.md §3）。
+      C1 既然证明了是同一算法，backward 也必须相等。fused 后端实测差 24.7×
+      （上游 bug TE#3333，见 docs/decisions/v8-5090-followup.md §3），flash 后端 cosine 1.000。
       **这是「forward 相等 ≠ backward 相等」的活教材**——与 V8 坑③（漏 qk-layernorm 规约：
       loss Δ 恰为 0 而梯度系统性偏）同源。
 
-  C3  fused 的 **BSHD** backward 是否可信（fused vs unfused 对照）
-      C2 若失败，需要知道「坏的是整个 fused 内核还是只有 THD 路径」——
-      这直接决定「CP + padding」这条退路是否成立。
+  C3  被测后端的 backward 是否可信（vs unfused 参考）
+      unfused 是 O(N²) 朴素实现，无 fused/varlen 内核，作可信参考。
+      C2 若失败，这一步区分「坏的是整个后端还是只有 THD 路径」。
 
   C4  CP=2 在 BSHD / THD 下各自能否跑
       CP 只有 TE 后端支持（mcore dot_product_attention.py:57-59 assert cp==1）；
-      而 Unfused（TE#3333 的 workaround）不支持 CP，故 CP 只能走 fused。
+      而 Unfused 不支持 CP，故 CP 只能走 fused 或 flash。
 
 **注意「上游放行 ≠ 算得对」**：TE `utils.py:992-999` 对 sm_120 的 THD 有一条
 `cudnn_version < (9,18,1)` 的 gate，本容器 cuDNN 9.25.0 **高于门槛故不触发**——
@@ -33,14 +46,21 @@ TE 自报 `FusedAttention=True (sub-backend 1)` 并选中它，即上游认为�
 
 **怎么跑**（容器 nano-mcore，镜像 agentic-rl-infra-lab:te-cudnn-system-spike）：
 
-    # C1-C3：单卡，跑两遍（fused / unfused）后比对
-    TAG=fused   torchrun --nproc_per_node=1 --master_port 29791 scripts/probe_v8.2_cp_packing.py
-    NVTE_FUSED_ATTN=0 NVTE_FLASH_ATTN=0 TAG=unfused \
-                torchrun --nproc_per_node=1 --master_port 29792 scripts/probe_v8.2_cp_packing.py
-    PROBE_MODE=compare python scripts/probe_v8.2_cp_packing.py
+    # 三个后端各跑一遍（TE 用这两个 env 选后端；megatron 的 --attention-backend
+    # 就是翻译成它们，见 mcore language_module.py:124-140）
+    NVTE_FUSED_ATTN=1 NVTE_FLASH_ATTN=0 TAG=fused   torchrun --nproc_per_node=1 ... $0
+    NVTE_FUSED_ATTN=0 NVTE_FLASH_ATTN=1 TAG=flash   torchrun --nproc_per_node=1 ... $0
+    NVTE_FUSED_ATTN=0 NVTE_FLASH_ATTN=0 TAG=unfused torchrun --nproc_per_node=1 ... $0
+    PROBE_MODE=compare python scripts/probe_v8.2_cp_packing.py    # = C3
 
     # C4：双卡
     PROBE_CP=2 torchrun --nproc_per_node=2 --master_port 29793 scripts/probe_v8.2_cp_packing.py
+
+**flash 后端要装 FA2**：容器默认带 FA4 4.0.0b15，它在 sm_120 上 `pack_gqa.py:139`
+报 `ValueError: Operation creation failed`（b21 才修，见 v8-5090-followup.md §2），
+故须换成 FA2 2.8.3。换的时候**必须连 `flash_attn_4-*.dist-info` 一起删** ——
+TE 是按包元数据判断 FA4 在不在（`get_pkg_version("flash-attn-4")`），
+留着它会让 TE 去 import 已被 FA2 覆盖掉的 `flash_attn.cute` → ModuleNotFoundError。
 
 **偏离登记**：本脚本用 TEDotProductAttention 直接测单层 attention，不搭完整 MegatronTrainer——
 源项目没有这类后端可行性探针（它假定 TE/FA 内核是对的）。nano 加这一层是因为
