@@ -182,8 +182,13 @@
 - 简化：**func_call 路径 + tau2 环境模拟器不实现**（记录设计）。
 - 对应源项目：`agentic/ToolOrchestra/{orchestra_solver.py,reward.py}`（QA 分支）。
 
-### 主线三（骨架，服务器就绪后展开）
-- V6 SGLang 真引擎 + update_weights 权重同步；V7 FSDP 真训一步(offload/packing)；V8 Megatron TP/PP/CP/EP 概念；V9 扫参数吞吐实验。
+### 主线三（V6-V8 已落地；V8.2/V9 计划已出，见各自 plan doc）
+- V6 SGLang 真引擎 + update_weights 权重同步 ✅；V7 FSDP 真训一步(packing) ✅；V8 Megatron TP + Megatron→HF 转换 ✅。
+- **V8.2 多卡 Megatron（TP×PP×CP）** —— 计划 [docs/decisions/v8.2-plan.md](decisions/v8.2-plan.md)。
+  硬件前提变化（4 卡机）使 V8 的三条「单卡硬阻断」偏离（gloo/PP/CP）全部可退休；EP 维持不做（0.6B 是 dense，**无 expert 可切**，不是做不到）。
+- **V9 吞吐实验** —— 计划 [docs/decisions/v9-plan.md](decisions/v9-plan.md)。
+  前八版全在问「对不对」，V9 第一次问「多快」：忠实复写源 `Timer`/`calculate_fwd_flops`/`log_perf_data_raw` 三件套，
+  扫 TP/PP/CP × 微批 × packing × 同步异步，回答五个**预先写下预期**的问题。**依赖 V8.2**（gloo 走 TCP，测吞吐等于测 TCP 栈）。
 
 ---
 

@@ -18,7 +18,7 @@
 
 - **源项目**：`/Users/qshf/my-project/slime-agentic`（github: LMIS-ORG/slime-agentic，分支 main。只读，用于对照）
 - **nano 项目**：`/Users/qshf/my-project/slime-agentic-zero-repro`（git 已 init，主分支 main）
-- **当前活跃分支**：`v8`
+- **当前活跃分支**：`v9`
 - **分支准则（每版必须遵守）**：**每个版本切一个 `vN` 分支，从上一版分支的末端切出；当版的全部提交——实施计划 doc + 代码实现 + 验证结果——都落在 `vN` 上，绝不提交到别的版本分支**。判断法：提交前先 `git branch --show-current`，确认在当版分支。反例（已修）：V4 的计划/实现/调试提交错落在 `v3` 分支上——已把 `v3` 回退到其最后一个 V3 提交、V4 全部收进 `v4` 分支。
 - **工作流**：**本地只开发**（写码+推 git）→ **SSH 5090 服务器**（RTX 5090，路径 `/home/ubuntu/slime-agentic-zero-repro`，git 管理）拉取/跑通/验证。V0（纯 fake）本地可验；V1 起接 Qwen3-0.6B SGLang，都在服务器验证。
 - **服务器 git 恢复准则（每版必须遵守）**：服务器 checkout 是 **git 管理**的（当前目录 `/home/ubuntu/slime-agentic-zero-repro`，旧的 `zj` 已弃用）。**当服务器所在版本与要跑的版本不匹配时，用 git 从远程仓库恢复到目标版本**（`git fetch origin && git reset --hard origin/<vN>`），**绝不用 rsync 往 git 工作树上盖**——rsync 会把本地其它版本的文件混进 checkout（tracked 被改、v4 文件混进 v3），污染分支状态。反例（已修）：本次调试把本地 v4 工作树 rsync 盖到服务器 v3 checkout，事后 `git restore` + `git clean` 才复原成干净 v3。**已落地（2026-07-22）**：服务器已配 github SSH key（`~/.ssh/id_ed25519`，公钥已加到 github）、remote 已换 SSH，`git fetch origin && git reset --hard origin/<vN>` 实测可用（HTTPS 443 仍超时，故必须走 SSH）。
@@ -57,7 +57,8 @@
 | V7.5 | sequence packing（退休偏离 #1）| flat + 块对角 mask 隔离 / loss-grad 等价 | ✅ 5090 world=1 PASSED（fp32 数学精确：loss 2.4e-7 / grad rel_L2 1.7e-4 / cosine 0.99999999 → 隔离无泄漏；bf16 loss 1.7e-4 + cosine 0.9946）；opt-in `train_packing` 默认 off 零回归；显式块对角 4D mask 替 flash-attn varlen |
 | V7.6 | FA2 varlen packing（退休偏离 #7）| varlen 隔离 / negative control 验收范式 | ✅ 5090 world=1 PASSED（varlen 真 dispatch 28 次、cu_seqlens 与手工值一致；fa2 vs padding loss Δ=0 / cosine 0.99999999；**negative control 判别力 8721×**）；回到源 `attention_mask=None` 写法 |
 | V8 | Megatron 并行（TP）| 层内切分 / vocab-parallel / Megatron→HF 权重转换 | ✅ V8.0+V8.1 收官（5090 单卡 torchrun：**fp32 精确门** TP=2 vs TP=1 loss Δ=0、grad rel_L2 1.9e-5、cosine 1.00000000；bf16 门 loss Δ=5.1e-6、cosine 0.99909；转换往返 max_abs_diff=**0**；全 28 层复跑同样过。PP/CP/EP 单卡实测硬阻断，记录设计）|
-| V9 | 吞吐实验 | 扫参数定位瓶颈 | 记录设计 |
+| V8.2 | 多卡 Megatron（TP×PP×CP）| PP 1F1B / tie 跨 stage 梯度规约 / CP 2-chunk 对称切分 | 📋 **计划已出**（[v8.2-plan.md](docs/decisions/v8.2-plan.md)）：4 卡实测已推翻 V8 的 gloo/PP/CP 三条偏离 |
+| V9 | 吞吐实验 | Timer/FLOPs/MFU 口径 + 扫参数定位瓶颈 | 📋 **计划已出**（[v9-plan.md](docs/decisions/v9-plan.md)）：依赖 V8.2 |
 
 ## 4. 环境前置
 
@@ -211,6 +212,19 @@ rsync -az --exclude '.venv' --exclude '.git' \
 - **三个踩坑（都是真调试出来的）**：①**dropout 未关 → 等价门假阳性**：`TransformerConfig` 默认 `dropout=0.1`，而 `model_parallel_cuda_manual_seed` **故意**让各 TP rank 持不同 dropout RNG → TP=1/TP=2 丢弃不同单元，实测 cosine 仅 **0.25**、grad_norm 差 11×，**不是 TP 切错纯是随机性**；修=显式设 0（也更忠实，HF Qwen3 `attention_dropout=0.0`）。②**fused kernel 原地改输入**：它 in-place 减 max，而 nano 逐样本切 `logits[row,:L-1]` 共享同一 base storage → autograd 版本计数报错；**bf16 时 `.float()` 隐式拷贝把问题盖住，只有 fp32 才暴露**；修=显式 `.float().clone()`（源不需要：它整批 pack 成一条 `[S,B,V]` 喂 kernel）。③**漏 `finalize_model_grads`（本版最实质的正确性发现）**：源 `finalize_model_grads.py:403-405` 对 `q/k_layernorm` 做 **SUM all-reduce**——qk-layernorm 作用在**每个头**上而头被 TP 切开，各 rank 的梯度是**部分和**；漏掉时「前向 loss Δ 恰为 0、梯度却系统性偏 1.8e-2 且最差正是 `q_norm.weight`」=**漏规约的指纹**；补上后 rel_L2 1.8e-2 → **1.9e-5（约 930×）**。**这条坑 bf16 抓不到（5e-2 会被当舍入放过）——fp32 副证的价值就在这里。**
 - **PP/CP/EP 记录设计不实现（单卡实测硬阻断，非偷懒）**：PP 需 CUDA p2p 而 **gloo 不支持**（`gloo::IoException`）、EP 需 all_to_all 而 **gloo 无**（且 0.6B 是 dense）、CP 单卡=1 无可验内容。接缝按源留好（显式 `pipeline_model_parallel_size=1`），≥2 卡 + NCCL 可直接补。
 - **偏离**（v8.md 11 条三要素表）：gloo 而非 NCCL（单卡多 rank 被 NCCL 硬拒，语义等价性能不等价）、只用 `megatron.core` 不走 `megatron.training.init`、只做 TP、local spec 的 layernorm 命名（TE 装不了，两种名字都认+自动判定）、**`partition_stride=2` 对 GLU fc1 放行**（源无条件 assert==1 与它自己的重排分支语义冲突）、`_finalize_model_grads` 只做 qk-layernorm 一条分支、torch AdamW 而非 `DistributedOptimizer`、反向映射 nano 自有、只做 Qwen3 dense、无 packing/KL/entropy、权重同步止于转出 HF state_dict 未接 SGLang。
+
+### V8.2 + V9 计划（2026-08-10）详见 [v8.2-plan.md](docs/decisions/v8.2-plan.md) / [v9-plan.md](docs/decisions/v9-plan.md)
+
+- **分支 `v9`**（从 `v8` 末端切出，按分支准则；V8.2 与 V9 同属该分支的两版）。本次只出**计划**，未写实现代码。
+- **触发点 = 硬件前提变了**：本轮在 `ssh 5090` 上跑 V7.5/V7.6/V8 全套复验（数字与文档记录一致，跨机干净复现）时发现**该机是 4 卡**——V8 那三条偏离（#1 gloo / #3a PP / #3b CP）的理由**都是「单卡物理阻断」而非「不重要」**，故全部不再成立。**4 卡 NCCL 冒烟已实测**：双卡 all_reduce ✅、**CUDA p2p send/recv ✅**（gloo 在这里直接 abort，故这条就是 PP 的物理前提）、`initialize_model_parallel(TP=1,PP=2)` ✅、`get_embedding_group()=[0,1]` ✅（tie 跨 stage 规约通路已就位）。拓扑 `nvidia-smi topo -m`：0-1 同 NUMA、2-3 同 NUMA、跨组 SYS、**无 NVLink** → 决定 rank 映射（TP 放 NODE 内、PP 跨 NODE）。
+- **V8.2 最硬的正确性点 = PP + tie 的 embedding 梯度跨 first/last stage all-reduce**（源 `finalize_model_grads.py:164 _allreduce_word_embedding_grads`）。tie 让输入嵌入与输出投影是同一份权重，PP>1 时它们在**不同进程**里，各自梯度只是部分和。**它与 V8 坑③（漏 qk-layernorm 规约）是同一类错误、同一个指纹**——loss Δ 恰为 0 而梯度系统性偏，只是最差参数从 `q_norm.weight` 变成 `embed_tokens.weight`，且**只有 fp32 档抓得到**（bf16 会当舍入放过）。故 V8.2 必跑 fp32。
+- **V8.2 的结构债**：`_microbatch_backward` 要拆成源的 `forward_step` + `loss_func` 两件（`model.py:380-429`），因为 PP 必须走 `get_forward_backward_func()` 的 1F1B 调度，**手写 send/recv 必错**。这不是为 PP 特设的改造——**源本来就是这个形状**，V8 因 PP=1 才能合成一个函数。
+- **V8.2 的 G6**：V8.1 的 Megatron→HF 转换只处理了 TP-gather，因为 PP=1 时**单 rank 持全部层**；PP>1 时任何单 rank 都拿不到完整模型，须先跨 PP broadcast（源 `hf_weight_iterator_direct.py:66-77`）。**V8.1 只见到了这条 RL 接缝的一半。**
+- **EP 维持不做，但理由更新**：从「gloo 无 all_to_all」改为「**Qwen3-0.6B 是 dense，没有 expert**」——不是做不到，是无对象。
+- **V9 = 前八版全在问「对不对」，第一次问「多快」**。忠实复写源三件套：`timer.py:15 Timer`（单例+装饰器）、`flops_utils.py:66 calculate_fwd_flops`（逐条 seqlen，含 GQA/vocab 项）、`train_metric_utils.py:13 log_perf_data_raw`（`tflops = 3×fwd_flops/train_time`、`tok_per_s`、`wait_time_ratio`）。**FLOPs 必须按真实逐条长度算**（源 `data.py:292` 把 `total_lengths` 挂到 `Timer().seq_lens`）——用 `max_len×B` 会把 padding 浪费算成有效算力，Q3 就白测了。
+- **V9 依赖 V8.2**：gloo 走 TCP 经 CPU 中转，**现在测吞吐等于在测 TCP 栈**。V9 的五个问题各自预先写下可证伪的预期（TP 扩展效率 / PP bubble 是否符合 `(pp-1)/(m+pp-1)` / packing 到底省多少（**兑现 V7.6 偏离 #7 那句「装 flash-attn 后换 varlen 得全部吞吐」**）/ 真 trainer 上重测 V5 的 sync-vs-async（V5 那次是 `fake_train_seconds` 模拟的）/ 权重同步 disk reload 占比是否高到该换 broadcast）。
+- **V9 的方法学纪律**（性能实验的失效模式与正确性实验不同）：必 `cuda.synchronize()` 再停表（不同步测的是 launch 时间，会得出「TP=4 比 TP=1 快」）；必丢 warmup；必记 `nvidia-smi` 快照（**共享 GPU 上的吞吐数字不可比**——4 卡实测常被 `vllm-qwen36-27b` 各占 28.5G，V8 就因此 OOM）；**先写预期再测**（先测后编解释是性能工程最常见的自欺）；**V9 只测量不优化**（发现瓶颈记待办，不当场改，否则两者互相污染）。
+- **登记偏离（V9）**：源 `Timer` 自身**不 sync**（它测的是跨 `ray.get` 的粗粒度阶段，边界天然被同步点隔开）；nano V9 要测更细的段（单次 forward / 单次 all-reduce）**必须自加 sync**，此偏离要写进代码注释。
 
 ## 7. 待办 / 已知问题
 
