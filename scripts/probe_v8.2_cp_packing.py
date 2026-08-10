@@ -32,35 +32,58 @@ docs/decisions/v8.2-plan.md §1.1。
   C3  被测后端的 backward 是否可信（vs unfused 参考）
       unfused 是 O(N²) 朴素实现，无 fused/varlen 内核，作可信参考。
       C2 若失败，这一步区分「坏的是整个后端还是只有 THD 路径」。
+      比谁跟谁由 `PROBE_A`/`PROBE_B` 指定（默认 flash vs unfused）。
 
   C4  CP=2 在 BSHD / THD 下各自能否跑
       CP 只有 TE 后端支持（mcore dot_product_attention.py:57-59 assert cp==1）；
       而 Unfused 不支持 CP，故 CP 只能走 fused 或 flash。
+      两种布局**各自**报告实选后端——TE 可能对它们给出不同选择。
+
+**后端是被断言的，不是被假设的（C0）**：`NVTE_*` 三个 env 表达的是**请求**，
+TE 可能按 dtype/head_dim/CP/硬件否掉它（unfused 遇 CP 直接 `No dot product
+attention backend is available`；FA4 b15 在 sm_120 `Operation creation failed`）。
+故本脚本在跑过真前向后从 TE 的模块级缓存
+（`transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py:68`
+的 `_attention_backends`）读回**实选后端**，与 `TAG` 不符即退出。
+`TAG` 因此不再只是文件名标签，而是一条被验证的断言。
+想看 TE 的完整选择过程仍可加 `NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2`
+（日志里找 `Selected backend =`），但常规跑不需要——C0 已经把结论打出来了。
 
 **注意「上游放行 ≠ 算得对」**：TE `utils.py:992-999` 对 sm_120 的 THD 有一条
 `cudnn_version < (9,18,1)` 的 gate，本容器 cuDNN 9.25.0 **高于门槛故不触发**——
 TE 自报 `FusedAttention=True (sub-backend 1)` 并选中它，即上游认为这条路已修好，
-而 C2 实测 backward 仍错。想看后端选择过程加 `NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2`。
+而 C2 实测 backend 仍错。
 （另：本 bug 与 TE#2186「THD+CP tail-padding NaN」不是同一条——那条依赖 CP，
 本条单卡无 CP、单段即复现。）
 
 **怎么跑**（容器 nano-mcore，镜像 agentic-rl-infra-lab:te-cudnn-system-spike）：
 
-    # 三个后端各跑一遍（TE 用这两个 env 选后端；megatron 的 --attention-backend
-    # 就是翻译成它们，见 mcore language_module.py:124-140）
-    NVTE_FUSED_ATTN=1 NVTE_FLASH_ATTN=0 TAG=fused   torchrun --nproc_per_node=1 ... $0
-    NVTE_FUSED_ATTN=0 NVTE_FLASH_ATTN=1 TAG=flash   torchrun --nproc_per_node=1 ... $0
-    NVTE_FUSED_ATTN=0 NVTE_FLASH_ATTN=0 TAG=unfused torchrun --nproc_per_node=1 ... $0
-    PROBE_MODE=compare python scripts/probe_v8.2_cp_packing.py    # = C3
+    # 三个后端各跑一遍。三个 NVTE_* 都显式写全，不依赖默认值；
+    # TAG 必须与实选后端一致，否则脚本在 C0 直接退出。
+    # （megatron 的 --attention-backend 就是翻译成这些 env，
+    #   见 mcore language_module.py:124-140 的 check_and_set_env_variable）
+    NVTE_FUSED_ATTN=1 NVTE_FLASH_ATTN=0 NVTE_UNFUSED_ATTN=0 TAG=fused \
+      torchrun --nproc_per_node=1 --master_port 29791 $0
+    NVTE_FUSED_ATTN=0 NVTE_FLASH_ATTN=1 NVTE_UNFUSED_ATTN=0 TAG=flash \
+      torchrun --nproc_per_node=1 --master_port 29792 $0
+    NVTE_FUSED_ATTN=0 NVTE_FLASH_ATTN=0 NVTE_UNFUSED_ATTN=1 TAG=unfused \
+      torchrun --nproc_per_node=1 --master_port 29793 $0
 
-    # C4：双卡
-    PROBE_CP=2 torchrun --nproc_per_node=2 --master_port 29793 scripts/probe_v8.2_cp_packing.py
+    # C3：默认比 flash vs unfused（用 PROBE_A/PROBE_B 换成别的组合）
+    PROBE_MODE=compare python $0
+    PROBE_A=fused PROBE_B=unfused PROBE_MODE=compare python $0
+
+    # C4：双卡。**env 同样要写全**——不写就是默认值，可能落到 fused 而非 FA2
+    NVTE_FUSED_ATTN=0 NVTE_FLASH_ATTN=1 NVTE_UNFUSED_ATTN=0 TAG=flash PROBE_CP=2 \
+      torchrun --nproc_per_node=2 --master_port 29794 $0
 
 **flash 后端要装 FA2**：容器默认带 FA4 4.0.0b15，它在 sm_120 上 `pack_gqa.py:139`
 报 `ValueError: Operation creation failed`（b21 才修，见 v8-5090-followup.md §2），
 故须换成 FA2 2.8.3。换的时候**必须连 `flash_attn_4-*.dist-info` 一起删** ——
 TE 是按包元数据判断 FA4 在不在（`get_pkg_version("flash-attn-4")`），
 留着它会让 TE 去 import 已被 FA2 覆盖掉的 `flash_attn.cute` → ModuleNotFoundError。
+注意本脚本**不 import flash_attn**：FA2 是 TE 按上述 env 在内部动态选择并加载的，
+所以「装没装对」只能由 C0 读回的实选后端来证明。
 
 **偏离登记**：本脚本用 TEDotProductAttention 直接测单层 attention，不搭完整 MegatronTrainer——
 源项目没有这类后端可行性探针（它假定 TE/FA 内核是对的）。nano 加这一层是因为
@@ -84,11 +107,23 @@ NH, NKV, HD = 16, 8, 128
 
 
 def _compare() -> int:
-    """PROBE_MODE=compare：比对两次 run 落盘的结果（不需要 GPU / dist）。"""
-    f = torch.load(f"{OUT_DIR}/probe_fused.pt")
-    u = torch.load(f"{OUT_DIR}/probe_unfused.pt")
-    print(f"\n=== C3 · fused vs unfused（unfused 为可信参考）===")
-    print(f"{'layout':<8}{'tensor':<6}{'fused_max':>13}{'unfused_max':>13}"
+    """PROBE_MODE=compare：比对两次 run 落盘的结果（不需要 GPU / dist）。
+
+    比谁跟谁由 PROBE_A / PROBE_B 指定（默认 flash vs unfused）——**不要硬编码**：
+    早先版本写死了 probe_fused.pt vs probe_unfused.pt，导致测 flash 时得靠
+    `cp probe_flash.pt probe_fused.pt` 这种把戏，日志里的 "fused" 字样与实际
+    跑的后端对不上。现在文件里存了 `_backend`（TE 自报的真实选择），
+    表头直接打出来，比对的是谁一目了然。
+    """
+    a_tag = os.environ.get("PROBE_A", "flash")
+    b_tag = os.environ.get("PROBE_B", "unfused")
+    f = torch.load(f"{OUT_DIR}/probe_{a_tag}.pt")
+    u = torch.load(f"{OUT_DIR}/probe_{b_tag}.pt")
+    # 落盘时记的是 TE 自报的后端；老文件没这个键，回退到文件名标签并标注
+    a_be = f.get("_backend", f"{a_tag}(未记录)")
+    b_be = u.get("_backend", f"{b_tag}(未记录)")
+    print(f"\n=== C3 · {a_be} vs {b_be}（后者为可信参考）===")
+    print(f"{'layout':<8}{'tensor':<6}{'A_max':>13}{'B_max':>13}"
           f"{'max_abs_diff':>14}{'cosine':>13}")
     bad = 0
     for layout in ("bshd", "thd"):
@@ -106,7 +141,7 @@ def _compare() -> int:
                 bad += 1
             print(f"{layout:<8}{nm:<6}{a.abs().max():>13.4e}{b.abs().max():>13.4e}"
                   f"{diff:>14.4e}{cos:>13.8f}{flag}")
-    print(f"\n结论：{'fused 内核在某路径上给出错误梯度' if bad else 'fused 与 unfused 一致'}")
+    print(f"\n结论：{f'{a_be} 在某路径上给出错误梯度' if bad else f'{a_be} 与 {b_be} 一致'}")
     return 0
 
 
@@ -144,6 +179,52 @@ cfg = TransformerConfig(
 def p(*a):
     if RANK == 0:
         print(*a, flush=True)
+
+
+def observed_backend() -> str:
+    """读回 **TE 自己选中的后端**，而不是我们请求的那个。
+
+    为什么必须有这一步：env var 是**请求**，不是**结果**。TE 会按 dtype /
+    head_dim / mask / CP / 硬件能力否掉请求（例如 unfused 不支持 CP 就直接
+    `No dot product attention backend is available`；FA4 b15 在 sm_120 上
+    `Operation creation failed`）。只打印 `NVTE_FLASH_ATTN=1` 而不验证结果，
+    就可能出现「以为测的是 FA2、实际落到 fused」——那正是本探针要抓的那类
+    静默错误，探针自己更不能犯。
+
+    TE 把选择缓存在模块级 dict（TE 2.17 `dot_product_attention.py:68`），
+    **必须在跑过一次真前向之后读**，此前全是 None。
+    """
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as _dpa,
+    )
+    b = _dpa._attention_backends
+    if b.get("use_flash_attention"):
+        return f"FlashAttention({b.get('flash_attention_backend')})"
+    if b.get("use_fused_attention"):
+        return f"FusedAttention({b.get('fused_attention_backend')})"
+    if b.get("use_unfused_attention"):
+        return "UnfusedDotProductAttention"
+    return "unknown(未选中任何后端)"
+
+
+def assert_backend(observed: str) -> None:
+    """把 TAG 从「文件名标签」升级为「被验证的断言」。
+
+    TAG 原本只影响落盘文件名，写错不会报错——这是文档与实测脱节的入口。
+    现在 TAG 必须与 TE 实选后端一致，不一致直接退出。
+    """
+    want = {"flash": "FlashAttention", "fused": "FusedAttention",
+            "unfused": "UnfusedDotProductAttention"}.get(TAG)
+    if want is None:
+        p(f"    ⚠️ TAG={TAG} 不在 flash/fused/unfused 中，跳过后端断言")
+        return
+    if not observed.startswith(want):
+        p(f"\n❌ 后端不符：TAG={TAG} 期望 {want}，TE 实选 {observed}")
+        p("   env 只是「请求」，TE 可能否掉它。检查 NVTE_* 三个变量，或该后端"
+          "在本配置下不可用（如 unfused 不支持 CP）。")
+        dist.destroy_process_group()
+        sys.exit(1)
+    p(f"    ✅ 后端已验证：TE 实选 {observed}（与 TAG={TAG} 一致）")
 
 
 def mk():
@@ -189,14 +270,23 @@ def run_thd(seqlens, seed: int):
 p(f"=== TAG={TAG} CP={CP} world={WORLD} device={torch.cuda.get_device_name(0)} "
   f"cap={torch.cuda.get_device_capability(0)}")
 p(f"    NVTE_FUSED_ATTN={os.environ.get('NVTE_FUSED_ATTN')} "
-  f"NVTE_FLASH_ATTN={os.environ.get('NVTE_FLASH_ATTN')}")
+  f"NVTE_FLASH_ATTN={os.environ.get('NVTE_FLASH_ATTN')} "
+  f"NVTE_UNFUSED_ATTN={os.environ.get('NVTE_UNFUSED_ATTN')}  ← 这些是**请求**，实选见下")
 
 S, SEED = 128, 1234
 
 if CP == 1:
     # C1/C2：单段 THD vs BSHD —— 数学上必须逐值相等
     ob, dqb, dkb, dvb = run_bshd(S, SEED)
+    # 后端只有跑过真前向才会被选中并缓存，故在此读回并断言
+    backend = observed_backend()
+    p(f"\n=== C0 · 后端验证 ===\n    TE 实选 = {backend}")
+    assert_backend(backend)
     ot, dqt, dkt, dvt = run_thd([S], SEED)
+    backend_thd = observed_backend()
+    if backend_thd != backend:
+        # THD 与 BSHD 落到不同后端会让 C1/C2 的「同一算法」前提失效
+        p(f"    ⚠️ THD 路径后端不同：{backend_thd} ≠ {backend}（C1/C2 前提失效，结果按此解读）")
     fwd_d = (ot.view(-1).float() - ob.view(-1).float()).abs().max().item()
     p(f"\n=== C1 · THD vs BSHD forward ===\n    max_abs_diff = {fwd_d:.3e}"
       f"  {'✅ 同一算法' if fwd_d == 0 else '⚠️ 不等'}")
@@ -210,6 +300,8 @@ if CP == 1:
 
     os.makedirs(OUT_DIR, exist_ok=True)
     torch.save({
+        # 存 TE 实选后端，让 C3 的表头能报出「比的到底是谁」而不是靠文件名
+        "_backend": backend, "_backend_thd": backend_thd,
         "bshd_o": ob.detach().float().cpu(), "bshd_dq": dqb.float().cpu(),
         "bshd_dk": dkb.float().cpu(), "bshd_dv": dvb.float().cpu(),
         "thd_o": ot.detach().float().cpu(), "thd_dq": dqt.float().cpu(),
@@ -223,8 +315,11 @@ else:
                      ("THD(packing)", lambda: run_thd([64, 96, 96], SEED))):
         try:
             out, dq, _, _ = fn()
+            # 每条各自读回后端：CP 下 TE 可能对两种布局给出不同选择，
+            # 只报一次会掩盖「BSHD 走 flash 而 THD 悄悄落回 fused」这类情况
             p(f"    {name:<16} PASS  out={tuple(out.shape)} "
-              f"|dq|={dq.float().norm().item():.4f} finite={torch.isfinite(dq).all().item()}")
+              f"|dq|={dq.float().norm().item():.4f} "
+              f"finite={torch.isfinite(dq).all().item()}  backend={observed_backend()}")
         except Exception as e:  # noqa: BLE001 — 探针要报告失败类型而非崩掉
             p(f"    {name:<16} FAIL  {type(e).__name__}: {str(e)[:160]}")
 

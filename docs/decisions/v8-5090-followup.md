@@ -92,6 +92,13 @@
    源所有 megatron 训练脚本都带 `--attention-backend flash`，`docs/zh/developer_guide/debug.md:15`
    写明理由是「避免 CP 下 fused attention 的数值不稳定」。**源遇到过同一类问题，解法是换后端。**
 
+**上表的后端是探针自证的，不是靠 env 推断的**：`NVTE_*` 是**请求**，TE 可能否掉它
+（unfused 遇 CP 就直接不可用）。探针跑过真前向后从 TE 的 `_attention_backends` 缓存读回实选后端并断言，
+实测三行分别自报 `FlashAttention(2.8.3)`（版本号直接证明是 FA2 而非 FA4）、
+`FusedAttention(NVTE_F16_arbitrary_seqlen)`、`UnfusedDotProductAttention`；
+CP=2 的 BSHD/THD 两行也各自内联报告，均为 `FlashAttention(2.8.3)`。
+故意错标（`TAG=flash` + env 请求 fused）会被 C0 拒绝 —— 该断言有判别力。
+
 > **不要去 patch 那个 sm_120 carve-out**：实测 patch 掉后 fused CP=2 THD 会"跑通"，但梯度是错的——
 > 那是把上游有意设的护栏拆掉换来一个静默错误。正确做法是换 flash 后端。
 
