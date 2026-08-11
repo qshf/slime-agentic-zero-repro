@@ -302,6 +302,9 @@ class MegatronTrainer:
         # 它们的梯度也是部分和，与 DP 一样要规约。
         self.dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
         self.dp_cp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+        # PP 角色标志：first stage 承载 input embedding，last stage 承载 final norm / output
+        # layer 并产出 logits；它们随后传给 GPTModel 的 pre_process / post_process。
+        # PP=1 时同一 rank 既是 first 也是 last，因而同时拥有模型的输入端和输出端。
         self.is_first_stage = mpu.is_pipeline_first_stage()
         self.is_last_stage = mpu.is_pipeline_last_stage()
 
