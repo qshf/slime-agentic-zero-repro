@@ -144,13 +144,18 @@ def main() -> int:
     ap.add_argument("--fp32", action="store_true", help="fp32 副证（数学精确证明）")
     args = ap.parse_args()
 
+    # 这一步完成整个 Megatron 侧初始化：建立 torch.distributed / TP 并行组，
+    # 按 tp_size 构造当前 rank 的模型分片，并把 HF checkpoint 的对应 slice 写入该分片。
+    # 因而构造器返回后，trainer.model.named_parameters() 已不是完整 HF 模型参数表。
     trainer = MegatronTrainer(
         MODEL_PATH,
         num_layers=args.layers,
         global_batch_size=1,
-        backend="gloo",  # 单卡多 rank 唯一通路
+        backend="gloo",  # 单卡多 rank 唯一通路 / 多卡 ncll
         params_dtype=torch.float32 if args.fp32 else torch.bfloat16,
     )
+    # rank 是 torchrun 分配的全局进程编号；本脚本只开 TP，故 tp_size == world_size。
+    # TP=2 时每个 rank 各持一半可切分参数，数值不同但大多数本地张量形状相同。
     rank, tp_size = trainer.rank, trainer.tp_size
     failed = 0
 
@@ -167,7 +172,11 @@ def main() -> int:
         print(f"=== V8.0 Megatron TP 等价（tp_size={tp_size}, layers={trainer.num_layers}）===")
         print("[a] TP 分片结构")
 
+    # 这里只读取当前 rank 的 local shard，绝不触发 all-gather；因此它能证明模型真的被切开。
+    # 对照：TP=1 时 local shape 是全量；TP=2 时 column/vocab 层的 dim0、row 层的 dim1 缩为一半。
     stats = _shard_stats(trainer)
+    # 以下是完整 HF 配置中的逻辑维度，用来计算每个 local shard 应有的形状，
+    # 而不是从 stats 反推；这样错误的切分也会被断言捕获。
     hidden = trainer.hf_config.hidden_size
     ffn = trainer.hf_config.intermediate_size
     head_dim = getattr(trainer.hf_config, "head_dim", None) or (
