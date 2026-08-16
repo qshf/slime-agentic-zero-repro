@@ -41,7 +41,7 @@ else
   CMD="python $SCRIPT $*"
 fi
 
-docker run --rm --gpus "$GPUS" --network host --shm-size=4g \
+docker run --rm --gpus '"'"${GPUS}"'"' --network host --shm-size=4g \
   -v "$ROOT:/workspace" \
   -v "$MODEL_PATH:/models/Qwen3-0.6B:ro" \
   -v /tmp:/tmp \
