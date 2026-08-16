@@ -47,5 +47,6 @@ docker run --rm --gpus '"'"${GPUS}"'"' --network host --shm-size=4g \
   -v /tmp:/tmp \
   -w /workspace \
   -e NANO_MODEL_PATH=/models/Qwen3-0.6B \
+  -e PYTHONPATH=/workspace \
   "$IMAGE" \
   bash -c "$CMD"
