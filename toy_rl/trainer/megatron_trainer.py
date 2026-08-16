@@ -240,13 +240,15 @@ class MegatronTrainer:
         assert context_parallel_size == 1 or self.use_te_spec, (
             "CP>1 必须用 TE spec（local spec 的 DotProductAttention assert cp==1）"
         )
-        # **CP>1 时后端必须是 flash**：落到 fused 会**静默算错**（§1.1 实测 dq cosine 0.356）。
-        # 这不是 nano 的发明，是把源所有 megatron 脚本的 `--attention-backend flash` 显式化。
+        # **CP>1 时后端必须是 flash**：对齐源所有 megatron 训练脚本的 `--attention-backend flash`。
+        # 历史原因：TE#3333（fused THD backward 在 sm_120 上静默算错，dq cosine~0.36）。
+        # TE 2.18 已修复该 bug（2026-08-14，commit 70957ad5），实测 G3b fused cosine=0.99894
+        # vs flash=0.99921，两者均远离 negative control（0.604）——bug 已不存在。
+        # 仍保留 flash 约束：（1）跟源；（2）flash 过门更干净；（3）换后端无吞吐收益证据。
         self.attention_backend = attention_backend
         if context_parallel_size > 1:
             assert attention_backend == "flash", (
-                f"CP>1 必须走 flash 后端（当前 {attention_backend!r}）——"
-                "fused(cuDNN) 的 THD backward 在 sm_120 上静默算错（TE#3333）"
+                f"CP>1 必须走 flash 后端（当前 {attention_backend!r}）——对齐源项目约定"
             )
 
         # 通信后端：单卡多 rank 只能 gloo（NCCL 拒绝 duplicate GPU）；多卡传 "nccl"。
