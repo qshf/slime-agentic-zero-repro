@@ -118,6 +118,7 @@ def _grads_in_hf_layout(trainer: MegatronTrainer) -> dict[str, torch.Tensor]:
     for name, param in _local_params_by_global_name(trainer.model, trainer.tie).items():
         if param.grad is None:
             continue
+        # 梯度继承参数的 TP 分片布局；伪装成参数后可复用 all_gather_param 的通信与重排逻辑。
         shim = SimpleNamespace(
             data=param.grad.detach(),
             tensor_model_parallel=getattr(param, "tensor_model_parallel", False),
@@ -125,16 +126,22 @@ def _grads_in_hf_layout(trainer: MegatronTrainer) -> dict[str, torch.Tensor]:
             partition_stride=getattr(param, "partition_stride", 1),
             parallel_mode=getattr(param, "parallel_mode", None),
         )
+        # 聚合当前 TP 组内的梯度分片，得到 Megatron 布局的完整梯度。
         full = all_gather_param(name, shim)
+        # 移除 Megatron 为整除并行度而补出的词表行。
         full = remove_padding(name, full, trainer.hf_config.vocab_size)
+        # 拆分/重排融合参数，并改写为 Hugging Face 的参数名和张量布局。
         for hf_name, hf_grad in convert_qwen3_to_hf(trainer.hf_config, name, full):
+            # 固化为独立的 CPU float32 快照，供验收比较使用。
             out[hf_name] = hf_grad.float().cpu().clone()
 
     if trainer.pp_size > 1:
+        # 每个 PP stage 仅持有部分层；收集各 stage 的局部 HF 梯度字典。
         gathered: list = [None] * trainer.pp_size
         dist.all_gather_object(gathered, out, group=trainer.pp_group)
         merged: dict[str, torch.Tensor] = {}
         for part in gathered:
+            # 各 stage 的参数名互不重叠，合并后得到完整模型的梯度字典。
             merged.update(part)
         out = merged
     return out
