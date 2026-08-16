@@ -29,6 +29,18 @@ echo "=== GPU状态快照（验证前） ===" >&2
 nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv >&2
 echo >&2
 
+# 检测是否需要 torchrun（脚本路径包含 test_v8.2_parallel 或用户显式传 NPROC）
+NPROC="${NPROC:-}"
+if [[ -z "$NPROC" ]] && [[ "$SCRIPT" == *"test_v8.2_parallel"* ]]; then
+  NPROC=1  # V8.2 测试默认单进程
+fi
+
+if [[ -n "$NPROC" ]]; then
+  CMD="torchrun --nproc-per-node=$NPROC $SCRIPT $*"
+else
+  CMD="python $SCRIPT $*"
+fi
+
 docker run --rm --gpus "$GPUS" --network host --shm-size=4g \
   -v "$ROOT:/workspace" \
   -v "$MODEL_PATH:/models/Qwen3-0.6B:ro" \
@@ -36,4 +48,4 @@ docker run --rm --gpus "$GPUS" --network host --shm-size=4g \
   -w /workspace \
   -e NANO_MODEL_PATH=/models/Qwen3-0.6B \
   "$IMAGE" \
-  bash -c "python $SCRIPT $*"
+  bash -c "$CMD"
