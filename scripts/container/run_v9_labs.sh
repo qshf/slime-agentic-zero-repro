@@ -12,7 +12,7 @@ shift
 SCRIPT="${1:?Usage: $0 [gpu_devices] script_path [args...]}"
 shift
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="agentic-rl-infra-lab:fa2-mcore"
 MODEL_PATH="${NANO_MODEL_PATH:-/home/ubuntu/models/Qwen/Qwen3-0.6B}"
 
