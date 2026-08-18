@@ -833,6 +833,11 @@ class MegatronTrainer:
             raise ValueError(f"microbatch_size must be positive, got {microbatch_size}")
         gbs = global_batch_size if global_batch_size is not None else self.global_batch_size
 
+        from toy_rl.utils.timer import Timer
+        timer = Timer()
+        timer.reset()  # 每次 train_batch 重置，保证 log_dict 只含本步计时
+
+        timer.start("batch_preparation")
         chunks = [samples[i : i + microbatch_size] for i in range(0, len(samples), microbatch_size)]
         num_microbatches = len(chunks)
         if self.pp_size > 1:
@@ -864,24 +869,35 @@ class MegatronTrainer:
         if not batches:
             return {"loss": 0.0, "grad_norm": 0.0, "trained_samples": 0, "num_microbatches": 0}
 
+        timer.end("batch_preparation")
+
         from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 
         self.optimizer.zero_grad(set_to_none=True)
         forward_backward_func = get_forward_backward_func()
+        timer.start("forward_backward")
+        torch.cuda.synchronize()  # 必须 sync，否则测的是 kernel launch 时间（V9 纪律）
         losses_reduced = forward_backward_func(
             forward_step_func=self.forward_step,
             data_iterator=iter(batches),
             model=[self.model],
             num_microbatches=len(batches),
-            # bshd：`seq_length` 要传**全局**长度（mcore get_tensor_shapes 内部 // cp_size）。
-            # thd：`variable_seq_lengths=True` 时它被忽略（各微批的 T 动态协商）。
             seq_length=batches[0]["seq_length"],
             micro_batch_size=microbatch_size,
             forward_only=False,
         )
+        torch.cuda.synchronize()
+        timer.end("forward_backward")
+        # 注：_finalize_model_grads（三处 all-reduce）由 config.finalize_model_grads_func
+        # 在 forward_backward_func 内部反向结束后自动触发，外层无调用点可包 timer。
+        # 通信开销折叠在 forward_backward 计时里；V9.3 在 _finalize_model_grads 内部细分。
 
+        timer.start("optimizer")
+        torch.cuda.synchronize()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad)
         self.optimizer.step()
+        torch.cuda.synchronize()
+        timer.end("optimizer")
 
         # loss 只在 last stage 算出；CP>1 时各 rank 只有部分和 —— 用与梯度同样的
         # AVG 规约还原成全量（× dp_cp 的缩放已在 loss_func 里做过）。
@@ -892,22 +908,26 @@ class MegatronTrainer:
             dist.all_reduce(t, op=dist.ReduceOp.AVG, group=self.dp_cp_group)
             loss_sum, trained = float(t[0]), int(round(float(t[1])))
         if self.pp_size > 1:
-            # **PP 下非 last stage 的 `losses_reduced` 是空的**（mcore schedules 只在
-            # last stage 调 loss_func），照直返回会让 rank 0（first stage）报 loss=0 ——
-            # 那不是算错，是"这个数在别的进程里"。源在 last stage 上记日志
-            # （loss.py:431 / model.py:279 都有 `is_pipeline_last_stage` 守卫）；
-            # nano 多广播一步，让任一 rank 都能拿到同一个数，验收脚本才不必关心自己是哪个 stage。
-            # **纯报告用**，与梯度无关。
             t = torch.tensor([loss_sum, float(trained)], device=self.device)
             dist.broadcast(t, src=dist.get_process_group_ranks(self.pp_group)[-1],
                            group=self.pp_group)
             loss_sum, trained = float(t[0]), int(round(float(t[1])))
+
+        # FLOPs 计算（逐样本精确算，不含 padding 浪费）。
+        from toy_rl.utils.flops_utils import calculate_fwd_flops
+        seqlens = [len(s["tokens"]) for s in samples]
+        fwd_flops = calculate_fwd_flops(seqlens, self.hf_config)
+        fwd_bwd_secs = timer.log_dict().get("forward_backward", 0.0)
+        tflops = 3 * fwd_flops / fwd_bwd_secs / 1e12 if fwd_bwd_secs > 0 else 0.0
 
         return {
             "loss": loss_sum,
             "grad_norm": float(grad_norm),
             "trained_samples": trained,
             "num_microbatches": len(batches),
+            "timer": timer.log_dict(),
+            "fwd_flops": fwd_flops,
+            "tflops": tflops,
         }
 
     def train_step(
