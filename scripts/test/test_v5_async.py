@@ -20,7 +20,13 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_HERE = Path(__file__).resolve()
+for _parent in _HERE.parents:
+    if (_parent / "toy_rl").is_dir():
+        sys.path.insert(0, str(_parent))
+        break
+else:
+    raise RuntimeError(f"Could not locate project root from {_HERE}")
 
 import ray
 

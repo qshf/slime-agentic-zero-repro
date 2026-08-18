@@ -141,6 +141,29 @@
       "console": "integratedTerminal",
       "subProcess": true,
       "justMyCode": false
+    },
+    {
+      "name": "V8.2 · Megatron TP=2 (2 GPU / 2 ranks, fp32)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "torch.distributed.run",
+      "args": [
+        "--nproc_per_node=2",
+        "scripts/test/test_v8.2_parallel.py",
+        "--fp32",
+        "--pp", "2",
+        "--backend", "nccl"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "NANO_MODEL_PATH": "/home/ubuntu/models/Qwen/Qwen3-0.6B",
+        "CUDA_VISIBLE_DEVICES": "2,3"
+      },
+      "console": "integratedTerminal",
+      "subProcess": true,
+      "justMyCode": false
     }
   ]
 }
