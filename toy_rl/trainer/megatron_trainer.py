@@ -651,10 +651,13 @@ class MegatronTrainer:
     def loss_func(self, batch: dict, logits: torch.Tensor):
         """logits → (缩放后的 loss, num_tokens, 日志 dict)。对齐源 loss.py:943 `loss_function`。
 
-        **缩放公式（对齐源 loss.py:1002-1005）**：
+        **本函数显式执行的缩放**（对齐源 loss.py:1002-1005）：
             loss × num_microbatches / global_batch_size × dp_size(with_cp)
+        注意：这里的 `× num_microbatches` 只有乘法；对应的
+        `output_tensor /= num_microbatches` 不在本函数，而是在 Megatron Core 的
+        pipeline schedule（`schedules.py:274`）中执行。两者合起来才是完整缩放。
         三个因子各自的理由：
-          - `× num_microbatches`：抵消 mcore 在 `forward_step_calc_loss` 里的
+          - `× num_microbatches`：抵消 mcore schedule 随后执行的
             `output_tensor /= num_microbatches`（schedules.py:274）。
           - `/ global_batch_size`：GRPO 的 loss 是「全局批的逐样本 mean 之和 / gbs」。
           - `× dp_size(with_cp)`：抵消梯度规约那一步的 `1/dp_cp`（源靠 mcore DDP 的
@@ -784,6 +787,9 @@ class MegatronTrainer:
         `gradient_scaling_factor = 1/dp_cp_size` 累积再 all-reduce，净效果 = 各 rank 贡献求和
         （所以源在 loss.py:1004 先 `× dp_size(with_cp)` 把这个 1/n 抵消掉）。
         nano 用 torch AdamW、无 DDP wrapper（V8 偏离 #7 的连带后果），**必须手写这一步**。
+
+        注意：本函数只负责 DP×CP 梯度的 AVG 规约；`num_microbatches` 的除法由
+        Megatron Core 的 pipeline schedule 完成，不在这里执行。
 
         **CP 下这不是可选项**：各 CP rank 只持有序列的一部分 token，它们对同一份权重的
         梯度是**部分和**。漏掉 → 又一个"前向对、梯度错"（且 loss 值也只是部分和）。
