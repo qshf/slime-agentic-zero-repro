@@ -216,7 +216,12 @@ def _run_megatron(samples: list[dict], model_path: str, num_layers: int,
         params_dtype=dtype,
         attention_backend=attention_backend,
     )
-    result = trainer.train_batch(samples, global_batch_size=len(samples))
+    # _microbatch_backward: forward + loss + backward，**无 clip_grad、无 optimizer.step**。
+    # train_batch 会在返回前调 clip_grad_norm_，读出来的梯度已被截断，与 TorchActor 的原始
+    # 梯度不可比。_microbatch_backward 绕过 mcore 调度器故不触发 finalize_model_grads_func，
+    # 这里手动补调（TP=1 PP=1 下三处 all-reduce 都是 no-op，但对齐完整路径）。
+    loss_val, _ = trainer._microbatch_backward(samples, global_batch_size=len(samples))
+    trainer._finalize_model_grads()
 
     # 梯度以 Megatron 分片形式存在 → 按 HF 名空间重建全量梯度 dict
     from transformers import AutoConfig
@@ -234,7 +239,7 @@ def _run_megatron(samples: list[dict], model_path: str, num_layers: int,
             grads_hf[hf_name] = tensor.cpu()
 
     dist.destroy_process_group()
-    return grads_hf, float(result["loss"])
+    return grads_hf, loss_val
 
 
 # ---------------------------------------------------------------------------

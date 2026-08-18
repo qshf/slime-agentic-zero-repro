@@ -367,7 +367,11 @@ class MegatronTrainer:
             parallel_output=True,
             share_embeddings_and_output_weights=self.tie,
         )
-        self.model = model.cuda()
+        # 源的 Apex FusedRMSNorm 在 build 时就尊重 TransformerConfig.params_dtype；
+        # 本机 Apex 未装，mcore fallback 到 torch.nn.RMSNorm，后者初始化为 fp32
+        # 且不读 config.params_dtype。不显式 cast 会导致 norm 权重停在 fp32，
+        # 与 bf16 激活产生 dtype mismatch → 精度门 loss 偏离 0.28+。
+        self.model = model.cuda().to(params_dtype)
         self.model.train()
 
         # 源 model.py:539 把 mcore 的 finalize_model_grads 挂到 config 上，由
