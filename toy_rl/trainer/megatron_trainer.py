@@ -936,3 +936,30 @@ class MegatronTrainer:
         from toy_rl.trainer.megatron_to_hf import megatron_to_hf_state_dict
 
         return megatron_to_hf_state_dict(self.model, self.hf_config, self.tie)
+
+    def save_pretrained(self, save_path: str) -> None:
+        """HF 格式落盘，供 SGLang disk reload 重载权重。对齐 WeightUpdater.update_weights 的调用约定。
+
+        偏离源（登记见 docs/decisions/v9.md）：
+          源 megatron_utils 走 tensor 广播到 SGLang 内存（update_weights_from_distributed），
+          不落盘。nano 沿用 V6/V7 的 disk reload 最小路径：先 to_hf_state_dict 转换 +
+          gather（集体操作，所有 rank 必须进），再 rank0 写盘。语义等价；disk I/O 是额外开销。
+
+        集体操作约定（对齐 FSDPTrainer.save_pretrained / WeightUpdater rank 门控）：
+          to_hf_state_dict 内含 all_gather + broadcast，所有 rank 都要调；
+          只有 rank0 真正写盘（与 fsdp 路径一致，WeightUpdater 会 fan-out 到每个 rank）。
+        """
+        import os
+
+        from transformers import AutoTokenizer
+
+        # 集体操作：所有 rank 参与（TP-gather + PP-broadcast 在内部）
+        state_dict = self.to_hf_state_dict()
+
+        if self.rank == 0:
+            os.makedirs(save_path, exist_ok=True)
+            # HF 格式写盘：config + tokenizer 从原始模型路径复制，权重用转换后的 state_dict
+            self.hf_config.save_pretrained(save_path)
+            tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+            tokenizer.save_pretrained(save_path)
+            torch.save(state_dict, os.path.join(save_path, "pytorch_model.bin"))

@@ -1,17 +1,20 @@
-"""V3/V6/V7.3: Trainer —— "谁负责训" 的角色。
+"""V3/V6/V7.3/V9: Trainer —— "谁负责训" 的角色。
 
 对齐源项目 actor（slime/backends/fsdp_utils/actor.py）的**角色与签名**：
   - train(rollout_id, rollout_data) : actor.py:437，消费 RolloutManager 产的 train_data dict
   - update_weights()                : actor.py:725，训练后把权重同步回推理引擎
 
-三个后端（args.train_backend）：
+四个后端（args.train_backend）：
   - "fake"（V0-A3/离线，默认）：不 forward/backward，只消费 train_data 结构 + 产可断言指标。
   - "torch"（V6.3）：单卡真 forward/backward/optimizer 一步，loss 对齐源 ppo_utils.compute_policy_loss
     + fsdp_utils/actor.py 的 sum_of_sample_mean。单卡纯 torch（不 FSDP/offload，见 v6.md 偏离表）。
   - "fsdp"（V7.3）：FSDP2 分片后端跑在 Ray actor 里、真 torch.distributed 进程组。loss 数学与
     torch 后端**完全相同**（同一 GRPO policy gradient），只换执行后端为分片 + 跨 rank DP。
+  - "megatron"（V9）：MegatronTrainer TP×PP×CP 并行后端。dist.init_process_group 在
+    MegatronTrainer.__init__ 内部完成（env 由 RayTrainGroup actor init 提前设好）。
+    DP-split 方式与 fsdp 一致；WeightUpdater.save_pretrained 走 to_hf_state_dict 落盘。
 
-偏离说明（docs/decisions/{v3,v6,v7}.md 偏离表）：
+偏离说明（docs/decisions/{v3,v6,v7,v9}.md 偏离表）：
   - fake 后端不算真梯度（主线一聚焦系统骨架）；torch 补单卡真训练一步；fsdp 补分布式分片。
   - 关 KL/entropy（nano 取最简，语义是纯 GRPO policy gradient）。
 """
@@ -55,8 +58,9 @@ class Trainer:
         self.args = args
         self.rank = rank            # V7.3 fsdp：本 rank 号（fake/torch 恒 0）
         self.world_size = world_size  # V7.3 fsdp：DP world_size（fake/torch 恒 1）
-        self._torch_actor = None    # V6 单卡 torch 后端
-        self._fsdp_trainer = None   # V7.3 FSDP 分片后端
+        self._torch_actor = None       # V6 单卡 torch 后端
+        self._fsdp_trainer = None      # V7.3 FSDP 分片后端
+        self._megatron_trainer = None  # V9 Megatron TP×PP×CP 后端
 
         if args.train_backend == "torch":
             # 延迟导入：torch/transformers 只在服务器装（optional [train]）。
@@ -81,16 +85,41 @@ class Trainer:
             # FSDPTrainer 自己知道真实 rank（从 dist 读），以它为准。
             self.rank = self._fsdp_trainer.rank
             self.world_size = self._fsdp_trainer.world_size
+        elif args.train_backend == "megatron":
+            # MegatronTrainer.__init__ 读 actor 设的 RANK/WORLD_SIZE/LOCAL_RANK env 并
+            # dist.init_process_group（多卡 nccl / 单卡 gloo）。
+            # 与 fsdp 路径对称：dist init 在 MegatronTrainer 内部，Trainer 只构造它。
+            from toy_rl.trainer.megatron_trainer import MegatronTrainer
+
+            self._megatron_trainer = MegatronTrainer(
+                model_path=args.train_model_path,
+                lr=args.train_lr,
+                eps_clip=args.eps_clip,
+                eps_clip_high=args.eps_clip_high,
+                clip_grad=args.clip_grad,
+                global_batch_size=args.global_batch_size,
+                tensor_model_parallel_size=args.tensor_model_parallel_size,
+                pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+                context_parallel_size=args.context_parallel_size,
+            )
+            self.rank = self._megatron_trainer.rank
+            self.world_size = self._megatron_trainer.world_size
 
         # 权重同步委托给独立角色（对齐源 actor 持有权重同步机制）。
-        # torch/fsdp 后端把可训模型交给 WeightUpdater 落盘供 SGLang reload。
-        train_actor = self._fsdp_trainer if self._fsdp_trainer is not None else self._torch_actor
-        self.weight_updater = WeightUpdater(
-            save_path=args.weight_save_path if args.train_backend in ("torch", "fsdp") else None,
-            torch_actor=train_actor,
-            rank=self.rank,  # V7.3：fsdp 的 save 是集体操作，但落盘 + SGLang POST 只 rank0
+        # torch/fsdp/megatron 后端把可训模型交给 WeightUpdater 落盘供 SGLang reload。
+        train_actor = (
+            self._megatron_trainer
+            if self._megatron_trainer is not None
+            else self._fsdp_trainer
+            if self._fsdp_trainer is not None
+            else self._torch_actor
         )
-        if args.train_backend in ("torch", "fsdp"):
+        self.weight_updater = WeightUpdater(
+            save_path=args.weight_save_path if args.train_backend in ("torch", "fsdp", "megatron") else None,
+            torch_actor=train_actor,
+            rank=self.rank,  # fsdp/megatron 的 save 是集体操作，但落盘 + SGLang POST 只 rank0
+        )
+        if args.train_backend in ("torch", "fsdp", "megatron"):
             # 训练后落盘的权重由 SGLang 从 disk 热重载（disk reload 最小路径，见 weight_sync 注释）。
             self.weight_updater.generate_url = args.sglang_generate_url
 
@@ -126,6 +155,23 @@ class Trainer:
             metrics.update(self._torch_actor.train_step(rollout_data))
             if trace:
                 self._fill_trace(metrics, rollout_data, batch_prep=0.0, compute=time.perf_counter() - t0)
+            return metrics
+
+        if self._megatron_trainer is not None:
+            # 列 dict → 逐样本 list，再按 rank DP-split（与 fsdp 路径完全对称）。
+            # MegatronTrainer 内部有 TP/PP/CP；外层只需按 DP 维 rank-split。
+            t0 = time.perf_counter() if trace else 0.0
+            all_samples = _rollout_data_to_samples(rollout_data)
+            gbs = max(len(all_samples), 1)
+            local_samples = all_samples[self.rank :: self.world_size]
+            t_prep = (time.perf_counter() - t0) if trace else 0.0
+            t1 = time.perf_counter() if trace else 0.0
+            if local_samples:
+                metrics.update(self._megatron_trainer.train_batch(local_samples, global_batch_size=gbs))
+            else:
+                metrics.update({"loss": 0.0, "grad_norm": 0.0, "trained_samples": 0})
+            if trace:
+                self._fill_trace(metrics, rollout_data, batch_prep=t_prep, compute=time.perf_counter() - t1)
             return metrics
 
         if self._fsdp_trainer is not None:

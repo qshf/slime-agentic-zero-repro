@@ -99,6 +99,10 @@ class Args:
     # "fsdp"=FSDP2 分片后端跑在 Ray actor 里、真 torch.distributed 进程组（V7.3）。
     train_backend: str = "fake"
     fsdp_world_size: int = 1      # V7.3 FSDP 后端的 DP world_size（Ray 起几个训练 actor / 用几张卡）
+    # V9 Megatron 并行度（对齐 MegatronTrainer.__init__ 同名参数；未启用时保持默认 1 零回归）。
+    tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    context_parallel_size: int = 1
     # V7.5/V7.6 opt-in sequence packing（默认 False → V7.0/V7.2 padding 路径不变、零回归）。
     # 三态（V7.6 从 bool 扩成字符串；False/"" 仍是默认关闭，V7.5 的 True 等价于 "mask"）：
     #   False/""  padding：逐样本一行 [B,L]（V7.0/V7.2 路径）。
