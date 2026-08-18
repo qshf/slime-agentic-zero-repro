@@ -6,29 +6,29 @@
 用法（容器内，`NANO_MODEL_PATH` 指向 Qwen3-0.6B）：
 
     # 基线（1 卡）——G1/G2/G3/G4 都跟它比
-    torchrun --nproc_per_node=1 scripts/test_v8.2_parallel.py --fp32 --dump /tmp/v82_base.pt
+    torchrun --nproc_per_node=1 scripts/test/test_v8.2_parallel.py --fp32 --dump /tmp/v82_base.pt
 
     # G1 NCCL 基线：换后端不改数学（2 卡，TP=2）
-    torchrun --nproc_per_node=2 scripts/test_v8.2_parallel.py --fp32 --tp 2 --backend nccl \
+    torchrun --nproc_per_node=2 scripts/test/test_v8.2_parallel.py --fp32 --tp 2 --backend nccl \
         --dump /tmp/v82_tp2.pt --compare /tmp/v82_base.pt
 
     # G2 PP：**本版最硬的门**（2 卡，PP=2）——抓 tie 的 embedding 漏规约
-    torchrun --nproc_per_node=2 scripts/test_v8.2_parallel.py --fp32 --pp 2 --backend nccl \
+    torchrun --nproc_per_node=2 scripts/test/test_v8.2_parallel.py --fp32 --pp 2 --backend nccl \
         --dump /tmp/v82_pp2.pt --compare /tmp/v82_base.pt
 
     # G3 CP：**只能 bf16**（见下方"G3 为什么没有 fp32 档"），故拆成三步：
     #   G3a 先证 THD(packing) + TE spec 这条前向路径本身与 bshd 等价（CP=1，隔离变量）
-    torchrun --nproc_per_node=1 scripts/test_v8.2_parallel.py --backend nccl \
+    torchrun --nproc_per_node=1 scripts/test/test_v8.2_parallel.py --backend nccl \
         --qkv-format thd --te-spec --dump /tmp/v82_thd1.pt --compare /tmp/v82_base_bf16.pt
     #   G3b 再证 CP=2 与 CP=1 等价（唯一变量就是 CP）
-    torchrun --nproc_per_node=2 scripts/test_v8.2_parallel.py --cp 2 --backend nccl \
+    torchrun --nproc_per_node=2 scripts/test/test_v8.2_parallel.py --cp 2 --backend nccl \
         --qkv-format thd --dump /tmp/v82_cp2.pt --compare /tmp/v82_thd1.pt
     #   G3c negative control：把 2-chunk 对称切分换成朴素连续切分，**必须判红**
-    torchrun --nproc_per_node=2 scripts/test_v8.2_parallel.py --cp 2 --backend nccl \
+    torchrun --nproc_per_node=2 scripts/test/test_v8.2_parallel.py --cp 2 --backend nccl \
         --qkv-format thd --negative-control --compare /tmp/v82_thd1.pt
 
     # G4/G5/G6 组合（4 卡，TP=2 × PP=2）+ 拓扑断言 + PP 下的 HF 往返
-    torchrun --nproc_per_node=4 scripts/test_v8.2_parallel.py --fp32 --tp 2 --pp 2 \
+    torchrun --nproc_per_node=4 scripts/test/test_v8.2_parallel.py --fp32 --tp 2 --pp 2 \
         --backend nccl --topology --convert --dump /tmp/v82_combo.pt --compare /tmp/v82_base.pt
 
 判据（沿用 V7.5 的度量教训 + V8 的分层 gate）：
@@ -60,7 +60,13 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_HERE = Path(__file__).resolve()
+for _parent in _HERE.parents:
+    if (_parent / "toy_rl").is_dir():
+        sys.path.insert(0, str(_parent))
+        break
+else:
+    raise RuntimeError(f"Could not locate project root from {_HERE}")
 
 import torch
 import torch.distributed as dist
