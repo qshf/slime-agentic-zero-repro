@@ -205,13 +205,18 @@ def _run_megatron(samples: list[dict], model_path: str, num_layers: int,
     对齐 test_v8.0_megatron_tp.py 的 dump 范式：TP-gather + convert_qwen3_to_hf。
     """
     _clear_nvte_backend_env()
-    # use_te_spec 必须与 attention_backend 绑定：
-    # - flash 路径：TE spec + attention_mask=None（TE 内部生成 causal mask）。
-    #   local spec + flash 会把 [B,1,S,S] 显式 bool mask 传给 FA2 kernel，
-    #   FA2 不支持该格式 → 静默算错（实测 loss 偏 0.24，grad cosine 只有 0.90）。
-    # - unfused 路径（fp32）：TE 不支持 fp32，只能走 local spec + 显式 mask。
-    #   V8 精度门 G1/G2 就走这条，已验证正确。
-    use_te = (attention_backend == "flash")
+    # use_te_spec / qkv_format 约束：
+    # - bshd + local spec：_forward_logits 用纯 causal tril mask，不屏蔽 padding。
+    #   批内各样本长度不同（本门 5 条样本长 17-22），padding token 被当真实 token
+    #   参与 attention → logits 被污染 → loss 系统性偏高 ~1.76×（实测）。
+    # - thd（sequence packing）：所有样本按 cu_seqlens 拼接，flash varlen kernel
+    #   天然隔离各样本，无 padding、无污染。与 TorchActor 侧的 attention_mask
+    #   语义完全等价。flash 后端 + TE spec 是 thd 的正确路径（FA2 拒收 fp32 例外）。
+    # fp32/unfused 时 FA2 不可用，退回 bshd + local spec + batch_size=1 逐样本跑，
+    # 规避 padding 问题（单样本无 padding）。
+    fp32_mode = (attention_backend == "unfused")
+    use_te = not fp32_mode
+    qkv_fmt = "bshd" if fp32_mode else "thd"
     trainer = MegatronTrainer(
         model_path=model_path,
         lr=1e-6,
@@ -223,6 +228,7 @@ def _run_megatron(samples: list[dict], model_path: str, num_layers: int,
         params_dtype=dtype,
         attention_backend=attention_backend,
         use_te_spec=use_te,
+        qkv_format=qkv_fmt,
     )
     # _microbatch_backward: forward + loss + backward，**无 clip_grad、无 optimizer.step**。
     # train_batch 会在返回前调 clip_grad_norm_，读出来的梯度已被截断，与 TorchActor 的原始
