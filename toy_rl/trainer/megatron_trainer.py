@@ -140,6 +140,32 @@ def observed_attention_backend() -> str:
     return "unknown(未选中任何后端)"
 
 
+def _get_rotary_base(hf_config) -> float:
+    """HF config から RoPE theta を確実に取り出す。
+
+    新しい transformers バージョン（Qwen3 対応版）では rope_theta が
+    rope_scaling 辞書の中に nest されており、トップレベル属性には存在しない
+    (getattr(cfg, "rope_theta", 10000) → MISSING → fallback 10000)。
+    フォールバック順：
+      1. rope_scaling["rope_theta"]  — 新 transformers の Qwen3 Config
+      2. rope_scaling["base"]        — 一部のモデルが使う別名
+      3. rotary_emb_base             — 旧 Qwen2 世代
+      4. rope_theta                  — 多くの LLaMA 系モデル
+      5. 10000.0                     — 最終 fallback（ほぼ使われない）
+    """
+    rs = getattr(hf_config, "rope_scaling", None)
+    if isinstance(rs, dict):
+        if "rope_theta" in rs:
+            return float(rs["rope_theta"])
+        if "base" in rs:
+            return float(rs["base"])
+    for attr in ("rotary_emb_base", "rope_theta"):
+        v = getattr(hf_config, attr, None)
+        if v is not None:
+            return float(v)
+    return 10000.0
+
+
 def _build_transformer_config(
     hf_config,
     tp_size: int,
@@ -363,7 +389,7 @@ class MegatronTrainer:
             pre_process=self.is_first_stage,
             post_process=self.is_last_stage,
             position_embedding_type="rope",
-            rotary_base=getattr(self.hf_config, "rope_theta", 10000),
+            rotary_base=_get_rotary_base(self.hf_config),
             parallel_output=True,
             share_embeddings_and_output_weights=self.tie,
         )
