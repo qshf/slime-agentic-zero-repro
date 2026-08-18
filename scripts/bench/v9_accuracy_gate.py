@@ -36,6 +36,15 @@ for _parent in _HERE.parents:
 else:
     raise RuntimeError(f"Could not locate project root from {_HERE}")
 
+# TE + megatron の native library を transformers より**先に**ロードする。
+# _run_torch_actor が AutoModelForCausalLM を引くと cuDNN binding が確定し、
+# その後 MegatronTrainer.__init__ で megatron.core → TE の dlopen が
+# `libcudnn_engines_runtime_compiled.so.9: undefined symbol` で失敗する。
+# V8.0 は MegatronTrainer を先に構築するので自然に回避していた。
+# nano はここで明示的に eager import して同じ効果を得る。
+import transformer_engine  # noqa: F401 — side-effect: TE native lib loaded
+import megatron.core  # noqa: F401 — triggers full TE import chain
+
 import torch
 import torch.distributed as dist
 
