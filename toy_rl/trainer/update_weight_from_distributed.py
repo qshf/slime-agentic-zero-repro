@@ -1,19 +1,19 @@
-"""UpdateWeightFromTensor: 实际可行的免落盘权重同步（Gloo + Ray RPC）。
+"""UpdateWeightFromTensor: 实际可行的免落盘权重同步(Gloo + Ray RPC)。
 
-对齐源：slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+对齐源:slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
 
-工作流：
+工作流:
   1. 训练进程从 Megatron/HF 格式转到 HF state_dict
-  2. 按 dtype 分组打包成 FlattenedTensorBucket（序列化 CPU 传输）
+  2. 按 dtype 分组打包成 FlattenedTensorBucket(序列化 CPU 传输)
   3. 通过 HTTP POST 到 SGLang 的 /update_weights_from_tensor 端点
   4. SGLang 反序列化并热加载权重
 
-为何不用 NCCL（UpdateWeightFromDistributed）：
-  - 需要 SGLang engine 作为 Ray actor（支持 init_weights_update_group）
-  - 当前 SGLang 是独立服务，不在 Ray 管理下
+为何不用 NCCL(UpdateWeightFromDistributed):
+  - 需要 SGLang engine 作为 Ray actor(支持 init_weights_update_group)
+  - 当前 SGLang 是独立服务,不在 Ray 管理下
   - UpdateWeightFromTensor 是唯一立即可用的免落盘方案
 
-预期性能：2-5 秒（比 disk reload 25 秒快 5-12×）
+预期性能:2-5 秒(比 disk reload 25 秒快 5-12×)
 
 from __future__ import annotations
 
@@ -30,12 +30,12 @@ except ImportError:
 
 
 class UpdateWeightFromTensor:
-    """通过 HTTP 发送序列化 tensor 到 SGLang (免落盘，实际可行)。"""
+    """通过 HTTP 发送序列化 tensor 到 SGLang (免落盘,实际可行)。"""
 
     def __init__(self, trainer, sglang_url: str):
         """
-        trainer: 训练器实例（MegatronTrainer / FSDPTrainer / TorchActor）
-        sglang_url: SGLang /generate 端点（替换为 /update_weights_from_tensor）
+        trainer: 训练器实例(MegatronTrainer / FSDPTrainer / TorchActor)
+        sglang_url: SGLang /generate 端点(替换为 /update_weights_from_tensor)
         """
         if FlattenedTensorBucket is None:
             raise ImportError("需要安装 sglang 才能使用 UpdateWeightFromTensor")
@@ -47,7 +47,7 @@ class UpdateWeightFromTensor:
 
     @torch.no_grad()
     def update_weights(self):
-        """免落盘同步权重（HTTP POST 序列化 tensor）。"""
+        """免落盘同步权重(HTTP POST 序列化 tensor)。"""
         self.weight_version += 1
 
         # 1. 获取 HF state_dict
@@ -66,7 +66,7 @@ class UpdateWeightFromTensor:
         # 2. 按 dtype 分组打包
         named_tensors_by_dtype = {}
         for name, tensor in hf_state_dict.items():
-            # 移到 CPU（序列化传输）
+            # 移到 CPU(序列化传输)
             if hasattr(tensor, "cuda") and tensor.is_cuda:
                 tensor = tensor.cpu()
 
@@ -88,7 +88,7 @@ class UpdateWeightFromTensor:
 
             # 4. HTTP POST 到 SGLang
             payload = {
-                "serialized_named_tensors": [serialized],  # SGLang 期望 list（支持多 TP rank）
+                "serialized_named_tensors": [serialized],  # SGLang 期望 list(支持多 TP rank)
                 "load_format": "flattened_bucket",
                 "weight_version": str(self.weight_version),
             }
