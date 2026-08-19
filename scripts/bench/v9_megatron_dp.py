@@ -110,8 +110,9 @@ def main() -> None:
         metrics, wall = run_mode(mode, args.dp_size, args.rounds)
         result = summarize(metrics, wall)
         results[mode] = result
+        generation_label = "gen" if mode == "sync" else "wait_gen"
         print(
-            f"{mode}: wait_gen={result['wait_gen_median']:.3f}s "
+            f"{mode}: {generation_label}={result['wait_gen_median']:.3f}s "
             f"train={result['train_median']:.3f}s "
             f"sync={result['sync_median']:.3f}s total={result['total']:.2f}s "
             f"wall={result['wall']:.1f}s"
