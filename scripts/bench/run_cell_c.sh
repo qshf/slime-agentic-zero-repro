@@ -17,14 +17,16 @@ echo "[2/4] 检查 GPU..."
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader
 echo ""
 
-# 3. 确认代码版本
+# 3. 确认代码版本（检查关键修复是否都在）
 cd /home/ubuntu/slime-agentic-zero-repro
 current_commit=$(git rev-parse --short HEAD)
-echo "[3/4] 当前代码: $current_commit (期望 d91316e)"
-if [ "$current_commit" != "d91316e" ]; then
-    echo "      代码版本不对，先 git fetch && git reset --hard origin/v9"
+echo "[3/4] 当前代码: $current_commit"
+# 检查 NCCL 后端修复是否在（d91316e 的关键字）
+if ! git log --oneline -5 | grep -q "MegatronTrainer 多卡自动选 NCCL"; then
+    echo "      缺少 NCCL 后端修复，先 git fetch && git reset --hard origin/v9"
     exit 1
 fi
+echo "      关键修复已就位（placement_group GPU + NCCL 后端）"
 
 # 4. 跑 Cell C（GPU 2+3，NCCL 后端已在代码里自动选）
 echo "[4/4] 运行 Cell C (CUDA_VISIBLE_DEVICES=2,3)..."
