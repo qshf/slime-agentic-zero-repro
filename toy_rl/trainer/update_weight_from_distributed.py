@@ -30,7 +30,7 @@ except ImportError:
 
 
 class UpdateWeightFromTensor:
-    """通过 HTTP 发送序列化 tensor 到 SGLang（免落盘，实际可行）。"""
+    """通过 HTTP 发送序列化 tensor 到 SGLang (免落盘，实际可行)。"""
 
     def __init__(self, trainer, sglang_url: str):
         """
