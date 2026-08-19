@@ -70,7 +70,7 @@ def make_args(
     return args
 
 
-def _validate_workload(data: dict[str, Any]) -> None:
+def _validate_workload(data: dict[str, Any], *, require_trainable_rows: bool = True) -> None:
     required = ("tokens", "loss_masks", "rewards", "response_lengths", "rollout_log_probs")
     missing = [name for name in required if name not in data]
     if missing:
@@ -83,14 +83,34 @@ def _validate_workload(data: dict[str, Any]) -> None:
     ):
         if len(tokens) < 2 or len(mask) != len(tokens) or len(log_probs) != len(tokens):
             raise ValueError(f"invalid token-aligned row {index}")
-        if not any(mask):
+        if require_trainable_rows and not any(mask):
             raise ValueError(f"workload row {index} has no trainable tokens")
+
+
+def _drop_masked_rows(workload: dict[str, Any]) -> int:
+    """Remove GRPO groups that custom_convert correctly marked as no-signal."""
+    keep = [index for index, mask in enumerate(workload["loss_masks"]) if any(mask)]
+    dropped = len(workload["tokens"]) - len(keep)
+    row_columns = (
+        "tokens",
+        "loss_masks",
+        "rewards",
+        "response_lengths",
+        "rollout_log_probs",
+        "rollout_policy_versions",
+    )
+    for name in row_columns:
+        if name in workload:
+            workload[name] = [workload[name][index] for index in keep]
+    return dropped
 
 
 async def collect_workload(args) -> tuple[dict[str, Any], dict[str, Any]]:
     from mini_slime.rollout_manager import RolloutManager
 
     workload = await RolloutManager(args).generate(0, rollout_policy_version=0)
+    _validate_workload(workload, require_trainable_rows=False)
+    dropped_rows = _drop_masked_rows(workload)
     _validate_workload(workload)
     metadata = {
         "schema_version": 1,
@@ -99,6 +119,7 @@ async def collect_workload(args) -> tuple[dict[str, Any], dict[str, Any]]:
         "samples_per_prompt": args.n_samples_per_prompt,
         "rollout_temperature": args.rollout_temperature,
         "rows": len(workload["tokens"]),
+        "masked_rows_dropped": dropped_rows,
         "model_tokens": sum(len(tokens) for tokens in workload["tokens"]),
         "trainable_tokens": sum(sum(mask) for mask in workload["loss_masks"]),
         "raw_reward_mean": (

@@ -10,6 +10,7 @@ sys.path.insert(0, str(_ROOT))
 
 from mini_slime.args import Args
 from mini_slime.custom_convert import custom_convert
+from scripts.bench.v9_gsm8k_throughput import _drop_masked_rows, _validate_workload
 from toy_rl.agent.toolorchestra.gsm8k_throughput_rollout import _apply_output
 from toy_rl.agent.toolorchestra.rollout import GenOutput
 from toy_rl.sample import Sample
@@ -40,6 +41,11 @@ def main() -> int:
     assert data["grpo_group_count"] == 1
     assert data["grpo_active_group_count"] == 1
     assert data["rewards"][0] < 0 < data["rewards"][1]
+
+    masked = custom_convert(Args(n_samples_per_prompt=4), [_sample(True) for _ in range(4)])
+    _validate_workload(masked, require_trainable_rows=False)
+    assert _drop_masked_rows(masked) == 4
+    assert not masked["tokens"]
     print("V9 GSM8K throughput workload contract OK")
     return 0
 
