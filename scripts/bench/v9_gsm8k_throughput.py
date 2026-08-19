@@ -31,7 +31,13 @@ DIRECT_REWARD_PATH = "toy_rl.agent.toolorchestra.gsm8k_throughput_rollout.reward
 GRPO_CONVERT_PATH = "mini_slime.custom_convert.custom_convert"
 
 
-def make_args(backend: str, prompts: int, samples_per_prompt: int, dp_size: int):
+def make_args(
+    backend: str,
+    prompts: int,
+    samples_per_prompt: int,
+    dp_size: int,
+    gsm8k_local_dir: str | None,
+):
     from mini_slime.args import Args
 
     args = Args(
@@ -55,6 +61,8 @@ def make_args(backend: str, prompts: int, samples_per_prompt: int, dp_size: int)
         learner_trace=True,
         update_weights_interval=0,
     )
+    if gsm8k_local_dir:
+        args.gsm8k_local_dir = gsm8k_local_dir
     if backend == "megatron":
         args.tensor_model_parallel_size = 1
         args.megatron_data_parallel_size = dp_size
@@ -165,6 +173,11 @@ def main() -> None:
     parser.add_argument("--megatron-dp", type=int, default=1)
     parser.add_argument("--prompts", type=int, default=2)
     parser.add_argument("--samples-per-prompt", type=int, default=4)
+    parser.add_argument(
+        "--gsm8k-local-dir",
+        default=None,
+        help="directory containing train-00000-of-00001.parquet; required inside v9-dev unless mounted",
+    )
     parser.add_argument("--updates", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--require-active-grpo", action="store_true")
@@ -174,7 +187,13 @@ def main() -> None:
     if cli.prompts < 1 or cli.samples_per_prompt < 2 or cli.updates < 1 or cli.warmup < 0:
         parser.error("invalid workload or update size")
 
-    args = make_args(cli.backend, cli.prompts, cli.samples_per_prompt, cli.megatron_dp)
+    args = make_args(
+        cli.backend,
+        cli.prompts,
+        cli.samples_per_prompt,
+        cli.megatron_dp,
+        cli.gsm8k_local_dir,
+    )
     path = Path(cli.workload)
     workload = None
     metadata: dict[str, Any] = {}
