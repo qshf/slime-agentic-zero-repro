@@ -40,11 +40,15 @@ def create_placement_groups(args: Args) -> dict:
     """
     if not ray.is_initialized():
         # fsdp/megatron 后端要 Ray 调度 GPU 给训练 actor；fake/torch 无 GPU 调度需求（=0）。
-        # megatron world_size = tp × pp（V9.2 对齐 actor_group.py:120）。
+        # megatron world_size = TP × PP × DP（对齐 actor_group.py）。
         if args.train_backend == "fsdp":
             num_gpus = args.fsdp_world_size
         elif args.train_backend == "megatron":
-            num_gpus = args.tensor_model_parallel_size * args.pipeline_model_parallel_size
+            num_gpus = (
+                args.tensor_model_parallel_size
+                * args.pipeline_model_parallel_size
+                * args.megatron_data_parallel_size
+            )
         else:
             num_gpus = 0
         ray.init(

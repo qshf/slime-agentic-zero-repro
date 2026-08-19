@@ -74,19 +74,25 @@ def train(args: Args) -> list[dict]:
 
         # 4) 按 interval 同步权重（对齐 train_async.py:62-66）。换权重前先 sync 掉在途 generation，
         #    防止"在生成中途换权重"（源注释：sync generate before update weights）。
+        t_sync = 0.0
         if (rollout_id + 1) % args.update_weights_interval == 0:
+            t0 = time.time()
             rollout_data_curr = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None
             actor_model.update_weights()
+            t_sync = time.time() - t0
 
         metrics = {
             "rollout_id": rollout_id,
             "wait_gen_time": t_wait_gen,   # 等当前 gen 的 ray.get 耗时（异步下多半已被上一轮 train 藏掉）
             "train_time": t_train,          # train(N) 的 ray.get 耗时（≈ fake_train_seconds + IPC）
+            "sync_time": t_sync,
             "reward_mean": m["reward_mean"],
             "tokens_per_rollout": tokens,
             "weight_version": actor_model.weight_version(),
         }
+        if "loss" in m:
+            metrics["loss"] = m["loss"]
         metrics_log.append(metrics)
         print(
             f"[rollout {rollout_id}] "
