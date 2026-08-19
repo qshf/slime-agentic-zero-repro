@@ -68,7 +68,7 @@ def train(args: Args) -> list[dict]:
         # 3) 训 train(N)：此刻 gen(N+1) 正在另一个进程跑（对齐 train_async.py:42-47 无 critic 分支）
         t0 = time.time()
         train_metrics = ray.get(actor_model.async_train(rollout_id, rollout_data_curr))
-        m = train_metrics[0]  # DP=1，取 rank0
+        m = train_metrics[0]  # rank0 的指标；Megatron DP 时其 loss 已在 trainer 内跨 DP 平均。
         t_train = time.time() - t0
         tokens = sum(rollout_data_curr["response_lengths"])  # 在 update 块把 curr 改掉之前先取
 

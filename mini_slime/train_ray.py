@@ -66,7 +66,7 @@ def train(args: Args) -> list[dict]:
         print(f"[rollout {rollout_id}] training...", flush=True)
         t0 = time.time()
         train_metrics = ray.get(actor_model.async_train(rollout_id, rollout_data))
-        m = train_metrics[0]  # DP=1，取 rank0 的指标
+        m = train_metrics[0]  # rank0 的指标；Megatron DP 时其 loss 已在 trainer 内跨 DP 平均。
         t_train = time.time() - t0
 
         # 3) 同步权重回推理引擎（对齐 actor_model.update_weights()）

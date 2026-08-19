@@ -117,7 +117,7 @@ def main() -> None:
             f"wall={result['wall']:.1f}s"
         )
         print(
-            f"  loss={result['losses']} mean={result['loss_mean']:.6f} "
+            f"  pre-update PPO loss={result['losses']} mean={result['loss_mean']:.6f} "
             f"delta(first->last)={result['loss_delta']:.6f} tokens={result['tokens']}"
         )
 
@@ -126,7 +126,8 @@ def main() -> None:
     print(f"total async/sync = {async_['total'] / sync['total']:.3f}x")
     print(f"wall async/sync = {async_['wall'] / sync['wall']:.3f}x")
     print(f"loss mean async-sync = {async_['loss_mean'] - sync['loss_mean']:.6f}")
-    print("Note: loss comparison is meaningful only when token batches match; inspect tokens above.")
+    print("Note: compare pre-update loss only when token batches and rollout policy versions match; "
+          "on-policy first-pass PPO commonly yields loss=-reward_mean.")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
