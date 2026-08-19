@@ -56,6 +56,13 @@ def train(args: Args) -> list[dict]:
             validate_train_data(rollout_data)
 
         # 2) 训：fan-out 到 worker actor 们，ray.get 是同步点（对齐 ray.get(actor_model.async_train(...))）
+        token_lengths = [len(tokens) for tokens in rollout_data["tokens"]]
+        response_lengths = rollout_data["response_lengths"]
+        print(
+            f"[rollout {rollout_id}] samples={len(token_lengths)} "
+            f"token_lengths={token_lengths} response_lengths={response_lengths}",
+            flush=True,
+        )
         print(f"[rollout {rollout_id}] training...", flush=True)
         t0 = time.time()
         train_metrics = ray.get(actor_model.async_train(rollout_id, rollout_data))

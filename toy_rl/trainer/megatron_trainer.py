@@ -887,6 +887,12 @@ class MegatronTrainer:
         seq_length = packed_length = None
         if self.qkv_format == "bshd":
             longest = max(len(s["tokens"]) for s in samples)
+            max_sequence_length = getattr(self.config, "max_sequence_length", None)
+            if max_sequence_length is not None and longest > max_sequence_length:
+                raise ValueError(
+                    f"sample sequence length {longest} exceeds model max_sequence_length "
+                    f"{max_sequence_length}; refusing an unbounded Megatron step"
+                )
             unit = 2 * self.cp_size
             seq_length = ((longest + unit - 1) // unit) * unit
         else:
