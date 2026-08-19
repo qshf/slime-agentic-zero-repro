@@ -48,6 +48,9 @@ class Args:
     #     用 sleep **代表**我们没真跑的那段计算的 wall-clock，让 V5 的 overlap 可观测可断言。
     #     偏离登记见 docs/decisions/v5.md。
     fake_train_seconds: float = 0.0   # Trainer.train 模拟训练一步耗时；V5 打开以让 overlap 可观测
+
+    # --- V9+ 权重同步优化 ---
+    use_tensor_weight_sync: bool = False  # True=HTTP POST tensor（免落盘，2-5秒）；False=disk reload（默认，25秒）
     fake_gen_seconds: float = 0.0     # 离线 stub gen 模拟推理耗时；服务器真 SGLang 时恒为 0
 
     # --- A1 MemAgent 专属字段（对齐源 agentic/memagent/rollout.py 的 MEM_* 环境变量）---

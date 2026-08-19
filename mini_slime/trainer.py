@@ -115,13 +115,16 @@ class Trainer:
             if self._fsdp_trainer is not None
             else self._torch_actor
         )
+        use_tensor_sync = getattr(args, "use_tensor_weight_sync", False)
         self.weight_updater = WeightUpdater(
             save_path=args.weight_save_path if args.train_backend in ("torch", "fsdp", "megatron") else None,
             torch_actor=train_actor,
             rank=self.rank,  # fsdp/megatron 的 save 是集体操作，但落盘 + SGLang POST 只 rank0
+            use_tensor_http_sync=use_tensor_sync,
+            sglang_url=args.sglang_generate_url if use_tensor_sync else None,
         )
-        if args.train_backend in ("torch", "fsdp", "megatron"):
-            # 训练后落盘的权重由 SGLang 从 disk 热重载（disk reload 最小路径，见 weight_sync 注释）。
+        if args.train_backend in ("torch", "fsdp", "megatron") and not use_tensor_sync:
+            # disk reload 路径：训练后落盘的权重由 SGLang 从 disk 热重载
             self.weight_updater.generate_url = args.sglang_generate_url
 
     @property

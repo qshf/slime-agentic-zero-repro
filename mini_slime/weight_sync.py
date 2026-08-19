@@ -1,14 +1,14 @@
 """V3: WeightUpdater —— "谁负责把训练后权重同步回推理引擎" 的角色。
 
 对齐源项目 —— actor.update_weights()（slime/backends/fsdp_utils/actor.py:725）内部委托给一个
-权重同步机制（UpdateWeightFromDistributed / UpdateWeightFromTensor），把训练后权重 **bucket
+权重同步机制（UpdateWeightFromTensor / UpdateWeightFromDistributed），把训练后权重 **bucket
 -by-bucket 广播** 回 SGLang 推理引擎。这是"训练器 → 推理引擎"的桥。
 
 独立成文件（而非并进 trainer.py）的理由：让主线一的**三个角色**（RolloutManager 产数据 /
 Trainer 训 / WeightUpdater 同步权重）在文件层面就清晰可见——这正是 V3 的教学目标。源项目里
 它也是独立的一层（actor 只是调用方）。
 
-偏离说明（详见 docs/decisions/{v3,v6,v7}.md 偏离表）：
+偏离说明（详见 docs/decisions/{v3,v6,v7,v9}.md 偏离表）：
   - fake（V0-A3）：无真训练器 → 无真权重张量、无引擎句柄 → 无处广播。只 bump 版本号 + 计数。
   - V6.3 torch：走 **disk reload** 最小路径——训练后 save_pretrained 落盘 → SGLang
     /update_weights_from_disk 重载。源用 tensor/distributed bucket 广播（免落盘、更快），
@@ -16,6 +16,8 @@ Trainer 训 / WeightUpdater 同步权重）在文件层面就清晰可见——�
   - V7.3 fsdp：save_pretrained 是**集体操作**（各 rank gather 分片到 rank0），故所有 rank 都要
     调它；但落盘 + SGLang POST + 权威 version 只 rank0 一次（对齐源 actor.py:744-746 的
     barrier + if rank==0）。传入 rank 做门控。
+  - V9+ tensor HTTP：用 UpdateWeightFromTensor（免落盘，HTTP POST 序列化 tensor），
+    替代 disk reload。预期 2-5 秒（比 25 秒快 5-12×）。
 """
 
 from __future__ import annotations
@@ -24,32 +26,59 @@ from __future__ import annotations
 class WeightUpdater:
     """训练后权重 → 推理引擎的同步器。对齐源 actor.update_weights 委托的权重同步机制。"""
 
-    def __init__(self, save_path: str | None = None, torch_actor=None, rank: int = 0) -> None:
+    def __init__(
+        self,
+        save_path: str | None = None,
+        torch_actor=None,
+        rank: int = 0,
+        use_tensor_http_sync: bool = False,
+        sglang_url: str | None = None,
+    ) -> None:
         self.version = 0      # 当前推理引擎上的权重版本号（每同步一次 +1）
         self.num_syncs = 0    # 累计同步次数（供主循环打点/断言）
         self.save_path = save_path      # V6.3 torch / V7.3 fsdp：落盘路径（None=fake，不落盘）
-        self.torch_actor = torch_actor  # 持有可训模型（TorchActor / FSDPTrainer），用于 save_pretrained
+        self.torch_actor = torch_actor  # 持有可训模型（TorchActor / FSDPTrainer / MegatronTrainer）
         self.rank = rank                # V7.3 fsdp：本 rank（集体 save，但落盘/POST 只 rank0）
         self.generate_url = None        # SGLang /update_weights_from_disk 端点（可选）
+
+        # V9+: HTTP tensor 同步路径（免落盘，实际可行）
+        self._tensor_updater = None
+        if use_tensor_http_sync and sglang_url:
+            from toy_rl.trainer.update_weight_from_distributed import UpdateWeightFromTensor
+            self._tensor_updater = UpdateWeightFromTensor(torch_actor, sglang_url)
 
     def update_weights(self, state_dict=None) -> int:
         """把训练后权重推回推理引擎。
 
-        源: 遍历权重 bucket，逐块广播到 SGLang engine（update_weights_from_distributed）。
+        源: 遍历权重 bucket，逐块广播到 SGLang engine（update_weights_from_tensor）。
         fake: 不接收/广播真张量，只推进版本号并计数。
         torch（V6.3）: save_pretrained 落盘 → 若配了 generate_url 则触发 SGLang /update_weights_from_disk。
         fsdp（V7.3）: **所有 rank** 调 save_pretrained（集体 gather 分片到 rank0），但只 **rank0** 落盘
                      （save_pretrained 内部已 rank0 门控）+ **rank0** POST SGLang（避免重复 reload）。
+        V9+ HTTP tensor: 直接 HTTP POST 序列化 tensor（免落盘，预期 2-5 秒）。
         返回新的权重版本号（各 rank 一致递增，rank0 权威）。
         """
-        if self.torch_actor is not None and self.save_path:
+        if self._tensor_updater:
+            # V9+: HTTP tensor 同步路径（只 rank0 发送）
+            if self.rank == 0:
+                self._tensor_updater.update_weights()
+                self.version = self._tensor_updater.weight_version
+            else:
+                # 非 rank0：只递增本地 version（与 rank0 保持同步）
+                self.version += 1
+        elif self.torch_actor is not None and self.save_path:
+            # 旧路径：disk reload
             # save_pretrained 对 fsdp 是集体操作：每个 rank 都必须进（内部只 rank0 真写盘）。
             self.torch_actor.save_pretrained(self.save_path)
             # SGLang 只有一个引擎、disk 上只有一份权重：只让 rank0 POST 一次触发 reload。
             if self.generate_url and self.rank == 0:
                 self._reload_sglang()
+            self.version += 1
+        else:
+            # fake 路径
+            self.version += 1
+
         self.num_syncs += 1
-        self.version += 1
         return self.version
 
     def _reload_sglang(self) -> None:
