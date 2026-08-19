@@ -39,8 +39,14 @@ def create_placement_groups(args: Args) -> dict:
     每个 num_gpus=1 的 actor 独占一张；driver 侧用 CUDA_VISIBLE_DEVICES 限定到 SGLang 未占的空闲卡）。
     """
     if not ray.is_initialized():
-        # fsdp 后端要 Ray 调度 GPU 给训练 actor；fake/torch 无 GPU 调度需求（=0）。
-        num_gpus = args.fsdp_world_size if args.train_backend == "fsdp" else 0
+        # fsdp/megatron 后端要 Ray 调度 GPU 给训练 actor；fake/torch 无 GPU 调度需求（=0）。
+        # megatron world_size = tp × pp（V9.2 对齐 actor_group.py:120）。
+        if args.train_backend == "fsdp":
+            num_gpus = args.fsdp_world_size
+        elif args.train_backend == "megatron":
+            num_gpus = args.tensor_model_parallel_size * args.pipeline_model_parallel_size
+        else:
+            num_gpus = 0
         ray.init(
             num_gpus=num_gpus,
             ignore_reinit_error=True,
