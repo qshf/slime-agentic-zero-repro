@@ -277,10 +277,13 @@ class MegatronTrainer:
                 f"CP>1 必须走 flash 后端（当前 {attention_backend!r}）——对齐源项目约定"
             )
 
-        # 通信后端：单卡多 rank 只能 gloo（NCCL 拒绝 duplicate GPU）；多卡传 "nccl"。
+        # 通信后端：world_size > 1 时自动用 NCCL（gloo TCP 在多卡 TP all-reduce 时不稳定），
+        # 单卡保留 gloo（V8/V9.1 单卡精度门的既有路径）。外层传入的 backend 参数在此自动覆盖。
         if not dist.is_initialized():
-            dist.init_process_group(backend=backend)
-        self.backend = backend
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            auto_backend = "nccl" if world_size > 1 else "gloo"
+            dist.init_process_group(backend=auto_backend)
+        self.backend = dist.get_backend()
 
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
