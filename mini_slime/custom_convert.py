@@ -144,6 +144,12 @@ def custom_convert(args, samples: list) -> dict:
             log_probs_list.append(full_log_probs)
             policy_versions.append(pv)  # V7.4：本 turn-row 继承父样本版本
 
+    # Keep source reward and group signal separate from the normalized training
+    # rewards. A policy loss cannot reveal whether all GRPO groups were masked.
+    active_group_count = sum(
+        any(keep_mask[g * n : (g + 1) * n]) for g in range(num_groups)
+    ) if n > 0 else 0
+
     return {
         "tokens": tokens_list,
         "loss_masks": loss_masks,
@@ -151,4 +157,7 @@ def custom_convert(args, samples: list) -> dict:
         "response_lengths": response_lengths,
         "rollout_log_probs": log_probs_list,
         "rollout_policy_versions": policy_versions,  # V7.4：与其它列逐行对齐（长度 = turn-row 数）
+        "raw_rewards": pref_rewards,
+        "grpo_group_count": num_groups,
+        "grpo_active_group_count": active_group_count,
     }

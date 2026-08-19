@@ -140,13 +140,17 @@ class Trainer:
         fsdp：本 rank 训自己那片（DP split）——真分片 + 跨 rank 梯度 reduce。
         """
         rewards = rollout_data["rewards"]
+        raw_rewards = rollout_data.get("raw_rewards", rewards)
         n_trainable = sum(sum(m) for m in rollout_data["loss_masks"])
         n_total = sum(rollout_data["response_lengths"])
         metrics = {
             "rollout_id": rollout_id,
             "reward_mean": sum(rewards) / len(rewards) if rewards else 0.0,
+            "raw_reward_mean": sum(raw_rewards) / len(raw_rewards) if raw_rewards else 0.0,
             "trainable_tokens": n_trainable,
             "total_tokens": n_total,
+            "grpo_group_count": int(rollout_data.get("grpo_group_count", 0)),
+            "grpo_active_group_count": int(rollout_data.get("grpo_active_group_count", 0)),
         }
         # V7.4 learner_trace（opt-in）：可测相位计时 + token 分母（源锚点 infra LearnerTrace）。
         # model_tokens = 全序列长度之和；compute 相位把 forward+backward 合并计（repo 未拆 log-prob 独立

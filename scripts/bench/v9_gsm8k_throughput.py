@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""V9 GSM8K learner-throughput benchmark with a collect/replay boundary.
+
+``collect`` obtains one fixed GRPO workload from SGLang and writes exact
+tokens, masks, old log-probabilities, and normalized advantages to JSON.
+``replay`` feeds that immutable workload repeatedly to one learner backend.
+This is the valid trainer-throughput comparison: every configuration sees the
+same THD segments and the same trainable-token denominator.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import statistics
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+MODEL_PATH = "/home/ubuntu/models/Qwen/Qwen3-0.6B"
+SGLANG_BASE_URL = "http://localhost:30000/v1"
+SGLANG_GENERATE_URL = "http://localhost:30000/generate"
+DIRECT_DATA_PATH = "toy_rl.agent.toolorchestra.gsm8k_data.load_data_source"
+DIRECT_GENERATE_PATH = "toy_rl.agent.toolorchestra.gsm8k_throughput_rollout.generate"
+DIRECT_REWARD_PATH = "toy_rl.agent.toolorchestra.gsm8k_throughput_rollout.reward_func"
+GRPO_CONVERT_PATH = "mini_slime.custom_convert.custom_convert"
+
+
+def make_args(backend: str, prompts: int, samples_per_prompt: int, dp_size: int):
+    from mini_slime.args import Args
+
+    args = Args(
+        train_backend=backend,
+        train_model_path=MODEL_PATH,
+        sglang_base_url=SGLANG_BASE_URL,
+        sglang_generate_url=SGLANG_GENERATE_URL,
+        orchestra_orchestrator_base_url=SGLANG_BASE_URL,
+        orchestra_orchestrator_model="Qwen/Qwen3-0.6B",
+        data_source_path=DIRECT_DATA_PATH,
+        custom_generate_function_path=DIRECT_GENERATE_PATH,
+        custom_rm_path=DIRECT_REWARD_PATH,
+        custom_convert_path=GRPO_CONVERT_PATH,
+        batch_size=prompts,
+        n_samples_per_prompt=samples_per_prompt,
+        gsm8k_num_train=max(prompts, 8),
+        rollout_temperature=0.7,
+        orchestra_max_tokens=192,
+        megatron_qkv_format="thd",
+        learner_contract_validate=True,
+        learner_trace=True,
+        update_weights_interval=0,
+    )
+    if backend == "megatron":
+        args.tensor_model_parallel_size = 1
+        args.megatron_data_parallel_size = dp_size
+    return args
+
+
+def _validate_workload(data: dict[str, Any]) -> None:
+    required = ("tokens", "loss_masks", "rewards", "response_lengths", "rollout_log_probs")
+    missing = [name for name in required if name not in data]
+    if missing:
+        raise ValueError(f"workload missing fields: {missing}")
+    rows = len(data["tokens"])
+    if rows == 0 or any(len(data[name]) != rows for name in required):
+        raise ValueError("workload columns must be non-empty and aligned")
+    for index, (tokens, mask, log_probs) in enumerate(
+        zip(data["tokens"], data["loss_masks"], data["rollout_log_probs"], strict=True)
+    ):
+        if len(tokens) < 2 or len(mask) != len(tokens) or len(log_probs) != len(tokens):
+            raise ValueError(f"invalid token-aligned row {index}")
+        if not any(mask):
+            raise ValueError(f"workload row {index} has no trainable tokens")
+
+
+async def collect_workload(args) -> tuple[dict[str, Any], dict[str, Any]]:
+    from mini_slime.rollout_manager import RolloutManager
+
+    workload = await RolloutManager(args).generate(0, rollout_policy_version=0)
+    _validate_workload(workload)
+    metadata = {
+        "schema_version": 1,
+        "model_path": args.train_model_path,
+        "prompts": args.batch_size,
+        "samples_per_prompt": args.n_samples_per_prompt,
+        "rollout_temperature": args.rollout_temperature,
+        "rows": len(workload["tokens"]),
+        "model_tokens": sum(len(tokens) for tokens in workload["tokens"]),
+        "trainable_tokens": sum(sum(mask) for mask in workload["loss_masks"]),
+        "raw_reward_mean": (
+            sum(workload.get("raw_rewards", [])) / len(workload.get("raw_rewards", []))
+            if workload.get("raw_rewards") else 0.0
+        ),
+        "grpo_group_count": workload.get("grpo_group_count", 0),
+        "grpo_active_group_count": workload.get("grpo_active_group_count", 0),
+    }
+    return workload, metadata
+
+
+def write_workload(path: Path, workload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"metadata": metadata, "workload": workload}, indent=2), encoding="utf-8")
+
+
+def load_workload(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    workload = payload["workload"]
+    _validate_workload(workload)
+    return workload, payload.get("metadata", {})
+
+
+def replay(args, workload: dict[str, Any], updates: int, warmup: int) -> dict[str, Any]:
+    import ray
+
+    from mini_slime.learner_contract import validate_train_data
+    from mini_slime.ray.placement_group import create_placement_groups, create_training_models
+
+    validate_train_data(workload)
+    create_placement_groups(args)
+    group, _ = create_training_models(args)
+    group.async_init(args)
+    records = []
+    try:
+        for update in range(updates):
+            t0 = time.perf_counter()
+            metrics = ray.get(group.async_train(update, workload))[0]
+            elapsed = time.perf_counter() - t0
+            records.append({"update": update, "wall_seconds": elapsed, **metrics})
+    finally:
+        ray.shutdown()
+
+    steady = records[warmup:] if len(records) > warmup else records
+    trainable = sum(sum(mask) for mask in workload["loss_masks"])
+    model_tokens = sum(len(tokens) for tokens in workload["tokens"])
+    steady_seconds = sum(record["wall_seconds"] for record in steady)
+    return {
+        "backend": args.train_backend,
+        "megatron_dp": args.megatron_data_parallel_size if args.train_backend == "megatron" else 1,
+        "updates": updates,
+        "warmup_updates": warmup,
+        "steady_updates": len(steady),
+        "model_tokens_per_update": model_tokens,
+        "trainable_tokens_per_update": trainable,
+        "median_step_seconds": statistics.median(record["wall_seconds"] for record in steady),
+        "trainable_tokens_per_second": trainable * len(steady) / steady_seconds if steady_seconds else 0.0,
+        "model_tokens_per_second": model_tokens * len(steady) / steady_seconds if steady_seconds else 0.0,
+        "median_loss": statistics.median(record.get("loss", 0.0) for record in steady),
+        "median_tflops": statistics.median(record.get("tflops", 0.0) for record in steady),
+        "records": records,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="V9 GSM8K fixed-workload learner throughput")
+    parser.add_argument("--collect", action="store_true", help="collect one real SGLang rollout workload")
+    parser.add_argument("--replay", action="store_true", help="replay the saved workload through a learner")
+    parser.add_argument("--workload", default="/tmp/v9_gsm8k_throughput.json")
+    parser.add_argument("--result", default="/tmp/v9_gsm8k_throughput_result.json")
+    parser.add_argument("--backend", choices=("torch", "megatron"), default="megatron")
+    parser.add_argument("--megatron-dp", type=int, default=1)
+    parser.add_argument("--prompts", type=int, default=2)
+    parser.add_argument("--samples-per-prompt", type=int, default=4)
+    parser.add_argument("--updates", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--require-active-grpo", action="store_true")
+    cli = parser.parse_args()
+    if not cli.collect and not cli.replay:
+        parser.error("choose --collect, --replay, or both")
+    if cli.prompts < 1 or cli.samples_per_prompt < 2 or cli.updates < 1 or cli.warmup < 0:
+        parser.error("invalid workload or update size")
+
+    args = make_args(cli.backend, cli.prompts, cli.samples_per_prompt, cli.megatron_dp)
+    path = Path(cli.workload)
+    workload = None
+    metadata: dict[str, Any] = {}
+    if cli.collect:
+        workload, metadata = asyncio.run(collect_workload(args))
+        write_workload(path, workload, metadata)
+        print(f"workload={path} rows={metadata['rows']} model_tokens={metadata['model_tokens']} "
+              f"trainable_tokens={metadata['trainable_tokens']} raw_reward={metadata['raw_reward_mean']:.3f} "
+              f"active_grpo={metadata['grpo_active_group_count']}/{metadata['grpo_group_count']}")
+        if cli.require_active_grpo and metadata["grpo_active_group_count"] == 0:
+            raise RuntimeError("collected workload has no active GRPO group; adjust temperature or prompt mix")
+    if cli.replay:
+        if workload is None:
+            workload, metadata = load_workload(path)
+        result = replay(args, workload, cli.updates, cli.warmup)
+        result["workload"] = str(path)
+        result["workload_metadata"] = metadata
+        result["cuda_visible_devices"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        Path(cli.result).write_text(json.dumps(result, indent=2), encoding="utf-8")
+        print(json.dumps({key: value for key, value in result.items() if key != "records"}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
