@@ -926,6 +926,12 @@ class MegatronTrainer:
         forward_backward_func = get_forward_backward_func()
         timer.start("forward_backward")
         torch.cuda.synchronize()  # 必须 sync，否则测的是 kernel launch 时间（V9 纪律）
+        print(
+            f"[Rank {self.rank}] forward_backward begin "
+            f"qkv={self.qkv_format} seq_length={batches[0]['seq_length']} "
+            f"microbatches={len(batches)}",
+            flush=True,
+        )
         losses_reduced = forward_backward_func(
             forward_step_func=self.forward_step,
             data_iterator=iter(batches),
@@ -937,6 +943,7 @@ class MegatronTrainer:
         )
         torch.cuda.synchronize()
         timer.end("forward_backward")
+        print(f"[Rank {self.rank}] forward_backward done", flush=True)
         # 注：_finalize_model_grads（三处 all-reduce）由 config.finalize_model_grads_func
         # 在 forward_backward_func 内部反向结束后自动触发，外层无调用点可包 timer。
         # 通信开销折叠在 forward_backward 计时里；V9.3 在 _finalize_model_grads 内部细分。
@@ -947,6 +954,7 @@ class MegatronTrainer:
         self.optimizer.step()
         torch.cuda.synchronize()
         timer.end("optimizer")
+        print(f"[Rank {self.rank}] optimizer done", flush=True)
 
         # loss 只在 last stage 算出；CP>1 时各 rank 只有部分和 —— 用与梯度同样的
         # AVG 规约还原成全量（× dp_cp 的缩放已在 loss_func 里做过）。
@@ -961,6 +969,7 @@ class MegatronTrainer:
             dist.broadcast(t, src=dist.get_process_group_ranks(self.pp_group)[-1],
                            group=self.pp_group)
             loss_sum, trained = float(t[0]), int(round(float(t[1])))
+        print(f"[Rank {self.rank}] train_batch done", flush=True)
 
         # FLOPs 计算（逐样本精确算，不含 padding 浪费）。
         from toy_rl.utils.flops_utils import calculate_fwd_flops
