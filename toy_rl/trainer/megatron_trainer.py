@@ -260,12 +260,19 @@ class MegatronTrainer:
         self.qkv_format = qkv_format
         assert qkv_format in ("bshd", "thd"), f"未支持的 qkv_format={qkv_format!r}"
 
-        # TE spec 默认跟着 CP 走：**CP 只有 TE 后端支持**（mcore
-        # dot_product_attention.py:57-59 对 local spec 直接 `assert cp == 1`）。
-        # TP-only 路径仍可用 local spec（V8 的既有路径，零回归）。
-        self.use_te_spec = (context_parallel_size > 1) if use_te_spec is None else use_te_spec
+        # TE spec 默认跟着 CP/THD 走：**CP 和 THD 只有 TE 后端支持**。
+        # mcore 的 local DotProductAttention 会直接拒绝 packed_seq_params；
+        # TP-only BSHD 路径仍可用 local spec（V8 的既有路径）。
+        self.use_te_spec = (
+            (context_parallel_size > 1 or qkv_format == "thd")
+            if use_te_spec is None
+            else use_te_spec
+        )
         assert context_parallel_size == 1 or self.use_te_spec, (
             "CP>1 必须用 TE spec（local spec 的 DotProductAttention assert cp==1）"
+        )
+        assert qkv_format != "thd" or self.use_te_spec, (
+            "THD packing 必须用 TE spec（local DotProductAttention 不支持 packed_seq_params）"
         )
         # **CP>1 时后端必须是 flash**：对齐源所有 megatron 训练脚本的 `--attention-backend flash`。
         # 历史原因：TE#3333（fused THD backward 在 sm_120 上静默算错，dq cosine~0.36）。
