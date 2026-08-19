@@ -2,7 +2,7 @@
 
 > 文档创建日期：2026-08-20  
 > 最后更新：2026-08-20  
-> 状态：实现完成，等待 SGLang 服务端验证
+> 状态：已在 5090 完成端到端验证
 
 ## 背景
 
@@ -29,7 +29,7 @@ V9.2 实验中发现权重同步（disk reload）是主要性能瓶颈：
 2. **UpdateWeightFromTensor (HTTP POST tensor)** ✅ **已实施**
    - 预期耗时：2-5 秒
    - 要求：SGLang 支持 `/update_weights_from_tensor` 接口
-   - 状态：✅ **代码已完成，等待验证**
+   - 状态：✅ **代码与端到端验证均已完成**
 
 ### 实施方案
 
@@ -94,7 +94,22 @@ git log --oneline -5
 5. ✅ **HTTP 连接** - 成功连接到 SGLang 服务（端口 30000）并发送请求
 6. ✅ **SGLang 接口存在** - 确认 SGLang 0.5.15.post1 包含 `/update_weights_from_tensor` 接口
 
-### ❌ 当前阻塞点
+### ✅ 2026-08-20 5090 端到端验证
+
+测试拓扑：SGLang 在 GPU 0，单卡 MegatronTrainer 在 `v9-dev` 容器的 GPU 1；`TP=1`，不执行 rollout 或训练，只验证一次完整权重同步。
+
+```text
+Weight sync completed
+Time: 5.33s
+New version: 1
+POST /update_weights_from_tensor -> 200 OK
+POST /v1/chat/completions -> 200 OK
+response metadata.weight_version = "1"
+```
+
+`5.33s` 低于原 disk reload 的约 25 秒，约为 `4.7x` 加速；略高于原先 2--5 秒的估计，首次 Megatron 到 HF state_dict 转换也包含在该测量内。服务在更新后仍可正常生成，说明端到端链路可用。
+
+### 已解决：历史 500 错误
 
 **SGLang 服务端返回 500 Internal Server Error**
 
@@ -108,19 +123,20 @@ git log --oneline -5
 
 **问题分析**：
 
+已由 SGLang 服务日志确认：这个端点虽然用 HTTP 接收控制请求，tensor 数据实际仍由 Python `multiprocessing.resource_sharer` 通过 Unix socket 和文件描述符传递。训练容器 `v9-dev` 与 SGLang 容器原先有两个隔离问题：
+
+1. SGLang 容器未挂载主机 `/tmp`，无法找到发送方 resource-sharer socket，报 `FileNotFoundError`。
+2. 两个容器各自生成不同的 multiprocessing `authkey`；共享 `/tmp` 后连接虽能建立，但报 `AuthenticationError: digest received was wrong`。
+
+修复：`ff72cfe` 为 SGLang 容器挂载 `/tmp`；`c2625cb` 在启动时生成权限为 `0600` 的 `/tmp/sglang_tensor_sync_authkey`，并让 SGLang scheduler 与训练侧同步前使用该 key。不需要额外的 SGLang post-training 启动参数，也不需要改变现有 `flattened_bucket` payload。
+
 1. **接口存在性**：✅ 已确认 SGLang 0.5.15.post1 包含该接口
    - 路径：`sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py`
    - 相关实现：`gpu_worker_post_training_mixin.py`、`weights_updater.py`、`scheduler_post_training_mixin.py`
 
-2. **可能的原因**：
-   - SGLang 启动时未启用 post-training 权重更新功能
-   - 需要特定的启动参数（如 `--enable-post-training`）
-   - Payload 格式与 SGLang 0.5.15.post1 的接口不匹配
-   - SGLang 服务端处理请求时出错（需要查看日志）
+2. **旧假设已排除**：无需 `--enable-post-training` 等额外启动参数；`flattened_bucket` payload 与本服务版本兼容。
 
-3. **验证困难**：
-   - 无法获取 SGLang 服务的详细错误日志
-   - SGLang 服务进程信息不可见（可能已停止）
+3. **服务日志可用**：`docker logs sglang-qwen3` 提供了上述服务端堆栈和成功请求记录。
 
 ## 使用方法
 
@@ -184,14 +200,14 @@ print('✓' if os.path.exists(weights_api) else '✗')
 
 ## 待办事项
 
-### 高优先级
+### 高优先级（前两项已完成）
 
-1. **重启 SGLang 服务并验证**
+1. ✅ **重启 SGLang 服务并验证**
    - 确保 SGLang 服务运行在端口 30000
    - 检查是否需要特定启动参数启用 post-training 功能
    - 重新运行 `test_tensor_sync.py` 验证完整链路
 
-2. **分析 500 错误根因**
+2. ✅ **分析 500 错误根因**
    - 查看 SGLang 服务日志获取详细错误堆栈
    - 确认 payload 格式是否与 SGLang 0.5.15.post1 接口匹配
    - 必要时调整 payload 格式或参数
