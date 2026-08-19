@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import timedelta
 from functools import partial
 from typing import Optional
 
@@ -277,27 +278,29 @@ class MegatronTrainer:
                 f"CP>1 必须走 flash 后端（当前 {attention_backend!r}）——对齐源项目约定"
             )
 
+        # Ray 为每个 actor 设置独立的 CUDA_VISIBLE_DEVICES。必须在 NCCL 建组和
+        # 第一次 barrier 之前绑定 actor 视角中的设备，否则 NCCL 会按 global rank
+        # 猜设备（rank1 在单卡可见环境中尤其危险），后续 collective 可能无限等待。
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device_count = torch.cuda.device_count()
+        self.local_rank = local_rank if 0 <= local_rank < device_count else 0
+        torch.cuda.set_device(self.local_rank)
+        self.device = torch.device("cuda", self.local_rank)
+
         # 通信后端：world_size > 1 时自动用 NCCL（gloo TCP 在多卡 TP all-reduce 时不稳定），
         # 单卡保留 gloo（V8/V9.1 单卡精度门的既有路径）。外层传入的 backend 参数在此自动覆盖。
         if not dist.is_initialized():
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             auto_backend = "nccl" if world_size > 1 else "gloo"
-            dist.init_process_group(backend=auto_backend)
+            dist.init_process_group(
+                backend=auto_backend,
+                timeout=timedelta(minutes=10),
+                device_id=self.device if auto_backend == "nccl" else None,
+            )
         self.backend = dist.get_backend()
 
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        # **device 绑定在单卡/多卡下语义相反，这一行两种情形都要对**：
-        #  - 多卡 torchrun：`--nproc_per_node=4` 给每个进程不同的 LOCAL_RANK，必须真绑不同卡，
-        #    否则 4 个进程全挤 GPU0 → 立刻 OOM，且 NCCL 会以 `Duplicate GPU detected` 拒绝。
-        #  - 单卡多 rank（V8 的 gloo 场景）/ Ray actor（V7.3，Ray 独占 CUDA_VISIBLE_DEVICES）：
-        #    LOCAL_RANK 可能超出可见设备数，fallback 到 0 才对。
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        device_count = torch.cuda.device_count()
-        self.local_rank = local_rank if local_rank < device_count else 0
-        torch.cuda.set_device(self.local_rank)
-        self.device = torch.device("cuda")
-
         self.tp_size = tensor_model_parallel_size or (
             self.world_size // (pipeline_model_parallel_size * context_parallel_size)
         )

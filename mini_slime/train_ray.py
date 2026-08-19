@@ -43,6 +43,7 @@ def train(args: Args) -> list[dict]:
     for rollout_id in range(args.num_rollout):
         # 1) 产数据：另一进程的 RolloutManager actor（对齐 rollout_data_ref = ray.get(...generate.remote)）
         #    V7.4（缺口 1）：把当时的权重版本传给 generate，戳到每条 Sample（None-safe，默认路径不启用校验）。
+        print(f"[rollout {rollout_id}] generating...", flush=True)
         t0 = time.time()
         cur_version = actor_model.weight_version()
         rollout_data = ray.get(rollout_manager.generate.remote(rollout_id, cur_version))
@@ -55,12 +56,14 @@ def train(args: Args) -> list[dict]:
             validate_train_data(rollout_data)
 
         # 2) 训：fan-out 到 worker actor 们，ray.get 是同步点（对齐 ray.get(actor_model.async_train(...))）
+        print(f"[rollout {rollout_id}] training...", flush=True)
         t0 = time.time()
         train_metrics = ray.get(actor_model.async_train(rollout_id, rollout_data))
         m = train_metrics[0]  # DP=1，取 rank0 的指标
         t_train = time.time() - t0
 
         # 3) 同步权重回推理引擎（对齐 actor_model.update_weights()）
+        print(f"[rollout {rollout_id}] updating weights...", flush=True)
         t0 = time.time()
         if (rollout_id + 1) % args.update_weights_interval == 0:
             actor_model.update_weights()
