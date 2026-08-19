@@ -18,6 +18,9 @@ Expected: 2-5 sec (vs disk reload 25 sec, 5-12x faster)
 
 from __future__ import annotations
 
+import multiprocessing as mp
+from pathlib import Path
+
 import requests
 import torch
 
@@ -47,6 +50,7 @@ class UpdateWeightFromTensor:
     @torch.no_grad()
     def update_weights(self):
         """Disk-free weight sync via HTTP POST."""
+        self._configure_resource_sharer_authkey()
         self.weight_version += 1
 
         # 1. Get HF state_dict
@@ -93,3 +97,10 @@ class UpdateWeightFromTensor:
             except Exception as e:
                 print(f"[UpdateWeightFromTensor] Send failed (dtype={dtype}): {e}")
                 raise
+
+    @staticmethod
+    def _configure_resource_sharer_authkey() -> None:
+        """Use SGLang's shared resource-sharer key when the engine is in Docker."""
+        path = Path("/tmp/sglang_tensor_sync_authkey")
+        if path.is_file():
+            mp.current_process().authkey = path.read_bytes().strip()

@@ -15,6 +15,7 @@ CONTAINER_MODEL_DIR="/models/Qwen3-0.6B"
 CONTAINER_NAME="sglang-qwen3"
 HOST_PORT=30000        # SGLang 默认端口，与源项目 agentic/agentflow/rollout.py 对齐
 GPUS="device=0"        # 单卡，V1 用 0.6B 够了
+TENSOR_SYNC_AUTHKEY_PATH="/tmp/sglang_tensor_sync_authkey"
 
 if [ ! -d "$HOST_MODEL_DIR" ]; then
     echo "ERROR: 本地模型目录不存在: $HOST_MODEL_DIR"
@@ -30,6 +31,13 @@ echo "    模型: $HOST_MODEL_DIR -> $CONTAINER_MODEL_DIR"
 echo "    端口: $HOST_PORT"
 echo "    GPU:  $GPUS"
 
+# SGLang's tensor endpoint uses multiprocessing's resource-sharer, even though
+# its control request arrives over HTTP. Keep one private authkey in the shared
+# /tmp mount so the trainer and the SGLang scheduler can authenticate that Unix
+# socket connection across their separate containers.
+umask 077
+openssl rand -hex 32 > "$TENSOR_SYNC_AUTHKEY_PATH"
+
 # `update_weights_from_tensor` serializes tensor storages through Python's
 # multiprocessing resource-sharer socket. The trainer runs in `v9-dev`,
 # which already bind-mounts host `/tmp`; SGLang must see that same socket
@@ -41,7 +49,7 @@ docker run -d \
     -v "$HOST_MODEL_DIR":"$CONTAINER_MODEL_DIR":ro \
     -v /tmp:/tmp \
     lmsysorg/sglang:latest \
-    python -m sglang.launch_server \
+    python -c 'import multiprocessing as mp, runpy; mp.current_process().authkey = open("/tmp/sglang_tensor_sync_authkey", "rb").read().strip(); runpy.run_module("sglang.launch_server", run_name="__main__")' \
         --model-path "$CONTAINER_MODEL_DIR" \
         --served-model-name "Qwen/Qwen3-0.6B" \
         --port "$HOST_PORT" \
