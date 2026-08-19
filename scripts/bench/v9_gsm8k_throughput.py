@@ -37,12 +37,13 @@ def make_args(
     samples_per_prompt: int,
     dp_size: int,
     gsm8k_local_dir: str | None,
+    model_path: str,
 ):
     from mini_slime.args import Args
 
     args = Args(
         train_backend=backend,
-        train_model_path=MODEL_PATH,
+        train_model_path=model_path,
         sglang_base_url=SGLANG_BASE_URL,
         sglang_generate_url=SGLANG_GENERATE_URL,
         orchestra_orchestrator_base_url=SGLANG_BASE_URL,
@@ -171,6 +172,11 @@ def main() -> None:
     parser.add_argument("--result", default="/tmp/v9_gsm8k_throughput_result.json")
     parser.add_argument("--backend", choices=("torch", "megatron"), default="megatron")
     parser.add_argument("--megatron-dp", type=int, default=1)
+    parser.add_argument(
+        "--model-path",
+        default=MODEL_PATH,
+        help="local model path; use /models/Qwen3-0.6B inside v9-dev",
+    )
     parser.add_argument("--prompts", type=int, default=2)
     parser.add_argument("--samples-per-prompt", type=int, default=4)
     parser.add_argument(
@@ -193,6 +199,7 @@ def main() -> None:
         cli.samples_per_prompt,
         cli.megatron_dp,
         cli.gsm8k_local_dir,
+        cli.model_path,
     )
     path = Path(cli.workload)
     workload = None
