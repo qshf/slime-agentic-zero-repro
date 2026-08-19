@@ -249,7 +249,7 @@ class MegatronTrainer:
         params_dtype=torch.bfloat16,
         use_te_spec: Optional[bool] = None,
         attention_backend: str = "flash",
-        qkv_format: str = "bshd",
+        qkv_format: str = "thd",
     ):
         self.model_path = model_path
         self.lr = lr

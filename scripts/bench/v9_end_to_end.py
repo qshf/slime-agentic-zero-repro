@@ -78,6 +78,7 @@ def make_args(
         fake_train_seconds=0.0,
         fake_gen_seconds=0.0,
         update_weights_interval=1,  # 先固定 1；后续扫 {1,2,4}
+        megatron_qkv_format="thd",  # V9：Megatron 统一 sequence packing，禁止 BSHD padding
         # opt-in trace → 捕获 policy_version_gap（同步路径才有，异步路径补 0）
         learner_trace=True,
         learner_contract_validate=False,

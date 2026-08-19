@@ -101,6 +101,7 @@ class Trainer:
                 tensor_model_parallel_size=args.tensor_model_parallel_size,
                 pipeline_model_parallel_size=args.pipeline_model_parallel_size,
                 context_parallel_size=args.context_parallel_size,
+                qkv_format=args.megatron_qkv_format,
             )
             self.rank = self._megatron_trainer.rank
             self.world_size = self._megatron_trainer.world_size

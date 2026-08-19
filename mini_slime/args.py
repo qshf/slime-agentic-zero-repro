@@ -103,6 +103,8 @@ class Args:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     context_parallel_size: int = 1
+    # V9 Megatron：统一走 THD sequence packing，避免 BSHD 按 batch 最长样本 padding。
+    megatron_qkv_format: str = "thd"
     # V7.5/V7.6 opt-in sequence packing（默认 False → V7.0/V7.2 padding 路径不变、零回归）。
     # 三态（V7.6 从 bool 扩成字符串；False/"" 仍是默认关闭，V7.5 的 True 等价于 "mask"）：
     #   False/""  padding：逐样本一行 [B,L]（V7.0/V7.2 路径）。
