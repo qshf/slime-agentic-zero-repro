@@ -338,6 +338,7 @@ class MegatronTrainer:
         self.cp_rank = mpu.get_context_parallel_rank()
         self.cp_group = mpu.get_context_parallel_group()
         self.dp_size = mpu.get_data_parallel_world_size()
+        self.dp_rank = mpu.get_data_parallel_rank()
         # **缩放/规约用的是 DP×CP 组**（源 loss.py:1004 `get_data_parallel_world_size(
         # with_context_parallel=True)`）：CP rank 之间持有同一批样本的不同 token 段，
         # 它们的梯度也是部分和，与 DP 一样要规约。

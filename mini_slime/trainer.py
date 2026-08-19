@@ -164,7 +164,12 @@ class Trainer:
             t0 = time.perf_counter() if trace else 0.0
             all_samples = _rollout_data_to_samples(rollout_data)
             gbs = max(len(all_samples), 1)
-            local_samples = all_samples[self.rank :: self.world_size]
+            # Megatron 的 global rank 包含 TP/PP/CP，不能用它做 DP 切分。
+            # TP-only（V9 Cell C）dp_size=1，因此所有 TP rank 必须拿到同一批样本，
+            # 保证 collective 的序列 shape 和 microbatch 顺序一致。
+            dp_rank = self._megatron_trainer.dp_rank
+            dp_size = self._megatron_trainer.dp_size
+            local_samples = all_samples[dp_rank::dp_size]
             t_prep = (time.perf_counter() - t0) if trace else 0.0
             t1 = time.perf_counter() if trace else 0.0
             if local_samples:
