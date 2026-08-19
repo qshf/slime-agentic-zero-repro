@@ -30,11 +30,16 @@ echo "    模型: $HOST_MODEL_DIR -> $CONTAINER_MODEL_DIR"
 echo "    端口: $HOST_PORT"
 echo "    GPU:  $GPUS"
 
+# `update_weights_from_tensor` serializes tensor storages through Python's
+# multiprocessing resource-sharer socket. The trainer runs in `v9-dev`,
+# which already bind-mounts host `/tmp`; SGLang must see that same socket
+# path for the disk-free HTTP path to work across the two containers.
 docker run -d \
     --name "$CONTAINER_NAME" \
     --gpus "$GPUS" \
     --network host \
     -v "$HOST_MODEL_DIR":"$CONTAINER_MODEL_DIR":ro \
+    -v /tmp:/tmp \
     lmsysorg/sglang:latest \
     python -m sglang.launch_server \
         --model-path "$CONTAINER_MODEL_DIR" \
