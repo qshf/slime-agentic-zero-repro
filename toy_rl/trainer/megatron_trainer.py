@@ -360,8 +360,12 @@ class MegatronTrainer:
 
         for i in range(self.world_size):
             if i == self.rank:
-                self.hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                self.hf_config = AutoConfig.from_pretrained(
+                    model_path, trust_remote_code=True, local_files_only=True
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_path, trust_remote_code=True, local_files_only=True
+                )
             dist.barrier()
 
         self.config = _build_transformer_config(
