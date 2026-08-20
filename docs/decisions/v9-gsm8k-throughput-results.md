@@ -169,11 +169,15 @@ TP=2 在统一微批后仍比 TP=1 慢约 **14.5%**，这才更接近本机无 N
 
 在同一节点 GPU 2、3 上进一步测试 Megatron TP=1 的 DP 扩展，`microbatch_size` 与 global batch 相同，前 10 个 update warmup，后 50 个统计：
 
-| global batch | DP=1 step | DP=1 trainable tok/s | DP=2 step | DP=2 trainable tok/s | DP=2 / DP=1 |
-|---:|---:|---:|---:|---:|---:|
-| 16 | 0.488 s | 4,958.2 | 0.833 s | 2,990.0 | 0.60x |
-| 32 | 0.906 s | 5,408.5 | 0.857 s | 5,795.2 | 1.07x |
+| global batch | 并行 | step | trainable tokens/s | model tokens/s | loss | TFLOPs |
+|---:|---|---:|---:|---:|---:|---:|
+| 16 | DP=1 | 0.488 s | 4,958.2 | 8,021.8 | 0.005829 | 31.80 |
+| 16 | DP=2 | 0.833 s | 2,990.0 | 4,837.5 | 0.006059 | 9.13* |
+| 32 | DP=1 | 0.906 s | 5,408.5 | 8,678.5 | 0.003262 | 33.28 |
+| 32 | DP=2 | 0.857 s | 5,795.2 | 9,299.0 | 0.003487 | 17.18* |
 
 结果说明：global batch=16 时，每个 DP rank 只有 8 条样本，梯度规约和双进程同步仍超过并行收益，DP=2 反而慢约 39.7%。global batch=32 时，每个 rank 有 16 条样本，DP=2 的 step time 已略低于 DP=1，trainable tokens/s 提升约 **7.1%**，说明该实现需要更大的本地 batch 才能摊薄通信固定开销。
 
 当前冻结 workload 只有 88 行：batch=16 实际使用 5 个完整 batch（80 行），batch=32 使用 2 个完整 batch（64 行），尾部短 batch 被刻意丢弃以保持形状固定；60 个 update 会循环这些 batch。因此这组数据适合判断趋势，不应视为大规模数据集上的最终扩展曲线。下一步若要稳定测 DP scaling，应采集至少数百行有效 rollout，并使用 global batch 32/64/128。
+
+表中 loss 是各后端独立初始化后短训练运行的中位数，只用于检查数值健康；TFLOPs 是当前实现按本地 rank forward FLOPs 和训练计时计算的诊断值，DP=2 不是全局有效 TFLOPs，不能直接与 DP=1 做严格算力效率比较。
