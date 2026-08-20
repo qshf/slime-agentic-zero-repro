@@ -185,6 +185,15 @@ def save_csv(results: dict[str, CellResult], path: Path) -> None:
     print(f"CSV -> {path}")
 
 
+def save_repeat_csv(rows: list[dict[str, float | int | str]], path: Path) -> None:
+    fields = ["label", "repeat", *CellResult._fields]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"repeat CSV -> {path}")
+
+
 def plot_2x2(results: dict[str, CellResult], path: Path) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -270,6 +279,7 @@ def main() -> None:
 
     cells = [cell for cell in CELLS if cli.cell is None or cell["id"] == cli.cell]
     results: dict[str, CellResult] = {}
+    repeat_rows: list[dict[str, float | int | str]] = []
     out_dir = Path(cli.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     for cell in cells:
@@ -282,6 +292,7 @@ def main() -> None:
             metrics = run_cell(cell["backend"], cell["mode"], cli)
             result = _extract_metrics(metrics, cli.warmup_rounds)
             runs.append(result)
+            repeat_rows.append({"label": label, "repeat": repeat + 1, **result._asdict()})
             print(
                 f"wall={time.perf_counter() - t0:.1f}s e2e_step={result.end_to_end_step_median:.3f}s "
                 f"trainable_tok/s={result.trainable_tokens_per_second:.1f} "
@@ -293,6 +304,7 @@ def main() -> None:
 
     print_table(results, cli.workload, cli.min_active_grpo_rate)
     save_csv(results, out_dir / "v9_end_to_end.csv")
+    save_repeat_csv(repeat_rows, out_dir / "v9_end_to_end_repeats.csv")
     plot_2x2(results, out_dir / "v9_end_to_end.png")
     quality_failed = (
         cli.workload == "gsm8k"
