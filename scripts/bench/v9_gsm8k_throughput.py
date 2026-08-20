@@ -61,6 +61,7 @@ def make_args(
     gsm8k_local_dir: str | None,
     model_path: str,
     prompt_indices: tuple[int, ...],
+    megatron_microbatch_size: int = 1,
 ):
     from mini_slime.args import Args
 
@@ -82,6 +83,7 @@ def make_args(
         rollout_temperature=0.7,
         orchestra_max_tokens=192,
         megatron_qkv_format="thd",
+        megatron_microbatch_size=megatron_microbatch_size,
         learner_contract_validate=True,
         learner_trace=True,
         update_weights_interval=0,
@@ -390,6 +392,12 @@ def main() -> None:
         default=0,
         help="rows per learner update during --replay; 0 replays the full workload",
     )
+    parser.add_argument(
+        "--megatron-microbatch-size",
+        type=int,
+        default=1,
+        help="samples per Megatron microbatch; set to learner batch size for one THD microbatch",
+    )
     parser.add_argument("--require-active-grpo", action="store_true")
     parser.add_argument(
         "--collect-warmup-batches",
@@ -425,6 +433,7 @@ def main() -> None:
         or cli.warmup < 0
         or cli.train_batch_size < 0
         or cli.collect_warmup_batches < 0
+        or cli.megatron_microbatch_size < 1
     ):
         parser.error("invalid workload or update size")
 
@@ -436,6 +445,7 @@ def main() -> None:
         cli.gsm8k_local_dir,
         cli.model_path,
         tuple(paper["indices"]),
+        cli.megatron_microbatch_size,
     )
     args.v9_paper_metadata = {
         "paper_id": paper.get("paper_id", paper_path.name),

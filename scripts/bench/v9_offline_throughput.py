@@ -111,6 +111,7 @@ def run_config(
         gsm8k_local_dir=cli.gsm8k_local_dir,
         model_path=cli.model_path,
         prompt_indices=tuple(range(prompts)),
+        megatron_microbatch_size=cli.megatron_microbatch_size,
     )
     if backend == "megatron":
         args.tensor_model_parallel_size = tp_size
@@ -145,6 +146,12 @@ def main() -> None:
         default=8,
         help="fixed rows per learner update; 8 is one GSM8K GRPO group in the supplied paper",
     )
+    parser.add_argument(
+        "--megatron-microbatch-size",
+        type=int,
+        default=1,
+        help="samples per Megatron microbatch; use 8 for one THD microbatch in this workload",
+    )
     parser.add_argument("--min-active-grpo-groups", type=int, default=8)
     parser.add_argument("--min-trainable-tokens", type=int, default=4096)
     parser.add_argument("--model-path", default=MODEL_PATH)
@@ -156,6 +163,7 @@ def main() -> None:
         or cli.warmup >= cli.updates
         or cli.runs < 1
         or cli.train_batch_size < 1
+        or cli.megatron_microbatch_size < 1
     ):
         parser.error("require valid updates, runs, and positive train batch size")
 
@@ -204,6 +212,7 @@ def main() -> None:
         "warmup": cli.warmup,
         "runs": cli.runs,
         "train_batch_size": cli.train_batch_size,
+        "megatron_microbatch_size": cli.megatron_microbatch_size,
         "results": results,
     }
     out_path = Path(cli.out)

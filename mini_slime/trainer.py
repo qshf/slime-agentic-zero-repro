@@ -195,7 +195,13 @@ class Trainer:
             t_prep = (time.perf_counter() - t0) if trace else 0.0
             t1 = time.perf_counter() if trace else 0.0
             if local_samples:
-                metrics.update(self._megatron_trainer.train_batch(local_samples, global_batch_size=gbs))
+                metrics.update(
+                    self._megatron_trainer.train_batch(
+                        local_samples,
+                        global_batch_size=gbs,
+                        microbatch_size=self.args.megatron_microbatch_size,
+                    )
+                )
             else:
                 metrics.update({"loss": 0.0, "grad_norm": 0.0, "trained_samples": 0})
             if trace:
