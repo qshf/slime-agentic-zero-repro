@@ -164,3 +164,16 @@ CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
 TP=2 在统一微批后仍比 TP=1 慢约 **14.5%**，这才更接近本机无 NVLink、PCIe 同 NUMA 通信的真实代价。DP=2 在本配置反而低于 DP=1：全局 batch 仍为 8，但每个 DP rank 只拿到 4 条样本，无法充分填满单卡；同时增加梯度规约和双进程同步，因此这个 batch 太小，不适合证明 DP 扩展性。后续 DP=2 应使用至少 16 或 32 的 global batch，并令每个 rank 有足够的本地 microbatch。
 
 该补充矩阵仍是短序列、0.6B 模型的吞吐诊断，不代表大模型生产配置。`--megatron-microbatch-size` 默认仍为 `1`，以保持旧实验和接口兼容。
+
+## 10. DP 扩展：global batch 16/32
+
+在同一节点 GPU 2、3 上进一步测试 Megatron TP=1 的 DP 扩展，`microbatch_size` 与 global batch 相同，前 10 个 update warmup，后 50 个统计：
+
+| global batch | DP=1 step | DP=1 trainable tok/s | DP=2 step | DP=2 trainable tok/s | DP=2 / DP=1 |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 0.488 s | 4,958.2 | 0.833 s | 2,990.0 | 0.60x |
+| 32 | 0.906 s | 5,408.5 | 0.857 s | 5,795.2 | 1.07x |
+
+结果说明：global batch=16 时，每个 DP rank 只有 8 条样本，梯度规约和双进程同步仍超过并行收益，DP=2 反而慢约 39.7%。global batch=32 时，每个 rank 有 16 条样本，DP=2 的 step time 已略低于 DP=1，trainable tokens/s 提升约 **7.1%**，说明该实现需要更大的本地 batch 才能摊薄通信固定开销。
+
+当前冻结 workload 只有 88 行：batch=16 实际使用 5 个完整 batch（80 行），batch=32 使用 2 个完整 batch（64 行），尾部短 batch 被刻意丢弃以保持形状固定；60 个 update 会循环这些 batch。因此这组数据适合判断趋势，不应视为大规模数据集上的最终扩展曲线。下一步若要稳定测 DP scaling，应采集至少数百行有效 rollout，并使用 global batch 32/64/128。
