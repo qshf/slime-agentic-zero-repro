@@ -120,3 +120,30 @@ CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
 离线 workload 采集使用一次完整的 SGLang batch `/generate` 请求（`text` 为所有 prompt 的数组）；预热 batch 丢弃，随后才冻结 JSON。响应逐行恢复到原始输入顺序，因此每题的多个采样仍在连续 GRPO 分组中。
 
 冻结的 workload 是数据池，不等于一次 learner update。离线矩阵以 `--train-batch-size 8` 循环消费连续的有效 GRPO 组，防止 Torch padding 后的全词表 logits 以 88 行同时驻留而 OOM；每种后端接受相同的 batch 顺序。
+
+## 8. 2026-08-20 节点内纯训练矩阵
+
+本轮在 `5090` 上重新执行四个后端，避免把跨 NUMA 的 GPU 对误当成 TP 对照：
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
+  .venv/bin/python -u scripts/bench/v9_offline_throughput.py \
+  --workload /tmp/v9_gsm8k_offline_throughput_batched.json \
+  --configs torch,megatron-tp1,megatron-tp2,megatron-tp1-dp2 \
+  --train-batch-size 8 --updates 60 --warmup 10 --runs 1
+```
+
+固定 workload 为 16 道题、每题 8 个 rollout；采样预热 1 个 batch 后冻结，过滤无训练信号的组，留下 88 行、11 个有效 GRPO 组和 14,223 个 trainable tokens。训练阶段每次使用 8 行（一个 GRPO 组），循环 60 update，前 10 个 warmup，后 50 个计入中位数。所有 Megatron 路径为 THD packed sequence。
+
+| 后端 | GPU/并行 | median step time | trainable tokens/s | model tokens/s | loss | TFLOPs |
+|---|---|---:|---:|---:|---:|---:|
+| TorchActor | GPU 2，DP=1 | 0.255 s | 5,052.0 | 8,202.6 | 0.007889 | 29.06 |
+| Megatron | TP=1，GPU 2 | 2.772 s | 465.3 | 755.4 | 0.007417 | 2.68 |
+| Megatron | TP=2，GPU 2、3 | 2.905 s | 436.2 | 708.1 | 0.007077 | 2.51 |
+| Megatron | TP=1、DP=2，GPU 2、3 | 1.814 s | 724.8 | 1,176.8 | 0.006966 | 2.07* |
+
+这里的 TP=2 两个 rank 实际分别落在物理 GPU 2 和 3。`nvidia-smi topo -m` 显示 GPU 2-3 为同 NUMA 的 `NODE` 路径；GPU 1-2 为跨 NUMA 的 `SYS`，未用于该实验。机器没有 `NV#` 链路，因此这是同节点 PCIe/Host Bridge 通信，不是 NVLink 通信。
+
+相对 Megatron TP=1，TP=2 的 trainable tokens/s 下降约 6.3%；在当前 0.6B、小 batch、单节点无 NVLink 的工作负载上，TP 通信和 Megatron 固定开销大于张量并行带来的计算收益。DP=2 的吞吐提升约 55.8%，但未达到线性 2 倍，主要受梯度规约、Ray/进程和小 batch 开销影响。Torch 单卡约为 Megatron TP=1 的 10.9 倍；该结论只代表本 benchmark 的小模型和 batch 配置，不能外推到大模型或高算力占用场景。
+
+四项 loss 均为有限值且量级接近，可作为训练路径健康检查；它们来自各自重新初始化模型后的短吞吐运行，不是收敛性或模型质量比较。DP=2 的 TFLOPs 仍按当前 rank 本地计时口径记录，和 DP=1 的全局口径未完全统一，不能单独据此判断算力效率。
