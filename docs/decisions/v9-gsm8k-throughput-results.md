@@ -181,3 +181,51 @@ TP=2 在统一微批后仍比 TP=1 慢约 **14.5%**，这才更接近本机无 N
 当前冻结 workload 只有 88 行：batch=16 实际使用 5 个完整 batch（80 行），batch=32 使用 2 个完整 batch（64 行），尾部短 batch 被刻意丢弃以保持形状固定；60 个 update 会循环这些 batch。因此这组数据适合判断趋势，不应视为大规模数据集上的最终扩展曲线。下一步若要稳定测 DP scaling，应采集至少数百行有效 rollout，并使用 global batch 32/64/128。
 
 表中 loss 是各后端独立初始化后短训练运行的中位数，只用于检查数值健康；TFLOPs 是当前实现按本地 rank forward FLOPs 和训练计时计算的诊断值，DP=2 不是全局有效 TFLOPs，不能直接与 DP=1 做严格算力效率比较。
+
+## 11. 实际执行命令记录
+
+以下命令均在远端 `5090` 主机执行，代码目录为 `/home/ubuntu/slime-agentic-zero-repro`，使用宿主 `.venv`；GPU 0 保留给 SGLang，训练使用物理 GPU 2、3。三次实验复用同一冻结 workload `/tmp/v9_gsm8k_offline_throughput_batched.json`。
+
+统一 microbatch=8 的四配置矩阵：
+
+```bash
+cd /home/ubuntu/slime-agentic-zero-repro
+nohup env CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
+  .venv/bin/python -u scripts/bench/v9_offline_throughput.py \
+  --workload /tmp/v9_gsm8k_offline_throughput_batched.json \
+  --out /tmp/v9_offline_throughput_mb8.json \
+  --configs torch,megatron-tp1,megatron-tp2,megatron-tp1-dp2 \
+  --train-batch-size 8 --megatron-microbatch-size 8 \
+  --updates 60 --warmup 10 --runs 1 \
+  > /tmp/v9_offline_throughput_mb8.log 2>&1 < /dev/null &
+```
+
+global batch=16 的 DP 扩展：
+
+```bash
+cd /home/ubuntu/slime-agentic-zero-repro
+nohup env CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
+  .venv/bin/python -u scripts/bench/v9_offline_throughput.py \
+  --workload /tmp/v9_gsm8k_offline_throughput_batched.json \
+  --out /tmp/v9_offline_throughput_dp_batch16.json \
+  --configs megatron-tp1,megatron-tp1-dp2 \
+  --train-batch-size 16 --megatron-microbatch-size 16 \
+  --updates 60 --warmup 10 --runs 1 \
+  > /tmp/v9_offline_throughput_dp_batch16.log 2>&1 < /dev/null &
+```
+
+global batch=32 的 DP 扩展：
+
+```bash
+cd /home/ubuntu/slime-agentic-zero-repro
+nohup env CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
+  .venv/bin/python -u scripts/bench/v9_offline_throughput.py \
+  --workload /tmp/v9_gsm8k_offline_throughput_batched.json \
+  --out /tmp/v9_offline_throughput_dp_batch32.json \
+  --configs megatron-tp1,megatron-tp1-dp2 \
+  --train-batch-size 32 --megatron-microbatch-size 32 \
+  --updates 60 --warmup 10 --runs 1 \
+  > /tmp/v9_offline_throughput_dp_batch32.log 2>&1 < /dev/null &
+```
+
+三次运行都使用 `updates=60`、`warmup=10`、`runs=1`；结果文件分别为 `/tmp/v9_offline_throughput_mb8.json`、`/tmp/v9_offline_throughput_dp_batch16.json` 和 `/tmp/v9_offline_throughput_dp_batch32.json`，对应日志文件名相同并以 `.log` 结尾。运行前曾执行 `git fetch origin && git reset --hard origin/v9`，确保远端代码与报告提交版本一致。
