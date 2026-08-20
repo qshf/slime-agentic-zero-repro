@@ -1,7 +1,7 @@
 # V9 GSM8K 吞吐实验结果
 
 > 测试日期：2026-08-20  
-> 状态：固定工作负载的训练吞吐已完成；在线端到端仅完成 A 格冒烟。B/C/D 的完整对比尚未执行，不能从本文推出 async 的最终加速比。  
+> 状态：固定工作负载与在线 A/B/C/D 正式矩阵均已完成。在线结果使用经验证的 HTTP tensor 权重发布，而不是历史 disk reload。
 > 历史参考：[`v9-results.md`](v9-results.md) 是 2026-08-19 的 calculator 原型记录。其中 async 总耗时漏计权重发布、`policy_version_gap` 接线错误，保留作排障历史，不作为本报告结论。
 
 ## 1. 目的和判定边界
@@ -24,13 +24,13 @@
 | 项目 | 配置 |
 |---|---|
 | 训练仓库与 Ray | 宿主机 `5090`，`/home/ubuntu/slime-agentic-zero-repro`，宿主 `.venv` |
-| 训练 GPU | 固定回放：GPU 2（DP=1）或 GPU 2、3（DP=2）；在线 A 冒烟：GPU 2 |
+| 训练 GPU | 固定回放：GPU 2（DP=1）或 GPU 2、3（DP=2）；在线 A/B：GPU 2，C/D：GPU 2、3 |
 | 推理 GPU | GPU 0 上独立运行的 SGLang 容器，服务为 `http://localhost:30000` |
 | 模型 | `Qwen3-0.6B`，宿主 `/home/ubuntu/models/Qwen/Qwen3-0.6B`，容器 `/models/Qwen3-0.6B` |
 | 数据 | 本地 GSM8K，宿主 `/home/ubuntu/data/gsm8k`；采样容器使用挂载后的 `/tmp/gsm8k` |
-| 权重发布 | 在线 A 冒烟使用 `disk`。宿主训练环境没有 `sglang` Python client，不能从宿主进程调用 tensor sync。 |
+| 权重发布 | 宿主 `.venv` 的 Ray learner 通过 HTTP `POST /update_weights_from_tensor` 向容器 SGLang 发布；宿主无需安装 SGLang Python 包，使用兼容的序列化实现和共享的 `/tmp/sglang_tensor_sync_authkey`。 |
 
-此前 tensor sync 在 `v9-dev` 容器内单独验证成功，发布约 5.33 s，随后生成可见新 weight version。该结果与宿主 disk 发布约 24 s 处在不同运行拓扑，说明接口可用，不能当作严格的端到端速度比。
+SGLang 在独立容器、GPU 0 上运行；Ray、Torch 和 Megatron 都在宿主项目的 `.venv/bin/python` 中运行，训练 GPU 为 2、3。容器只承担 `/generate` 和 `/update_weights_from_tensor`。本次每次有效更新均观察到 SGLang 的 HTTP 200 与 cache flush；它是正式端到端计时的一部分。
 
 ## 3. 工作负载和训练信号
 
@@ -66,43 +66,38 @@ GRPO 只在同一题的多个样本奖励存在差异时产生有效优势。无
 
 \* DP=2 的 TFLOPs 当前由每个 rank 的本地计时/计数上报，DP=1 和 DP=2 的口径尚未统一，不能把 `1.812` 与 `1.190` 解读为全局算力退化。后续应统一为全局有效 tokens 和全局训练 wall time 后再比较 TFLOPs。
 
-## 5. 在线端到端：A 格 GSM8K 冒烟
+## 5. 在线端到端：GSM8K 正式 A/B/C/D
 
-命令使用 `--cell A --rounds 3 --warmup-rounds 1 --prompts 2 --samples-per-prompt 4 --weight-sync disk`。首轮 warmup 后取两轮中位数：
-
-| 指标 | 结果 |
-|---|---:|
-| rollout generation | 5.418 s |
-| learner train | 0.321 s |
-| disk weight sync | 24.022 s |
-| end-to-end step | 29.760 s |
-| 原始奖励均值 | 0.50 |
-| 有效 GRPO group rate | 50% |
-| trainable tokens/s（仅 train 段） | 2,198.6 |
-| model tokens/s（仅 train 段） | 6,099.0 |
-| TFLOPs（当前训练计时口径） | 21.696 |
-| loss | 0.01321 |
-
-时间构成接近 `5.418 + 0.321 + 24.022 = 29.761 s`：generation 约 **18.2%**、训练约 **1.1%**、disk 发布约 **80.7%**。因此当前瓶颈是训练后把权重发布给独立 SGLang 容器，而不是 learner 前反向计算。
-
-`reward_mean=0`（标准化后的组内优势均值）不等于任务没有奖励；本次原始 reward 均值为 `0.50`，且 50% 分组有有效方差，达到当前 25% 的质量门槛。冒烟中曾打印 `policy_version_gap=1`，该值来自发布后才取 trainer version 的旧接线，已在后续提交中改为发布前取版本；该旧值不纳入结果。
-
-## 6. 异步回归与未完成项
-
-基础异步状态机已在宿主 `.venv` 运行 `scripts/test/test_v5_async.py --offline`，结果为 `PASSED (0 failures)`；一次对照中 sync `5.102 s`、async `4.294 s`。这是 fake backend 回归，证明生命周期没有因新增指标而中断，不是 GSM8K A/B/C/D 的性能结论。
-
-完整四格应使用当前脚本的默认规模（12 rounds，2 warmup，4 prompts x 4 samples/group），每格至少重复 3 次，并同时记录质量门槛：
+执行于 2026-08-20。每格 `3` 次独立重复；每次 `6` 个 rollout，前 `2` 个预热，后 `4` 个计入。每个 rollout 是一次 SGLang batch `/generate` 请求，包含 `8` 道题 x 每题 `4` 个采样，即 global batch `32`；`temperature=1.0`、`max_new_tokens=192`。Torch 以 activation microbatch `8` 累积梯度并保持全 batch mean；Megatron 用 THD microbatch `8`。所有有效更新均走 tensor HTTP 权重发布。
 
 ```bash
-# A/B: 单卡 Torch；C/D: GPU 2、3 上的 Megatron TP=2
 CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
   .venv/bin/python -u scripts/bench/v9_end_to_end.py \
-  --rounds 12 --warmup-rounds 2 --prompts 4 --samples-per-prompt 4 \
-  --temperature 0.7 --max-new-tokens 192 --gsm8k-local-dir /tmp/gsm8k \
-  --weight-sync disk --repeats 3
+  --rounds 6 --warmup-rounds 2 --repeats 3 --prompts 8 --samples-per-prompt 4 \
+  --temperature 1.0 --max-new-tokens 192 --gsm8k-local-dir /home/ubuntu/data/gsm8k \
+  --megatron-microbatch-size 8 --torch-microbatch-size 8 --weight-sync tensor
 ```
 
-执行时分别传入 `--cell A`、`B`、`C`、`D`。在 B/D 结果产生前，不能宣称异步缩短了完整 e2e step；它最多能隐藏 generation，不能隐藏本轮的 disk weight sync。要比较 tensor 发布，需要先让宿主训练环境具备 SGLang Python client，或在同时具备 Ray 和 SGLang client 的一致容器环境运行训练器。
+表中的每项为三次重复的中位数；`e2e` 是每轮真实 wall clock，不是 phase 求和。异步情况下 `wait=0` 表示 generation 已在 learner 训练期间完成，而非没有生成开销；它仍体现在 `e2e` 和发布前的同步等待中。
+
+| 格 | wait/gen s | train s | tensor sync s | e2e s | 原始 reward | 有效组率 | trainable tok/s | model tok/s | TFLOPs | loss | version gap |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| A Torch sync | 5.992 | 0.511 | 9.462 | 15.968 | 0.438 | 43.8% | 3,859.1 | 16,482.6 | 57.77 | 0.00009 | 0 |
+| B Torch async | 0.000 | 0.411 | 13.995 | 14.512 | 0.477 | 40.6% | 4,574.5 | 18,430.6 | 76.35 | 0.00054 | 1 |
+| C Megatron TP=2 sync | 6.559 | 1.702 | 6.851 | 15.162 | 0.461 | 53.1% | 1,526.2 | 4,726.5 | 17.68 | 0.00040 | 0 |
+| D Megatron TP=2 async | 0.000 | 1.248 | 10.641 | 12.324 | 0.445 | 40.6% | 1,538.5 | 5,398.4 | 24.69 | 0.00009 | 1 |
+
+结论：B 相对 A 的 e2e 降低 **9.1%**（`15.968 -> 14.512 s`）；D 相对 C 降低 **18.7%**（`15.162 -> 12.324 s`）。Megatron 训练段明显较慢，但 C 和 A 的端到端时间接近，因为生成和权重发布占了大部分 wall time。TP=2 下训练较长，因而异步有更大的可隐藏窗口。
+
+四格的有效 GRPO 组率均高于预设 `25%` 门槛，故有真实训练信号。`reward_mean` 接近零是组内标准化优势的预期结果；应看 raw reward 和有效组率。loss 都是有限的数值健康检查，但每格在线采样的题目、响应长度和优势不同，不能按 loss 大小比较模型质量或后端优劣。
+
+本轮开始前发现 TP=2 tensor 发布会卡在首次 `update_weights`：`MegatronTrainer.to_hf_state_dict()` 需要每个 TP rank 都参与 `all_gather`，旧逻辑只让 rank 0 导出。修复为所有 rank 共同导出 HF state dict、仅 rank 0 序列化并 POST 给 SGLang。修复后初始发布及每次训练后发布均在容器日志中返回 HTTP 200。
+
+## 6. 异步语义与结果文件
+
+异步路径在训练 batch N 时预取 batch N+1；在换权重前会等待该生成结束，避免生成中途切换权重。因此 `policy_version_gap=1` 是预取 batch 相对 learner 的预期一代滞后，sync 为 `0`。这不是旧版“发布后才取版本”造成的误报。
+
+远端原始产物位于 `/tmp/v9_e2e_online_20260820/`：`v9_end_to_end.csv` 为聚合表，`v9_end_to_end_repeats.csv` 为 12 个 raw repeat 记录。重复的 e2e 范围：A `15.90-16.59s`、B `13.64-14.80s`、C `15.15-15.30s`、D `12.06-13.12s`；D 的第三次受较长的一个训练微批影响，仍保留而未剔除。
 
 ## 7. 复现入口
 
@@ -115,7 +110,7 @@ CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
 | GSM8K 直接采样和 reward | `toy_rl/agent/toolorchestra/gsm8k_throughput_rollout.py` |
 | 固定回放契约测试 | `scripts/test/test_v9_gsm8k_throughput.py` |
 
-本轮固定工作负载文件和在线冒烟 CSV 位于服务器临时目录：`/tmp/v9_gsm8k_throughput.json`、`/tmp/v9_e2e_smoke/v9_end_to_end.csv`。如需跨机器长期保留，应把 workload JSON 与完整四格 CSV 复制到版本化的实验产物目录。
+本轮固定工作负载和在线正式 CSV 位于服务器临时目录：`/tmp/v9_gsm8k_throughput.json`、`/tmp/v9_e2e_online_20260820/{v9_end_to_end.csv,v9_end_to_end_repeats.csv}`。如需跨机器长期保留，应把 workload JSON 与完整四格 CSV 复制到版本化的实验产物目录。
 
 离线 workload 采集使用一次完整的 SGLang batch `/generate` 请求（`text` 为所有 prompt 的数组）；预热 batch 丢弃，随后才冻结 JSON。响应逐行恢复到原始输入顺序，因此每题的多个采样仍在连续 GRPO 分组中。
 
