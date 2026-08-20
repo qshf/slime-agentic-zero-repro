@@ -213,7 +213,12 @@ def main() -> None:
     parser.add_argument("--samples-per-prompt", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-new-tokens", type=int, default=192)
-    parser.add_argument("--weight-sync", choices=("tensor", "disk"), default="tensor")
+    parser.add_argument(
+        "--weight-sync",
+        choices=("tensor", "disk"),
+        default="disk",
+        help="disk works with the external-host trainer; tensor needs the SGLang Python client in that process",
+    )
     parser.add_argument("--model-path", default=MODEL_PATH)
     parser.add_argument("--gsm8k-local-dir", default=None)
     parser.add_argument("--min-active-grpo-rate", type=float, default=0.25)
