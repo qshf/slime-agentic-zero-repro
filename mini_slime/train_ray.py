@@ -41,6 +41,7 @@ def train(args: Args) -> list[dict]:
     metrics_log: list[dict] = []
     traces: list = []  # V7.4：opt-in learner trace（分相位计时）
     for rollout_id in range(args.num_rollout):
+        step_t0 = time.perf_counter()
         # 1) 产数据：另一进程的 RolloutManager actor（对齐 rollout_data_ref = ray.get(...generate.remote)）
         #    V7.4（缺口 1）：把当时的权重版本传给 generate，戳到每条 Sample（None-safe，默认路径不启用校验）。
         print(f"[rollout {rollout_id}] generating...", flush=True)
@@ -81,12 +82,14 @@ def train(args: Args) -> list[dict]:
             actor_model.update_weights()
             weight_published = True
         t_sync = time.time() - t0
+        e2e_time = time.perf_counter() - step_t0
 
         metrics = {
             "rollout_id": rollout_id,
             "gen_time": t_gen,
             "train_time": t_train,
             "sync_time": t_sync,
+            "e2e_time": e2e_time,
             "reward_mean": m["reward_mean"],
             "raw_reward_mean": m.get("raw_reward_mean", m["reward_mean"]),
             "trainable_tokens": m.get("trainable_tokens", 0),

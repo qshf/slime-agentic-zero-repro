@@ -55,6 +55,7 @@ def train(args: Args) -> list[dict]:
     rollout_data_next_future = rollout_manager.generate.remote(0, actor_model.weight_version())
 
     for rollout_id in range(args.num_rollout):
+        step_t0 = time.perf_counter()
         # 1) sync 上一次已发起的 generation（对齐 train_async.py:34-36）
         t0 = time.time()
         if rollout_data_next_future is not None:
@@ -95,13 +96,18 @@ def train(args: Args) -> list[dict]:
             rollout_data_next_future = None
             actor_model.update_weights()
             t_sync = time.time() - t0
+            e2e_time = time.perf_counter() - step_t0
             weight_published = True
+
+        if not weight_published:
+            e2e_time = time.perf_counter() - step_t0
 
         metrics = {
             "rollout_id": rollout_id,
             "wait_gen_time": t_wait_gen,   # 等当前 gen 的 ray.get 耗时（异步下多半已被上一轮 train 藏掉）
             "train_time": t_train,          # train(N) 的 ray.get 耗时（≈ fake_train_seconds + IPC）
             "sync_time": t_sync,
+            "e2e_time": e2e_time,
             "reward_mean": m["reward_mean"],
             "raw_reward_mean": m.get("raw_reward_mean", m["reward_mean"]),
             "trainable_tokens": m.get("trainable_tokens", 0),

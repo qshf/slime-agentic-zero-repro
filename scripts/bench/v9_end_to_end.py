@@ -87,6 +87,7 @@ def make_args(backend: str, cli: argparse.Namespace):
         update_weights_interval=1,
         use_tensor_weight_sync=(cli.weight_sync == "tensor"),
         megatron_qkv_format="thd",
+        megatron_microbatch_size=cli.megatron_microbatch_size,
         learner_trace=True,
         # A no-signal GRPO round has no train rows by definition. The benchmark
         # reports it through active_grpo_rate instead of rejecting the whole run.
@@ -123,7 +124,12 @@ def _extract_metrics(metrics_log: list[dict], warmup: int) -> CellResult:
     wait = [float(m.get("wait_gen_time", m.get("gen_time", 0.0))) for m in steady]
     train = [float(m.get("train_time", 0.0)) for m in steady]
     sync = [float(m.get("sync_time", 0.0)) for m in steady]
-    step = [a + b + c for a, b, c in zip(wait, train, sync, strict=True)]
+    # In async mode generation and training overlap, so summing phases would
+    # overstate wall time. Use the explicit per-round wall-clock measurement.
+    step = [
+        float(m.get("e2e_time", a + b + c))
+        for m, a, b, c in zip(steady, wait, train, sync, strict=True)
+    ]
     train_seconds = sum(train)
     trainable_tokens = sum(int(m.get("trainable_tokens", 0)) for m in steady)
     model_tokens = sum(int(m.get("model_tokens", 0)) for m in steady)
@@ -211,6 +217,12 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prompts", type=int, default=4)
     parser.add_argument("--samples-per-prompt", type=int, default=4)
+    parser.add_argument(
+        "--megatron-microbatch-size",
+        type=int,
+        default=1,
+        help="samples per Megatron microbatch; use the per-round rollout batch for one THD microbatch",
+    )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-new-tokens", type=int, default=192)
     parser.add_argument(
@@ -230,7 +242,7 @@ def main() -> None:
     cli = parser.parse_args()
     if cli.rounds < 1 or cli.warmup_rounds < 0 or cli.repeats < 1:
         parser.error("rounds, warmup rounds, and repeats must be valid positive counts")
-    if cli.prompts < 1 or cli.samples_per_prompt < 2:
+    if cli.prompts < 1 or cli.samples_per_prompt < 2 or cli.megatron_microbatch_size < 1:
         parser.error("GSM8K GRPO requires at least one prompt and two samples per prompt")
     if not 0.0 <= cli.min_active_grpo_rate <= 1.0:
         parser.error("--min-active-grpo-rate must be in [0, 1]")
