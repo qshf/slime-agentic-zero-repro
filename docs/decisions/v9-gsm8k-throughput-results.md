@@ -114,3 +114,5 @@ CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
 | 固定回放契约测试 | `scripts/test/test_v9_gsm8k_throughput.py` |
 
 本轮固定工作负载文件和在线冒烟 CSV 位于服务器临时目录：`/tmp/v9_gsm8k_throughput.json`、`/tmp/v9_e2e_smoke/v9_end_to_end.csv`。如需跨机器长期保留，应把 workload JSON 与完整四格 CSV 复制到版本化的实验产物目录。
+
+离线 workload 采集使用一次完整的 SGLang batch `/generate` 请求（`text` 为所有 prompt 的数组）；预热 batch 丢弃，随后才冻结 JSON。响应逐行恢复到原始输入顺序，因此每题的多个采样仍在连续 GRPO 分组中。

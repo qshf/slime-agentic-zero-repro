@@ -129,10 +129,85 @@ def _drop_masked_rows(workload: dict[str, Any]) -> int:
     return dropped
 
 
-async def collect_workload(args) -> tuple[dict[str, Any], dict[str, Any]]:
+async def _collect_batch_request(manager, args, rollout_id: int, rollout_policy_version: int) -> dict[str, Any]:
+    """Generate one full GRPO rollout batch through one SGLang /generate request.
+
+    The regular RolloutManager contract is deliberately per-sample so that
+    multi-turn agents can await tool calls. This throughput collector is a
+    single-turn GSM8K-only path: batching its formatted prompts is semantically
+    equivalent and lets SGLang schedule the whole batch together.
+    """
+    import asyncio
+    import requests
+
+    from toy_rl.agent.toolorchestra.gsm8k_throughput_rollout import _apply_output, _prompt
+    from toy_rl.agent.toolorchestra.rollout import GenOutput, _strip_think, _tokenizer
+
+    samples = manager._next_batch(rollout_id)
+    tokenizer = _tokenizer(args.train_model_path)
+    prompt_texts = [_prompt(str(sample.prompt)) for sample in samples]
+    formatted_prompts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        for prompt_text in prompt_texts
+    ]
+    prompt_token_ids = [
+        tokenizer(prompt, add_special_tokens=False)["input_ids"] for prompt in formatted_prompts
+    ]
+    payload = {
+        "text": formatted_prompts,
+        "sampling_params": {
+            "max_new_tokens": args.orchestra_max_tokens,
+            "temperature": args.rollout_temperature,
+        },
+        "return_logprob": True,
+    }
+
+    def request_batch() -> list[dict[str, Any]]:
+        response = requests.post(args.sglang_generate_url, json=payload, timeout=360)
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, list) or len(result) != len(samples):
+            raise ValueError("SGLang batch /generate response must align with request rows")
+        return result
+
+    outputs = await asyncio.get_running_loop().run_in_executor(None, request_batch)
+    for sample, prompt_text, token_ids, output in zip(
+        samples, prompt_texts, prompt_token_ids, outputs, strict=True
+    ):
+        pairs = output.get("meta_info", {}).get("output_token_logprobs", [])
+        generated_ids = [int(pair[1]) for pair in pairs]
+        generated_log_probs = [float(pair[0]) for pair in pairs]
+        _apply_output(
+            sample,
+            prompt_text,
+            GenOutput(
+                response=_strip_think(str(output.get("text", ""))),
+                prompt_token_ids=list(token_ids),
+                generated_token_ids=generated_ids,
+                generated_log_probs=generated_log_probs,
+            ),
+        )
+        reward_result = await manager.reward_func(args, sample)
+        sample.reward = reward_result["reward"]
+        sample.rollout_policy_version = rollout_policy_version
+        sample.metadata["reward_features"] = {"correctness": sample.reward}
+    return manager.custom_convert(args, samples)
+
+
+async def collect_workload(args, warmup_batches: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
     from mini_slime.rollout_manager import RolloutManager
 
-    workload = await RolloutManager(args).generate(0, rollout_policy_version=0)
+    manager = RolloutManager(args)
+    for warmup_id in range(warmup_batches):
+        await _collect_batch_request(manager, args, warmup_id, rollout_policy_version=0)
+    # With a fixed paper, warmup IDs may wrap around the prompt list. Their data
+    # is deliberately discarded; rollout_id only selects the source window.
+    workload = await _collect_batch_request(manager, args, warmup_batches, rollout_policy_version=0)
     _validate_workload(workload, require_trainable_rows=False)
     dropped_rows = _drop_masked_rows(workload)
     _validate_workload(workload)
@@ -143,6 +218,7 @@ async def collect_workload(args) -> tuple[dict[str, Any], dict[str, Any]]:
         "prompts": args.batch_size,
         "samples_per_prompt": args.n_samples_per_prompt,
         "rollout_temperature": args.rollout_temperature,
+        "warmup_batches": warmup_batches,
         "rows": len(workload["tokens"]),
         "masked_rows_dropped": dropped_rows,
         "model_tokens": sum(len(tokens) for tokens in workload["tokens"]),
@@ -263,6 +339,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--require-active-grpo", action="store_true")
     parser.add_argument(
+        "--collect-warmup-batches",
+        type=int,
+        default=1,
+        help="discard this many full SGLang batch requests before writing --workload",
+    )
+    parser.add_argument(
         "--min-active-grpo-groups",
         type=int,
         default=0,
@@ -285,7 +367,11 @@ def main() -> None:
         parser.error("--prompts must match the fixed paper")
     if cli.samples_per_prompt is not None and cli.samples_per_prompt != samples_per_prompt:
         parser.error("--samples-per-prompt must match the fixed paper")
-    if cli.updates < 1 or cli.warmup < 0:
+    if (
+        cli.updates < 1
+        or cli.warmup < 0
+        or cli.collect_warmup_batches < 0
+    ):
         parser.error("invalid workload or update size")
 
     args = make_args(
@@ -307,11 +393,12 @@ def main() -> None:
     workload = None
     metadata: dict[str, Any] = {}
     if cli.collect:
-        workload, metadata = asyncio.run(collect_workload(args))
+        workload, metadata = asyncio.run(collect_workload(args, cli.collect_warmup_batches))
         write_workload(path, workload, metadata)
         print(f"workload={path} rows={metadata['rows']} model_tokens={metadata['model_tokens']} "
               f"trainable_tokens={metadata['trainable_tokens']} raw_reward={metadata['raw_reward_mean']:.3f} "
-              f"active_grpo={metadata['grpo_active_group_count']}/{metadata['grpo_group_count']}")
+              f"active_grpo={metadata['grpo_active_group_count']}/{metadata['grpo_group_count']} "
+              f"request_batch_rows={prompts * samples_per_prompt} warmup_batches={metadata['warmup_batches']}")
         if cli.require_active_grpo and metadata["grpo_active_group_count"] == 0:
             raise RuntimeError("collected workload has no active GRPO group; adjust temperature or prompt mix")
         validate_collection_quality(
