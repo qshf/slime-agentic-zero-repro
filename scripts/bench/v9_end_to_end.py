@@ -36,10 +36,12 @@ CALCULATOR_RM_PATH = "toy_rl.agent.calculator_hooks.reward_func"
 CALCULATOR_DATA_PATH = "toy_rl.agent.calculator_data.load_data_source"
 
 CELLS: list[dict] = [
-    dict(id="A", backend="torch", mode="sync", label="no-infra sync"),
-    dict(id="B", backend="torch", mode="async", label="no-infra async"),
-    dict(id="C", backend="megatron", mode="sync", label="Megatron TP=2 sync"),
-    dict(id="D", backend="megatron", mode="async", label="Megatron TP=2 async"),
+    dict(id="A", backend="torch", mode="sync", label="Torch sync"),
+    dict(id="B", backend="torch", mode="async", label="Torch async"),
+    dict(id="C", backend="megatron", mode="sync", label="Megatron TP=2 sync", tp=2, dp=1),
+    dict(id="D", backend="megatron", mode="async", label="Megatron TP=2 async", tp=2, dp=1),
+    dict(id="E", backend="megatron", mode="sync", label="Megatron TP=1 DP=2 sync", tp=1, dp=2),
+    dict(id="F", backend="megatron", mode="async", label="Megatron TP=1 DP=2 async", tp=1, dp=2),
 ]
 
 
@@ -64,9 +66,10 @@ def workload_paths(name: str) -> tuple[str, str, str, str]:
     return CALCULATOR_GEN_PATH, CALCULATOR_RM_PATH, CALCULATOR_DATA_PATH, ""
 
 
-def make_args(backend: str, cli: argparse.Namespace):
+def make_args(cell: dict, cli: argparse.Namespace):
     from mini_slime.args import Args
 
+    backend = cell["backend"]
     gen_path, rm_path, data_path, convert_path = workload_paths(cli.workload)
     args = Args(
         train_backend=backend,
@@ -101,17 +104,18 @@ def make_args(backend: str, cli: argparse.Namespace):
     if cli.gsm8k_local_dir:
         args.gsm8k_local_dir = cli.gsm8k_local_dir
     if backend == "megatron":
-        args.tensor_model_parallel_size = 2
+        args.tensor_model_parallel_size = int(cell["tp"])
+        args.megatron_data_parallel_size = int(cell["dp"])
     return args
 
 
-def run_cell(backend: str, mode: str, cli: argparse.Namespace) -> list[dict]:
+def run_cell(cell: dict, cli: argparse.Namespace) -> list[dict]:
     import ray
 
     if ray.is_initialized():
         ray.shutdown()
-    args = make_args(backend, cli)
-    if mode == "sync":
+    args = make_args(cell, cli)
+    if cell["mode"] == "sync":
         from mini_slime.train_ray import train
     else:
         from mini_slime.train_async import train
@@ -223,7 +227,7 @@ def plot_2x2(results: dict[str, CellResult], path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="V9 online end-to-end A/B/C/D benchmark")
+    parser = argparse.ArgumentParser(description="V9 online end-to-end sync/async parallelism benchmark")
     parser.add_argument("--cell", choices=[cell["id"] for cell in CELLS], default=None)
     parser.add_argument("--workload", choices=("gsm8k", "calculator"), default="gsm8k")
     parser.add_argument("--rounds", type=int, default=12)
@@ -301,7 +305,7 @@ def main() -> None:
         for repeat in range(cli.repeats):
             print(f"-- repeat {repeat + 1}/{cli.repeats} --")
             t0 = time.perf_counter()
-            metrics = run_cell(cell["backend"], cell["mode"], cli)
+            metrics = run_cell(cell, cli)
             result = _extract_metrics(metrics, cli.warmup_rounds)
             runs.append(result)
             repeat_rows.append({"label": label, "repeat": repeat + 1, **result._asdict()})
