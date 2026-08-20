@@ -59,9 +59,15 @@ class WeightUpdater:
         返回新的权重版本号（各 rank 一致递增，rank0 权威）。
         """
         if self._tensor_updater:
+            # Megatron/FSDP HF export can contain distributed collectives. Every
+            # rank must enter it; only rank0 then serializes and posts to SGLang.
+            hf_state_dict = None
+            if hasattr(self.torch_actor, "to_hf_state_dict"):
+                hf_state_dict = self.torch_actor.to_hf_state_dict()
+
             # V9+: HTTP tensor 同步路径（只 rank0 发送）
             if self.rank == 0:
-                self._tensor_updater.update_weights()
+                self._tensor_updater.update_weights(hf_state_dict)
                 self.version = self._tensor_updater.weight_version
             else:
                 # 非 rank0：只递增本地 version（与 rank0 保持同步）

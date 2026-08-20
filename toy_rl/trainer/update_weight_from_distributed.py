@@ -92,21 +92,24 @@ class UpdateWeightFromTensor:
         self.weight_version = 0
 
     @torch.no_grad()
-    def update_weights(self):
+    def update_weights(self, hf_state_dict: dict | None = None):
         """Disk-free weight sync via HTTP POST."""
         self._configure_resource_sharer_authkey()
         self.weight_version += 1
 
-        # 1. Get HF state_dict
-        if hasattr(self.trainer, "to_hf_state_dict"):
-            hf_state_dict = self.trainer.to_hf_state_dict()
-        elif hasattr(self.trainer, "model"):
-            hf_state_dict = {
-                k: v.cpu() if hasattr(v, "cpu") else v
-                for k, v in self.trainer.model.state_dict().items()
-            }
-        else:
-            raise ValueError("trainer must have to_hf_state_dict or model attribute")
+        # 1. Get HF state_dict unless a distributed caller already exported it.
+        # Megatron export contains TP/PP collectives, so WeightUpdater has every
+        # rank enter that phase and hands the resulting state to rank 0 here.
+        if hf_state_dict is None:
+            if hasattr(self.trainer, "to_hf_state_dict"):
+                hf_state_dict = self.trainer.to_hf_state_dict()
+            elif hasattr(self.trainer, "model"):
+                hf_state_dict = {
+                    k: v.cpu() if hasattr(v, "cpu") else v
+                    for k, v in self.trainer.model.state_dict().items()
+                }
+            else:
+                raise ValueError("trainer must have to_hf_state_dict or model attribute")
 
         # 2. Group by dtype
         named_tensors_by_dtype = {}
