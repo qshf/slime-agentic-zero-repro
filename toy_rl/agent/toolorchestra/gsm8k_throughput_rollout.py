@@ -77,12 +77,21 @@ async def generate_batch(args: Args, samples: list[Sample]) -> list[Sample]:
     prompt_token_ids = [
         tokenizer(prompt, add_special_tokens=False)["input_ids"] for prompt in formatted_prompts
     ]
-    payload = {
-        "text": formatted_prompts,
-        "sampling_params": {
+    # Keep the prompt identical within a GRPO group, but give each row a
+    # distinct deterministic sampling stream. Without this, a batched request
+    # can produce correlated duplicate completions for the four samples of one
+    # question and leave the group without a learning signal.
+    sampling_params = [
+        {
             "max_new_tokens": args.orchestra_max_tokens,
             "temperature": args.rollout_temperature,
-        },
+            "seed": 10_000 + index,
+        }
+        for index in range(len(samples))
+    ]
+    payload = {
+        "text": formatted_prompts,
+        "sampling_params": sampling_params,
         "return_logprob": True,
     }
 
