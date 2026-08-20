@@ -79,6 +79,7 @@ def train(args: Args) -> list[dict]:
         m = train_metrics[0]  # rank0 的指标；Megatron DP 时其 loss 已在 trainer 内跨 DP 平均。
         t_train = time.time() - t0
         tokens = sum(rollout_data_curr["response_lengths"])  # 在 update 块把 curr 改掉之前先取
+        model_tokens = sum(len(tokens) for tokens in rollout_data_curr["tokens"])
 
         # 4) 按 interval 同步权重（对齐 train_async.py:62-66）。换权重前先 sync 掉在途 generation，
         #    防止"在生成中途换权重"（源注释：sync generate before update weights）。
@@ -98,7 +99,7 @@ def train(args: Args) -> list[dict]:
             "reward_mean": m["reward_mean"],
             "raw_reward_mean": m.get("raw_reward_mean", m["reward_mean"]),
             "trainable_tokens": m.get("trainable_tokens", 0),
-            "model_tokens": m.get("_trace", {}).get("model_tokens", sum(len(t) for t in rollout_data_curr["tokens"])),
+            "model_tokens": m.get("_trace", {}).get("model_tokens", model_tokens),
             "grpo_group_count": m.get("grpo_group_count", 0),
             "grpo_active_group_count": m.get("grpo_active_group_count", 0),
             "trained_samples": m.get("trained_samples", 0),
