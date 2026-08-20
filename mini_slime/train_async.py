@@ -78,6 +78,10 @@ def train(args: Args) -> list[dict]:
         train_metrics = ray.get(actor_model.async_train(rollout_id, rollout_data_curr))
         m = train_metrics[0]  # rank0 的指标；Megatron DP 时其 loss 已在 trainer 内跨 DP 平均。
         t_train = time.time() - t0
+        # Measure staleness when the learner consumes the batch, before this
+        # round publishes the next engine version. Prefetched async data can
+        # then correctly report a positive gap while synchronous data is zero.
+        trainer_policy_version = actor_model.weight_version()
         tokens = sum(rollout_data_curr["response_lengths"])  # 在 update 块把 curr 改掉之前先取
         model_tokens = sum(len(tokens) for tokens in rollout_data_curr["tokens"])
 
@@ -119,7 +123,7 @@ def train(args: Args) -> list[dict]:
                 trace = LearnerTrace(
                     rollout_id=rollout_id,
                     rollout_policy_version=rollout_pv,
-                    trainer_policy_version=metrics["weight_version"],
+                    trainer_policy_version=trainer_policy_version,
                     samples=m.get("trained_samples", 0),
                     model_tokens=tr["model_tokens"],
                     trainable_tokens=m["trainable_tokens"],

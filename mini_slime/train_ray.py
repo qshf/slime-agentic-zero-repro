@@ -68,6 +68,10 @@ def train(args: Args) -> list[dict]:
         train_metrics = ray.get(actor_model.async_train(rollout_id, rollout_data))
         m = train_metrics[0]  # rank0 的指标；Megatron DP 时其 loss 已在 trainer 内跨 DP 平均。
         t_train = time.time() - t0
+        # Staleness is defined at learner consumption, before this round
+        # publishes a new rollout-engine version. Synchronous rollout/train is
+        # therefore gap=0; using the post-publish version would falsely show 1.
+        trainer_policy_version = actor_model.weight_version()
 
         # 3) 同步权重回推理引擎（对齐 actor_model.update_weights()）
         print(f"[rollout {rollout_id}] updating weights...", flush=True)
@@ -105,7 +109,7 @@ def train(args: Args) -> list[dict]:
                 trace = LearnerTrace(
                     rollout_id=rollout_id,
                     rollout_policy_version=rollout_pv,
-                    trainer_policy_version=metrics["weight_version"],
+                    trainer_policy_version=trainer_policy_version,
                     samples=m.get("trained_samples", 0),
                     model_tokens=tr["model_tokens"],
                     trainable_tokens=m["trainable_tokens"],
