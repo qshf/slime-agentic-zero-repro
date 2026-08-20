@@ -17,6 +17,8 @@
 
 所有 Megatron 实验使用 `THD` packed sequence，未使用 BSHD padding。
 
+多卡结果必须记录 `nvidia-smi topo -m`：TP rank 需要同一台主机，且应优先选同一 NUMA 域的 GPU 对。本机 GPU `2-3` 为 `NODE`（同 NUMA 的 PCIe Host Bridge 路径）；GPU `1-2` 为 `SYS`（跨 NUMA），不用于 TP=2 对照。该机未报告 `NV#`，即没有可用 NVLink 链路。
+
 ## 2. 运行环境
 
 | 项目 | 配置 |

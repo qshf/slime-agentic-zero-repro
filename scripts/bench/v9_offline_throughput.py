@@ -48,6 +48,16 @@ def _gpu_snapshot() -> str:
         return "nvidia-smi unavailable"
 
 
+def _gpu_topology() -> str:
+    """Persist the PCIe/NVLink topology used to interpret multi-GPU results."""
+    try:
+        return subprocess.run(
+            ["nvidia-smi", "topo", "-m"], check=False, capture_output=True, text=True
+        ).stdout.strip()
+    except FileNotFoundError:
+        return "nvidia-smi unavailable"
+
+
 def _parse_configs(value: str) -> list[tuple[str, str, int, int]]:
     """Map public names to backend, TP, and DP without exposing Ray internals."""
     catalog = {
@@ -156,6 +166,7 @@ def main() -> None:
         metadata, cli.min_active_grpo_groups, cli.min_trainable_tokens
     )
     gpu_before = _gpu_snapshot()
+    gpu_topology = _gpu_topology()
     print(
         f"offline workload={workload_path} rows={len(workload['tokens'])} "
         f"trainable_tokens={metadata.get('trainable_tokens', 0)} "
@@ -188,6 +199,7 @@ def main() -> None:
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "gpu_before": gpu_before,
         "gpu_after": _gpu_snapshot(),
+        "gpu_topology": gpu_topology,
         "updates": cli.updates,
         "warmup": cli.warmup,
         "runs": cli.runs,
