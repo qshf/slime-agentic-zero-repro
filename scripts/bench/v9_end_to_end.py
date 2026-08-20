@@ -206,7 +206,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="V9 online end-to-end A/B/C/D benchmark")
     parser.add_argument("--cell", choices=[cell["id"] for cell in CELLS], default=None)
     parser.add_argument("--workload", choices=("gsm8k", "calculator"), default="gsm8k")
-    parser.add_argument("--rounds", type=int, default=8)
+    parser.add_argument("--rounds", type=int, default=12)
     parser.add_argument("--warmup-rounds", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prompts", type=int, default=4)

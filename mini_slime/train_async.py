@@ -88,12 +88,14 @@ def train(args: Args) -> list[dict]:
         # 4) 按 interval 同步权重（对齐 train_async.py:62-66）。换权重前先 sync 掉在途 generation，
         #    防止"在生成中途换权重"（源注释：sync generate before update weights）。
         t_sync = 0.0
-        if (rollout_id + 1) % args.update_weights_interval == 0:
+        weight_published = False
+        if (rollout_id + 1) % args.update_weights_interval == 0 and m["trainable_tokens"] > 0:
             t0 = time.time()
             rollout_data_curr = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None
             actor_model.update_weights()
             t_sync = time.time() - t0
+            weight_published = True
 
         metrics = {
             "rollout_id": rollout_id,
@@ -107,6 +109,7 @@ def train(args: Args) -> list[dict]:
             "grpo_group_count": m.get("grpo_group_count", 0),
             "grpo_active_group_count": m.get("grpo_active_group_count", 0),
             "trained_samples": m.get("trained_samples", 0),
+            "weight_published": weight_published,
             "tokens_per_rollout": tokens,
             "weight_version": actor_model.weight_version(),
         }

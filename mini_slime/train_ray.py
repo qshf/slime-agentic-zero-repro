@@ -76,8 +76,10 @@ def train(args: Args) -> list[dict]:
         # 3) 同步权重回推理引擎（对齐 actor_model.update_weights()）
         print(f"[rollout {rollout_id}] updating weights...", flush=True)
         t0 = time.time()
-        if (rollout_id + 1) % args.update_weights_interval == 0:
+        weight_published = False
+        if (rollout_id + 1) % args.update_weights_interval == 0 and m["trainable_tokens"] > 0:
             actor_model.update_weights()
+            weight_published = True
         t_sync = time.time() - t0
 
         metrics = {
@@ -92,6 +94,7 @@ def train(args: Args) -> list[dict]:
             "grpo_group_count": m.get("grpo_group_count", 0),
             "grpo_active_group_count": m.get("grpo_active_group_count", 0),
             "trained_samples": m.get("trained_samples", 0),
+            "weight_published": weight_published,
             "tokens_per_rollout": sum(rollout_data["response_lengths"]),
             "weight_version": actor_model.weight_version(),
         }
