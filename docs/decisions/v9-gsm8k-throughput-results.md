@@ -107,6 +107,8 @@ CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
 | 用途 | 文件 |
 |---|---|
 | 固定工作负载采集与回放 | `scripts/bench/v9_gsm8k_throughput.py` |
+| 大样本离线训练吞吐矩阵 | `scripts/bench/v9_offline_throughput.py` |
+| 离线吞吐题卷（16 题 x 8 个采样） | `scripts/bench/data/v9_gsm8k_offline_throughput_paper.json` |
 | 在线 A/B/C/D | `scripts/bench/v9_end_to_end.py` |
 | GSM8K 直接采样和 reward | `toy_rl/agent/toolorchestra/gsm8k_throughput_rollout.py` |
 | 固定回放契约测试 | `scripts/test/test_v9_gsm8k_throughput.py` |

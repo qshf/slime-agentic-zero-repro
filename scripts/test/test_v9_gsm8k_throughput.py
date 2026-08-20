@@ -15,6 +15,7 @@ from scripts.bench.v9_gsm8k_throughput import (
     _drop_masked_rows,
     _validate_workload,
     load_paper,
+    validate_collection_quality,
 )
 from toy_rl.agent.toolorchestra.gsm8k_throughput_rollout import _apply_output
 from toy_rl.agent.toolorchestra.rollout import GenOutput
@@ -55,6 +56,14 @@ def main() -> int:
     _validate_workload(masked, require_trainable_rows=False)
     assert _drop_masked_rows(masked) == 4
     assert not masked["tokens"]
+    metadata = {"grpo_active_group_count": 8, "trainable_tokens": 4096}
+    validate_collection_quality(metadata, min_active_groups=8, min_trainable_tokens=4096)
+    try:
+        validate_collection_quality(metadata, min_active_groups=9, min_trainable_tokens=4096)
+    except RuntimeError as error:
+        assert "active_grpo_groups=8 < 9" in str(error)
+    else:
+        raise AssertionError("quality gate accepted too few active groups")
     print("V9 GSM8K throughput workload contract OK")
     return 0
 

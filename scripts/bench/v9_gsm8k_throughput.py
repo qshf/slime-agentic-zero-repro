@@ -169,6 +169,28 @@ def load_workload(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return workload, payload.get("metadata", {})
 
 
+def validate_collection_quality(
+    metadata: dict[str, Any], min_active_groups: int, min_trainable_tokens: int
+) -> None:
+    """Reject a saved rollout that is too small or has too little GRPO signal.
+
+    These are workload-quality gates, not learner correctness checks. Replaying a
+    no-signal group is valid structurally but measures Python/Ray overhead rather
+    than useful policy-gradient throughput.
+    """
+    if min_active_groups < 0 or min_trainable_tokens < 0:
+        raise ValueError("collection quality thresholds must be non-negative")
+    active_groups = int(metadata.get("grpo_active_group_count", 0))
+    trainable_tokens = int(metadata.get("trainable_tokens", 0))
+    failures = []
+    if active_groups < min_active_groups:
+        failures.append(f"active_grpo_groups={active_groups} < {min_active_groups}")
+    if trainable_tokens < min_trainable_tokens:
+        failures.append(f"trainable_tokens={trainable_tokens} < {min_trainable_tokens}")
+    if failures:
+        raise RuntimeError("collected workload failed quality gate: " + ", ".join(failures))
+
+
 def replay(args, workload: dict[str, Any], updates: int, warmup: int) -> dict[str, Any]:
     import ray
 
@@ -240,6 +262,18 @@ def main() -> None:
     parser.add_argument("--updates", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--require-active-grpo", action="store_true")
+    parser.add_argument(
+        "--min-active-grpo-groups",
+        type=int,
+        default=0,
+        help="fail collection if fewer groups have non-zero GRPO variance",
+    )
+    parser.add_argument(
+        "--min-trainable-tokens",
+        type=int,
+        default=0,
+        help="fail collection if saved rows contain fewer trainable tokens",
+    )
     cli = parser.parse_args()
     if not cli.collect and not cli.replay:
         parser.error("choose --collect, --replay, or both")
@@ -280,6 +314,9 @@ def main() -> None:
               f"active_grpo={metadata['grpo_active_group_count']}/{metadata['grpo_group_count']}")
         if cli.require_active_grpo and metadata["grpo_active_group_count"] == 0:
             raise RuntimeError("collected workload has no active GRPO group; adjust temperature or prompt mix")
+        validate_collection_quality(
+            metadata, cli.min_active_grpo_groups, cli.min_trainable_tokens
+        )
     if cli.replay:
         if workload is None:
             workload, metadata = load_workload(path)
