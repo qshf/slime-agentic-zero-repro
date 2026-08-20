@@ -93,44 +93,51 @@ class TorchActor:
         rewards 已经过 GRPO 组归一（custom_convert）；被 mask 掉的组 reward=0，对 loss 无贡献。
         """
         torch = self.torch
-        batch = self._pad_batch(
-            rollout_data["tokens"],
-            rollout_data["loss_masks"],
-            rollout_data["rewards"],
-            rollout_data.get("rollout_log_probs"),
-        )
-        if batch is None:
+        tokens = rollout_data["tokens"]
+        loss_masks = rollout_data["loss_masks"]
+        rewards = rollout_data["rewards"]
+        old_log_probs = rollout_data.get("rollout_log_probs")
+        valid = [i for i, sequence in enumerate(tokens) if len(sequence) >= 2 and sum(loss_masks[i]) > 0]
+        if not valid:
             return {"loss": 0.0, "grad_norm": 0.0, "trained_samples": 0}
-        input_ids, attn_mask, tgt_mask, old_lp, adv = batch
 
         self.optimizer.zero_grad(set_to_none=True)
-        # 一次批量前向：logits[:, :-1] 预测 tokens[:, 1:]（logits[t] 预测 token t+1）。
-        logits = self.model(input_ids, attention_mask=attn_mask).logits[:, :-1, :].float()  # [B, L-1, V]
-        targets = input_ids[:, 1:].unsqueeze(-1)                                             # [B, L-1, 1]
-        cur_lp = torch.log_softmax(logits, dim=-1).gather(-1, targets).squeeze(-1)           # [B, L-1]
+        total_samples = len(valid)
+        microbatch_size = self.args.torch_microbatch_size or total_samples
+        weighted_loss = 0.0
+        for start in range(0, total_samples, microbatch_size):
+            indices = valid[start : start + microbatch_size]
+            batch = self._pad_batch(
+                [tokens[i] for i in indices],
+                [loss_masks[i] for i in indices],
+                [rewards[i] for i in indices],
+                [old_log_probs[i] for i in indices] if old_log_probs else None,
+            )
+            assert batch is not None
+            input_ids, attn_mask, tgt_mask, old_lp, adv = batch
+            # logits[:, :-1] predicts tokens[:, 1:].
+            logits = self.model(input_ids, attention_mask=attn_mask).logits[:, :-1, :].float()
+            targets = input_ids[:, 1:].unsqueeze(-1)
+            cur_lp = torch.log_softmax(logits, dim=-1).gather(-1, targets).squeeze(-1)
+            old_lp = cur_lp.detach() if old_lp is None else old_lp
+            ratio = (cur_lp - old_lp).exp()
+            pg_losses1 = ratio * adv
+            pg_losses2 = ratio.clamp(1 - self.args.eps_clip, 1 + self.args.eps_clip_high) * adv
+            pg_loss = torch.min(pg_losses1, pg_losses2)
+            per_sample = (pg_loss * tgt_mask).sum(dim=1) / torch.clamp_min(tgt_mask.sum(dim=1), 1.0)
+            loss = -per_sample.mean()
+            # Accumulated gradients equal the historical mean over every valid
+            # sample, while each padded activation tensor stays microbatch-sized.
+            scale = len(indices) / total_samples
+            (loss * scale).backward()
+            weighted_loss += float(loss.detach()) * scale
 
-        # ratio = exp(cur - old)（源 ppo_utils.py:132）；无真 old 时退化 on-policy（ratio=1）。
-        old_lp = cur_lp.detach() if old_lp is None else old_lp
-        ratio = (cur_lp - old_lp).exp()                        # [B, L-1]
-        # GRPO：标量 advantage [B,1] 广播到每个 response token [B, L-1]。
-        # PPO clip 目标（此时还是"要最大化的 J"，尚未转负号）：
-        pg_losses1 = ratio * adv
-        pg_losses2 = ratio.clamp(1 - self.args.eps_clip, 1 + self.args.eps_clip_high) * adv
-        pg_loss = torch.min(pg_losses1, pg_losses2)            # min(ratio·A, clip·A)  源 ppo_utils.py:133-135
-
-        # 每条序列 masked-mean（只在 loss_mask=1 处）→ 再对 batch 求 mean（源 sum_of_sample_mean）。
-        per_sample = (pg_loss * tgt_mask).sum(dim=1) / torch.clamp_min(tgt_mask.sum(dim=1), 1.0)  # [B]
-        policy_loss = per_sample.mean()
-        # PyTorch optimizer 是梯度下降（minimize）：加负号把"最大化 J"转成"最小化 L"。
-        loss = -policy_loss
-
-        loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
         self.optimizer.step()
         return {
-            "loss": float(loss.detach()),
+            "loss": weighted_loss,
             "grad_norm": float(grad_norm),
-            "trained_samples": int(adv.shape[0]),
+            "trained_samples": total_samples,
         }
 
     def save_pretrained(self, path: str) -> None:

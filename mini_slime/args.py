@@ -115,6 +115,10 @@ class Args:
     # Samples per Megatron microbatch. Keep 1 for compatibility; throughput
     # runs may use the full learner batch to avoid per-sample scheduling.
     megatron_microbatch_size: int = 1
+    # Zero keeps the historical one-shot Torch update. Throughput runs can
+    # accumulate padded Torch microbatches without changing the global GRPO
+    # batch mean or optimizer-step count.
+    torch_microbatch_size: int = 0
     # V9 Megatron：统一走 THD sequence packing，避免 BSHD 按 batch 最长样本 padding。
     megatron_qkv_format: str = "thd"
     # V7.5/V7.6 opt-in sequence packing（默认 False → V7.0/V7.2 padding 路径不变、零回归）。

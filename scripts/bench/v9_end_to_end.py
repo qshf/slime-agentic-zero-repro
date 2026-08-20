@@ -92,6 +92,7 @@ def make_args(backend: str, cli: argparse.Namespace):
         use_tensor_weight_sync=(cli.weight_sync == "tensor"),
         megatron_qkv_format="thd",
         megatron_microbatch_size=cli.megatron_microbatch_size,
+        torch_microbatch_size=cli.torch_microbatch_size,
         learner_trace=True,
         # A no-signal GRPO round has no train rows by definition. The benchmark
         # reports it through active_grpo_rate instead of rejecting the whole run.
@@ -236,6 +237,12 @@ def main() -> None:
         default=1,
         help="samples per Megatron microbatch; use the per-round rollout batch for one THD microbatch",
     )
+    parser.add_argument(
+        "--torch-microbatch-size",
+        type=int,
+        default=8,
+        help="samples per Torch activation microbatch; gradients still use the full rollout batch mean",
+    )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-new-tokens", type=int, default=192)
     parser.add_argument(
@@ -260,7 +267,12 @@ def main() -> None:
     cli = parser.parse_args()
     if cli.rounds < 1 or cli.warmup_rounds < 0 or cli.repeats < 1:
         parser.error("rounds, warmup rounds, and repeats must be valid positive counts")
-    if cli.prompts < 1 or cli.samples_per_prompt < 2 or cli.megatron_microbatch_size < 1:
+    if (
+        cli.prompts < 1
+        or cli.samples_per_prompt < 2
+        or cli.megatron_microbatch_size < 1
+        or cli.torch_microbatch_size < 1
+    ):
         parser.error("GSM8K GRPO requires at least one prompt and two samples per prompt")
     if not 0.0 <= cli.min_active_grpo_rate <= 1.0:
         parser.error("--min-active-grpo-rate must be in [0, 1]")
