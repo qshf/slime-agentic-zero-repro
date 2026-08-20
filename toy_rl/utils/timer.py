@@ -59,8 +59,13 @@ class Timer(metaclass=SingletonMeta):
     def reset(self, name: str | None = None) -> None:
         if name is None:
             self.timers = {}
-        elif name in self.timers:
-            del self.timers[name]
+            # A caller may return early after start() (for example an empty
+            # GRPO microbatch). A full reset starts a new measurement epoch,
+            # so stale open scopes must not poison the next train step.
+            self.start_time = {}
+        else:
+            self.timers.pop(name, None)
+            self.start_time.pop(name, None)
 
     def add(self, name: str, elapsed_time: float) -> None:
         self.timers[name] = self.timers.get(name, 0) + elapsed_time
