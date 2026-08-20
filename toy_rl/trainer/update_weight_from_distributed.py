@@ -19,7 +19,10 @@ Expected: 2-5 sec (vs disk reload 25 sec, 5-12x faster)
 from __future__ import annotations
 
 import multiprocessing as mp
+import base64
+import io
 from pathlib import Path
+from types import SimpleNamespace
 
 import requests
 import torch
@@ -28,8 +31,52 @@ try:
     from sglang.srt.model_executor.model_runner import FlattenedTensorBucket
     from sglang.srt.utils import MultiprocessingSerializer
 except ImportError:
-    FlattenedTensorBucket = None
-    MultiprocessingSerializer = None
+    # The learner runs in the host .venv (Ray is installed there), while the
+    # rollout server runs in a separate SGLang container. The wire protocol is
+    # deliberately simple: ForkingPickler plus a flat uint8 tensor and metadata
+    # objects with these six attributes. The server reconstructs its own
+    # FlattenedTensorMetadata instances, so importing all of SGLang here is not
+    # required.
+    from multiprocessing.reduction import ForkingPickler
+
+    class FlattenedTensorBucket:
+        def __init__(self, named_tensors):
+            if not named_tensors:
+                raise ValueError("Cannot create an empty tensor bucket")
+            parts = []
+            metadata = []
+            offset = 0
+            for name, tensor in named_tensors:
+                flattened = tensor.flatten().view(torch.uint8)
+                size = flattened.numel()
+                parts.append(flattened)
+                metadata.append(
+                    SimpleNamespace(
+                        name=name,
+                        shape=tensor.shape,
+                        dtype=tensor.dtype,
+                        start_idx=offset,
+                        end_idx=offset + size,
+                        numel=size,
+                    )
+                )
+                offset += size
+            self._flattened_tensor = torch.cat(parts, dim=0)
+            self._metadata = metadata
+
+        def get_flattened_tensor(self):
+            return self._flattened_tensor
+
+        def get_metadata(self):
+            return self._metadata
+
+    class MultiprocessingSerializer:
+        @staticmethod
+        def serialize(obj, output_str: bool = False):
+            buffer = io.BytesIO()
+            ForkingPickler(buffer).dump(obj)
+            payload = buffer.getvalue()
+            return base64.b64encode(payload).decode("utf-8") if output_str else payload
 
 
 class UpdateWeightFromTensor:
@@ -40,9 +87,6 @@ class UpdateWeightFromTensor:
         trainer: Trainer instance (MegatronTrainer / FSDPTrainer / TorchActor)
         sglang_url: SGLang /generate endpoint (replaced with /update_weights_from_tensor)
         """
-        if FlattenedTensorBucket is None:
-            raise ImportError("Need sglang installed for UpdateWeightFromTensor")
-
         self.trainer = trainer
         self.sglang_url = sglang_url.replace("/generate", "/update_weights_from_tensor")
         self.weight_version = 0
