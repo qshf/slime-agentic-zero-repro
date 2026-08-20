@@ -70,11 +70,12 @@ def _metadata() -> dict:
     }
 
 
-def _load_rows(split: str, n: int, local_dir: str):
+def _load_rows(split: str, n: int, local_dir: str, indices: tuple[int, ...] | None = None):
     """加载 GSM8K 某 split 的前 N 行。
 
     服务器连不上 HF（CLAUDE.md 已记）：优先读本地 parquet（local_dir/<split>-00000-of-00001.parquet）；
-    不存在时回退 datasets.load_dataset("openai/gsm8k")（本地开发有网）。返回 [{question, answer}, ...]。
+    不存在时回退 datasets.load_dataset("openai/gsm8k")（本地开发有网）。``indices`` 非空时按
+    manifest 的原始行号和顺序选题；否则保持旧行为，取前 N 条。
     """
     import os
 
@@ -82,29 +83,48 @@ def _load_rows(split: str, n: int, local_dir: str):
     if os.path.isfile(parquet_path):
         import pandas as pd
 
-        frame = pd.read_parquet(parquet_path).head(n)
+        frame = pd.read_parquet(parquet_path)
+        if indices is not None:
+            if any(index < 0 or index >= len(frame) for index in indices):
+                raise ValueError(f"GSM8K {split} paper index is outside dataset bounds")
+            frame = frame.iloc[list(indices)]
+        else:
+            frame = frame.head(n)
         return frame.to_dict("records")
 
     from datasets import load_dataset
 
     dataset = load_dataset("openai/gsm8k", "main", split=split)
-    return [dataset[i] for i in range(min(n, len(dataset)))]
+    selected = indices if indices is not None else tuple(range(min(n, len(dataset))))
+    if any(index < 0 or index >= len(dataset) for index in selected):
+        raise ValueError(f"GSM8K {split} paper index is outside dataset bounds")
+    return [dataset[index] for index in selected]
 
 
-def _load_split(split: str, n: int, local_dir: str) -> list[Sample]:
+def _load_split(
+    split: str,
+    n: int,
+    local_dir: str,
+    indices: tuple[int, ...] | None = None,
+) -> list[Sample]:
     return [
         Sample(
             prompt=str(row["question"]),
             label=_extract_gold(str(row["answer"])),
             metadata=_metadata(),
         )
-        for row in _load_rows(split, n, local_dir)
+        for row in _load_rows(split, n, local_dir, indices)
     ]
 
 
 def load_data_source(args) -> list[Sample]:
-    """训练数据源：GSM8K train 前 N 条（对齐源 data_source_cls 的可切换加载）。"""
-    return _load_split("train", args.gsm8k_num_train, args.gsm8k_local_dir)
+    """训练数据源：默认前 N 条，V9 可通过 manifest 固定 train 行号与顺序。"""
+    return _load_split(
+        "train",
+        args.gsm8k_num_train,
+        args.gsm8k_local_dir,
+        getattr(args, "gsm8k_train_indices", None),
+    )
 
 
 def load_eval_source(args) -> list[Sample]:

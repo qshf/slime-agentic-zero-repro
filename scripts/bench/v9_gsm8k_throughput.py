@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import statistics
@@ -29,6 +30,27 @@ DIRECT_DATA_PATH = "toy_rl.agent.toolorchestra.gsm8k_data.load_data_source"
 DIRECT_GENERATE_PATH = "toy_rl.agent.toolorchestra.gsm8k_throughput_rollout.generate"
 DIRECT_REWARD_PATH = "toy_rl.agent.toolorchestra.gsm8k_throughput_rollout.reward_func"
 GRPO_CONVERT_PATH = "mini_slime.custom_convert.custom_convert"
+DEFAULT_PAPER_PATH = Path(__file__).with_name("data") / "v9_gsm8k_paper.json"
+
+
+def load_paper(path: Path) -> tuple[dict[str, Any], str]:
+    """Read and validate the versioned GSM8K prompt paper used for collection."""
+    raw = path.read_bytes()
+    paper = json.loads(raw)
+    if paper.get("dataset") != "openai/gsm8k" or paper.get("config") != "main":
+        raise ValueError("V9 paper must identify openai/gsm8k main")
+    if paper.get("split") != "train":
+        raise ValueError("V9 throughput paper must use the GSM8K train split")
+    indices = paper.get("indices")
+    if not isinstance(indices, list) or not indices or any(
+        not isinstance(index, int) or index < 0 for index in indices
+    ):
+        raise ValueError("V9 paper requires non-negative integer indices")
+    if len(set(indices)) != len(indices):
+        raise ValueError("V9 paper indices must be unique")
+    if not isinstance(paper.get("samples_per_prompt"), int) or paper["samples_per_prompt"] < 2:
+        raise ValueError("V9 paper samples_per_prompt must be at least two")
+    return paper, hashlib.sha256(raw).hexdigest()
 
 
 def make_args(
@@ -38,6 +60,7 @@ def make_args(
     dp_size: int,
     gsm8k_local_dir: str | None,
     model_path: str,
+    prompt_indices: tuple[int, ...],
 ):
     from mini_slime.args import Args
 
@@ -54,7 +77,8 @@ def make_args(
         custom_convert_path=GRPO_CONVERT_PATH,
         batch_size=prompts,
         n_samples_per_prompt=samples_per_prompt,
-        gsm8k_num_train=max(prompts, 8),
+        gsm8k_num_train=len(prompt_indices),
+        gsm8k_train_indices=prompt_indices,
         rollout_temperature=0.7,
         orchestra_max_tokens=192,
         megatron_qkv_format="thd",
@@ -114,6 +138,7 @@ async def collect_workload(args) -> tuple[dict[str, Any], dict[str, Any]]:
     _validate_workload(workload)
     metadata = {
         "schema_version": 1,
+        "paper": getattr(args, "v9_paper_metadata", {}),
         "model_path": args.train_model_path,
         "prompts": args.batch_size,
         "samples_per_prompt": args.n_samples_per_prompt,
@@ -198,8 +223,15 @@ def main() -> None:
         default=MODEL_PATH,
         help="local model path; use /models/Qwen3-0.6B inside v9-dev",
     )
-    parser.add_argument("--prompts", type=int, default=2)
-    parser.add_argument("--samples-per-prompt", type=int, default=4)
+    parser.add_argument(
+        "--paper",
+        default=str(DEFAULT_PAPER_PATH),
+        help="versioned GSM8K prompt paper; its indices and sampling count define collect",
+    )
+    parser.add_argument("--prompts", type=int, default=None, help="must match --paper when supplied")
+    parser.add_argument(
+        "--samples-per-prompt", type=int, default=None, help="must match --paper when supplied"
+    )
     parser.add_argument(
         "--gsm8k-local-dir",
         default=None,
@@ -211,17 +243,32 @@ def main() -> None:
     cli = parser.parse_args()
     if not cli.collect and not cli.replay:
         parser.error("choose --collect, --replay, or both")
-    if cli.prompts < 1 or cli.samples_per_prompt < 2 or cli.updates < 1 or cli.warmup < 0:
+    paper_path = Path(cli.paper)
+    paper, paper_sha256 = load_paper(paper_path)
+    prompts = len(paper["indices"])
+    samples_per_prompt = paper["samples_per_prompt"]
+    if cli.prompts is not None and cli.prompts != prompts:
+        parser.error("--prompts must match the fixed paper")
+    if cli.samples_per_prompt is not None and cli.samples_per_prompt != samples_per_prompt:
+        parser.error("--samples-per-prompt must match the fixed paper")
+    if cli.updates < 1 or cli.warmup < 0:
         parser.error("invalid workload or update size")
 
     args = make_args(
         cli.backend,
-        cli.prompts,
-        cli.samples_per_prompt,
+        prompts,
+        samples_per_prompt,
         cli.megatron_dp,
         cli.gsm8k_local_dir,
         cli.model_path,
+        tuple(paper["indices"]),
     )
+    args.v9_paper_metadata = {
+        "paper_id": paper.get("paper_id", paper_path.name),
+        "path": str(paper_path),
+        "sha256": paper_sha256,
+        "indices": paper["indices"],
+    }
     path = Path(cli.workload)
     workload = None
     metadata: dict[str, Any] = {}

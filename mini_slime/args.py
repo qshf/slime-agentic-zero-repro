@@ -88,6 +88,8 @@ class Args:
     #     需 calculator 工具才能稳定答对——满足"调工具才答对"+"base 有提升空间"。
     gsm8k_num_train: int = 8      # 离线/训练取前 N 条 train（避免每次拉全量 7473）
     gsm8k_num_eval: int = 20      # eval 取前 N 条 test，量 before/after 答对率
+    # V9 吞吐基准可指定固定题卷中的 train 行号。None 保持旧行为：取前 num_train 条。
+    gsm8k_train_indices: tuple[int, ...] | None = None
     # 服务器连不上 HF（CLAUDE.md 已记 HF/github 不可达）：优先从本地 parquet 目录加载 GSM8K；
     # 该目录不存在时回退 datasets.load_dataset("openai/gsm8k")（本地开发有网时走这条）。
     gsm8k_local_dir: str = "/home/ubuntu/data/gsm8k"

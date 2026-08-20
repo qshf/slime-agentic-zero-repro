@@ -10,7 +10,12 @@ sys.path.insert(0, str(_ROOT))
 
 from mini_slime.args import Args
 from mini_slime.custom_convert import custom_convert
-from scripts.bench.v9_gsm8k_throughput import _drop_masked_rows, _validate_workload
+from scripts.bench.v9_gsm8k_throughput import (
+    DEFAULT_PAPER_PATH,
+    _drop_masked_rows,
+    _validate_workload,
+    load_paper,
+)
 from toy_rl.agent.toolorchestra.gsm8k_throughput_rollout import _apply_output
 from toy_rl.agent.toolorchestra.rollout import GenOutput
 from toy_rl.sample import Sample
@@ -31,6 +36,10 @@ def _sample(correct: bool) -> Sample:
 
 
 def main() -> int:
+    paper, paper_sha256 = load_paper(DEFAULT_PAPER_PATH)
+    assert paper["indices"] == [0, 1]
+    assert paper["samples_per_prompt"] == 4
+    assert len(paper_sha256) == 64
     samples = [_sample(False), _sample(True), _sample(True), _sample(False)]
     data = custom_convert(Args(n_samples_per_prompt=4), samples)
     assert len(data["tokens"]) == 4
