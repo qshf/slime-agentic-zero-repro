@@ -16,6 +16,8 @@
 | B | Torch 单卡 | 异步 |
 | C | Megatron TP=2 | 同步 |
 | D | Megatron TP=2 | 异步 |
+| E | Megatron TP=1、DP=2 | 同步 |
+| F | Megatron TP=1、DP=2 | 异步 |
 
 每格独立运行 3 次；每次 6 个 rollout，前 2 步预热、后 4 步统计。每步向 SGLang 发送一个 batch `/generate` 请求，包含 8 道 GSM8K 题、每题 4 个采样，共 32 条 rollout；`temperature=1.0`，`max_new_tokens=192`。Torch 训练 activation microbatch 为 8 并累积为完整 global batch mean；Megatron THD microbatch 为 8。
 
@@ -39,15 +41,32 @@ CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
 | B Torch async | 0.000 | 0.411 | 13.995 | 14.512 | 0.477 | 40.6% | 4,574.5 | 18,430.6 | 0.00054 | 1 |
 | C Megatron TP=2 sync | 6.559 | 1.702 | 6.851 | 15.162 | 0.461 | 53.1% | 1,526.2 | 4,726.5 | 0.00040 | 0 |
 | D Megatron TP=2 async | 0.000 | 1.248 | 10.641 | 12.324 | 0.445 | 40.6% | 1,538.5 | 5,398.4 | 0.00009 | 1 |
+| E Megatron TP=1 DP=2 sync | 5.609 | 1.219 | 7.343 | 13.879 | 0.477 | 43.8% | 1,593.7 | 6,222.0 | 0.00001 | 0 |
+| F Megatron TP=1 DP=2 async | 0.000 | 1.141 | 10.969 | 11.970 | 0.453 | 40.6% | 1,843.5 | 7,637.8 | -0.00010 | 1 |
 
 - Torch 异步 B 相对同步 A：`15.968 -> 14.512s`，端到端降低 **9.1%**。
 - Megatron 异步 D 相对同步 C：`15.162 -> 12.324s`，端到端降低 **18.7%**。
+- Megatron DP=2 异步 F 相对同步 E：`13.879 -> 11.970s`，端到端降低 **13.8%**。
 - C 与 A 的端到端时间接近，但原因不是 TP=2 learner 更快，而是在线时间主要由生成和权重发布构成；Megatron 更长的训练段提供了更大的异步重叠窗口。
-- 四格有效 GRPO 组率都超过 25% 门槛，存在训练信号。loss 仅用于数值健康检查：在线采样得到的题目、响应长度和优势不同，不能用 loss 大小比较后端或模型质量。
+- 六格有效 GRPO 组率都超过 25% 门槛，存在训练信号。loss 仅用于数值健康检查：在线采样得到的题目、响应长度和优势不同，不能用 loss 大小比较后端或模型质量。
 
 异步采用“一代预取”：训练 batch N 时生成 batch N+1，发布权重前等待该生成结束，避免生成中途切换权重。因此异步 `policy_version_gap=1`、同步为 0 是设计语义，而不是计量错误。
 
-原始结果：`/tmp/v9_e2e_online_20260820/v9_end_to_end.csv` 和 `/tmp/v9_e2e_online_20260820/v9_end_to_end_repeats.csv`。
+原始结果：A-D 在 `/tmp/v9_e2e_online_20260820/`；E/F batch 32 在 `/tmp/v9_e2e_dp2_batch32_fixed/`、`/tmp/v9_e2e_dp2_async_batch32/`；batch sweep 在 `/tmp/v9_e2e_dp2_batch16/`、`/tmp/v9_e2e_dp2_batch64/`。每个目录包含聚合 CSV 与逐次重复 CSV。
+
+### DP=2 的 global batch 扩展
+
+固定 E（Megatron TP=1、DP=2、同步）、每题 4 个采样、THD microbatch 8；只改变每轮题目数，因此 global batch 为 `prompts x 4`。每点 3 次重复，前 2 步预热、后 4 步统计。batch 32 的数值与上表 E 相同。
+
+| global batch | prompts/round | e2e s | train s | sync s | trainable tok/s | 有效 GRPO 组率 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 4 | 5.324 | 0.439 | 4.331 | 1,563.1 | 31.2% |
+| 32 | 8 | 13.879 | 1.219 | 7.343 | 1,593.7 | 43.8% |
+| 64 | 16 | 16.356 | 2.282 | 6.794 | 2,177.5 | 51.6% |
+
+batch 64 稳定运行且没有 OOM；相对 batch 32，learner 的 trainable tokens/s 提升 **36.6%**。端到端步时没有随 learner 吞吐同比下降，因为每步在线生成的回答从 32 条增加到 64 条，生成成本同时增长。
+
+batch 16 只有 4 个 GRPO 组，三次重复中有效组率的中位数仅 31.2%，其中一次恰为 25% 门槛，并有无方差组跳过训练和权重发布。因此该点只用于说明小 batch 的信号不稳定，不应用其较短 e2e 与 batch 32/64 做速度结论。在线 DP 吞吐比较的有效范围应从 global batch 32 开始。
 
 ## 2. 离线训练吞吐测试
 
