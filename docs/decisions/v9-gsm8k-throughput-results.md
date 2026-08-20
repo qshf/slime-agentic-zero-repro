@@ -147,3 +147,20 @@ CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/home/ubuntu/slime-agentic-zero-repro \
 相对 Megatron TP=1，TP=2 的 trainable tokens/s 下降约 6.3%；在当前 0.6B、小 batch、单节点无 NVLink 的工作负载上，TP 通信和 Megatron 固定开销大于张量并行带来的计算收益。DP=2 的吞吐提升约 55.8%，但未达到线性 2 倍，主要受梯度规约、Ray/进程和小 batch 开销影响。Torch 单卡约为 Megatron TP=1 的 10.9 倍；该结论只代表本 benchmark 的小模型和 batch 配置，不能外推到大模型或高算力占用场景。
 
 四项 loss 均为有限值且量级接近，可作为训练路径健康检查；它们来自各自重新初始化模型后的短吞吐运行，不是收敛性或模型质量比较。DP=2 的 TFLOPs 仍按当前 rank 本地计时口径记录，和 DP=1 的全局口径未完全统一，不能单独据此判断算力效率。
+
+## 9. 统一 microbatch 粒度的补充矩阵
+
+上一节的 Megatron 默认 `microbatch_size=1`，一个 8 行 learner batch 会拆成 8 次 forward/backward 调度；这会放大小 batch 下的调度开销。为验证这一点，新增 `--megatron-microbatch-size` 参数，并在同一 workload、同一 GPU 2-3 拓扑下使用 `8`，使 TP=1/TP=2 各自把一个 learner batch 作为单个 THD microbatch 执行：
+
+| 后端 | median step time | trainable tokens/s | model tokens/s | loss | TFLOPs |
+|---|---:|---:|---:|---:|---:|
+| TorchActor | 0.277 s | 4,616.0 | 7,494.6 | 0.007559 | 26.66 |
+| Megatron TP=1 | 0.413 s | 2,992.9 | 4,859.3 | 0.007032 | 19.57 |
+| Megatron TP=2 | 0.488 s | 2,558.5 | 4,154.1 | 0.006651 | 15.84 |
+| Megatron TP=1、DP=2 | 0.803 s | 1,582.2 | 2,568.8 | 0.006873 | 4.72* |
+
+对比默认 microbatch=1 的结果，Megatron TP=1 吞吐提升约 **6.43 倍**，TP=2 提升约 **5.87 倍**，证明之前 Torch 的优势很大一部分来自执行粒度差异，而不是单纯的模型计算速度。统一微批后 Torch 仍快于 Megatron TP=1，约为 **1.54 倍**；剩余差异来自 Megatron schedule、THD/Transformer Engine 路径和分布式框架固定开销。
+
+TP=2 在统一微批后仍比 TP=1 慢约 **14.5%**，这才更接近本机无 NVLink、PCIe 同 NUMA 通信的真实代价。DP=2 在本配置反而低于 DP=1：全局 batch 仍为 8，但每个 DP rank 只拿到 4 条样本，无法充分填满单卡；同时增加梯度规约和双进程同步，因此这个 batch 太小，不适合证明 DP 扩展性。后续 DP=2 应使用至少 16 或 32 的 global batch，并令每个 rank 有足够的本地 microbatch。
+
+该补充矩阵仍是短序列、0.6B 模型的吞吐诊断，不代表大模型生产配置。`--megatron-microbatch-size` 默认仍为 `1`，以保持旧实验和接口兼容。
