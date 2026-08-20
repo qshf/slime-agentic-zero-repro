@@ -87,6 +87,7 @@ class WeightUpdater:
 
         url = self.generate_url.replace("/generate", "/update_weights_from_disk")
         try:
-            requests.post(url, json={"model_path": self.save_path}, timeout=120)
-        except Exception as exc:  # noqa: BLE001 — 同步失败不该炸整个训练循环，记录即可
-            print(f"[WeightUpdater] SGLang reload failed: {exc}")
+            response = requests.post(url, json={"model_path": self.save_path}, timeout=120)
+            response.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"SGLang disk reload failed: {exc}") from exc

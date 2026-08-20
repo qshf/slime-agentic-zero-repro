@@ -232,8 +232,8 @@ def main() -> None:
     parser.add_argument(
         "--weight-sync",
         choices=("tensor", "disk"),
-        default="disk",
-        help="disk works with the external-host trainer; tensor needs the SGLang Python client in that process",
+        default="tensor",
+        help="tensor is the verified disk-free default; disk is retained only for explicit compatibility checks",
     )
     parser.add_argument("--model-path", default=MODEL_PATH)
     parser.add_argument("--gsm8k-local-dir", default=None)
