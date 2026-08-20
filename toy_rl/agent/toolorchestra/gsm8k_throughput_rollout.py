@@ -77,17 +77,15 @@ async def generate_batch(args: Args, samples: list[Sample]) -> list[Sample]:
     prompt_token_ids = [
         tokenizer(prompt, add_special_tokens=False)["input_ids"] for prompt in formatted_prompts
     ]
-    # Keep the prompt identical within a GRPO group, but give each row a
-    # distinct deterministic sampling stream. Without this, a batched request
-    # can produce correlated duplicate completions for the four samples of one
-    # question and leave the group without a learning signal.
+    # Keep each GRPO group on exactly the same prompt and sampling distribution.
+    # SGLang accepts per-row parameter objects; using distinct dicts avoids its
+    # batch normalizer aliasing one mutable object across all rows.
     sampling_params = [
         {
             "max_new_tokens": args.orchestra_max_tokens,
             "temperature": args.rollout_temperature,
-            "seed": 10_000 + index,
         }
-        for index in range(len(samples))
+        for _ in samples
     ]
     payload = {
         "text": formatted_prompts,
