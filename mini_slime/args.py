@@ -34,6 +34,9 @@ class Args:
     #     RolloutManager 用 load_function 按这三个路径动态加载 data_source / generate / reward。
     #     默认是 calculator 路径（主线一）；主线二换 agent 只改这三条路径 + 下面的 agent 专属字段。
     custom_generate_function_path: str = "toy_rl.agent.calculator_hooks.generate"
+    # Optional batch rollout hook. The generic agent path stays per-sample;
+    # single-turn benchmark workloads can issue one server-side generation batch.
+    batch_generate_function_path: str = ""
     custom_rm_path: str = "toy_rl.agent.calculator_hooks.reward_func"
     data_source_path: str = "toy_rl.agent.calculator_data.load_data_source"  # 对齐源 args.data_source_path
 

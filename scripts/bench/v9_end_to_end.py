@@ -26,6 +26,7 @@ SGLANG_BASE_URL = "http://localhost:30000/v1"
 SGLANG_GEN_URL = "http://localhost:30000/generate"
 
 GSM8K_GEN_PATH = "toy_rl.agent.toolorchestra.gsm8k_throughput_rollout.generate"
+GSM8K_BATCH_GEN_PATH = "toy_rl.agent.toolorchestra.gsm8k_throughput_rollout.generate_batch"
 GSM8K_RM_PATH = "toy_rl.agent.toolorchestra.gsm8k_throughput_rollout.reward_func"
 GSM8K_DATA_PATH = "toy_rl.agent.toolorchestra.gsm8k_data.load_data_source"
 GRPO_CONVERT_PATH = "mini_slime.custom_convert.custom_convert"
@@ -77,6 +78,9 @@ def make_args(backend: str, cli: argparse.Namespace):
         sglang_base_url=SGLANG_BASE_URL,
         sglang_generate_url=SGLANG_GEN_URL,
         custom_generate_function_path=cli.gen_path or gen_path,
+        batch_generate_function_path=(
+            GSM8K_BATCH_GEN_PATH if cli.workload == "gsm8k" and not cli.serial_generation else ""
+        ),
         custom_rm_path=cli.rm_path or rm_path,
         data_source_path=cli.data_path or data_path,
         custom_convert_path=convert_path,
@@ -236,6 +240,11 @@ def main() -> None:
     parser.add_argument("--min-active-grpo-rate", type=float, default=0.25)
     parser.add_argument("--fail-on-quality-gate", action="store_true")
     parser.add_argument("--gen-path", default=None, help="override the workload generate hook")
+    parser.add_argument(
+        "--serial-generation",
+        action="store_true",
+        help="disable the GSM8K one-request rollout batch for debugging only",
+    )
     parser.add_argument("--rm-path", default=None, help="override the workload reward hook")
     parser.add_argument("--data-path", default=None, help="override the workload data hook")
     parser.add_argument("--out-dir", default="docs/decisions")

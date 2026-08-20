@@ -41,6 +41,11 @@ class RolloutManager:
         # A1 起数据源可切换（对齐源 data_source_cls）：calculator 走 calculator_data，MemAgent 走 memagent/data。
         self.data_source = load_function(args.data_source_path)(args)  # -> list[Sample]
         self.generate_rollout = load_function(args.custom_generate_function_path)
+        self.generate_rollout_batch = (
+            load_function(args.batch_generate_function_path)
+            if getattr(args, "batch_generate_function_path", "")
+            else None
+        )
         self.reward_func = load_function(args.custom_rm_path)
         # V6.2 opt-in（对齐源 --custom-convert-samples-to-train-data-path）：设了则用 GRPO 组归一转换，
         # 否则用内置 per-sample 转换（V0-A3 路径 custom_convert_path 为空，行为不变）。
@@ -75,9 +80,15 @@ class RolloutManager:
         （主循环在调用前从 trainer 取当前 weight_version 传入）。戳到每条 Sample 上，供 learner_contract
         算 staleness / 校验单一版本。None（V0-A3/离线不传）时不戳，行为不变。
         """
-        samples: list[Sample] = []
-        for s in self._next_batch(rollout_id):
-            s = await self.generate_rollout(self.args, s)              # 真 SGLang rollout（复用 V1/V2 loop）
+        source_samples = self._next_batch(rollout_id)
+        if self.generate_rollout_batch is not None:
+            samples = await self.generate_rollout_batch(self.args, source_samples)
+        else:
+            samples = []
+            for s in source_samples:
+                samples.append(await self.generate_rollout(self.args, s))
+
+        for s in samples:
             reward_result = await self.reward_func(self.args, s)       # per-sample reward hook
             s.reward = reward_result["reward"]
             s.rollout_policy_version = rollout_policy_version          # V7.4：戳当时的权重版本（None=不戳）
@@ -85,7 +96,6 @@ class RolloutManager:
             if not isinstance(s.metadata, dict):
                 s.metadata = {}
             s.metadata["reward_features"] = {"correctness": reward_result["reward"]}
-            samples.append(s)
         # V6.2：设了 custom_convert 走 GRPO 组归一（同题多 rollout），否则内置 per-sample 转换。
         if self.custom_convert is not None:
             return self.custom_convert(self.args, samples)
