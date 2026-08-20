@@ -108,7 +108,7 @@ def run_config(
     runs = []
     for run in range(cli.runs):
         print(f"[{name}] run {run + 1}/{cli.runs}", flush=True)
-        runs.append(replay(args, workload, cli.updates, cli.warmup))
+        runs.append(replay(args, workload, cli.updates, cli.warmup, cli.train_batch_size))
     return {
         "backend": backend,
         "tensor_parallel_size": tp_size,
@@ -129,13 +129,25 @@ def main() -> None:
     parser.add_argument("--updates", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument(
+        "--train-batch-size",
+        type=int,
+        default=8,
+        help="fixed rows per learner update; 8 is one GSM8K GRPO group in the supplied paper",
+    )
     parser.add_argument("--min-active-grpo-groups", type=int, default=8)
     parser.add_argument("--min-trainable-tokens", type=int, default=4096)
     parser.add_argument("--model-path", default=MODEL_PATH)
     parser.add_argument("--gsm8k-local-dir", default=None)
     cli = parser.parse_args()
-    if cli.updates < 2 or cli.warmup < 0 or cli.warmup >= cli.updates or cli.runs < 1:
-        parser.error("require updates >= 2, 0 <= warmup < updates, and runs >= 1")
+    if (
+        cli.updates < 2
+        or cli.warmup < 0
+        or cli.warmup >= cli.updates
+        or cli.runs < 1
+        or cli.train_batch_size < 1
+    ):
+        parser.error("require valid updates, runs, and positive train batch size")
 
     configs = _parse_configs(cli.configs)
     workload_path = Path(cli.workload)
@@ -148,7 +160,8 @@ def main() -> None:
         f"offline workload={workload_path} rows={len(workload['tokens'])} "
         f"trainable_tokens={metadata.get('trainable_tokens', 0)} "
         f"active_grpo={metadata.get('grpo_active_group_count', 0)}/"
-        f"{metadata.get('grpo_group_count', 0)} updates={cli.updates} warmup={cli.warmup}",
+        f"{metadata.get('grpo_group_count', 0)} train_batch={cli.train_batch_size} "
+        f"updates={cli.updates} warmup={cli.warmup}",
         flush=True,
     )
     print(f"gpu_before={gpu_before}", flush=True)
@@ -178,6 +191,7 @@ def main() -> None:
         "updates": cli.updates,
         "warmup": cli.warmup,
         "runs": cli.runs,
+        "train_batch_size": cli.train_batch_size,
         "results": results,
     }
     out_path = Path(cli.out)

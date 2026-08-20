@@ -111,9 +111,12 @@ class RayTrainGroup:
 
     def __init__(self, args: Args, num_nodes: int = 1, num_gpus_per_node: int = 1) -> None:
         self.args = args
-        # fsdp/megatron 后端：每 rank 一张卡，Ray 调度 GPU；fake/torch：CPU（不归 Ray 调度）。
+        # 真训练后端：每 rank 一张卡，由 Ray 调度；fake 保持 CPU。
         # megatron world_size = TP × PP × DP；TP/PP/DP 组由 Megatron mpu 建立。
-        if args.train_backend == "fsdp":
+        if args.train_backend == "torch":
+            world_size = 1
+            num_gpus = 1
+        elif args.train_backend == "fsdp":
             world_size = args.fsdp_world_size
             num_gpus = 1  # 每 rank 一张卡（对齐源 actor_group.py:90 num_gpus=1）。
         elif args.train_backend == "megatron":
@@ -125,7 +128,7 @@ class RayTrainGroup:
             num_gpus = 1  # 每 rank 一张卡，与 fsdp 路径对称。
         else:
             world_size = num_nodes * num_gpus_per_node
-            num_gpus = 0  # fake=CPU、torch=单卡 docker 外；不归 Ray 调度 GPU。
+            num_gpus = 0  # fake=CPU。
         self.world_size = world_size
 
         # 运行时包装（对齐源 actor_group.py:90）：同一个类按 backend 选 num_gpus。

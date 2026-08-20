@@ -267,41 +267,88 @@ def validate_collection_quality(
         raise RuntimeError("collected workload failed quality gate: " + ", ".join(failures))
 
 
-def replay(args, workload: dict[str, Any], updates: int, warmup: int) -> dict[str, Any]:
+def _fixed_batches(workload: dict[str, Any], train_batch_size: int) -> list[dict[str, Any]]:
+    """Split an immutable row pool into equal learner batches without reshuffling.
+
+    A large collected workload provides length and reward diversity. Feeding all
+    rows to one padded Torch forward can make the `[B, L, vocab]` logits exceed
+    device memory, so the throughput benchmark cycles fixed equal-size batches.
+    Dropping a final short tail keeps every timed update comparable.
+    """
+    if train_batch_size < 1:
+        return [workload]
+    rows = len(workload["tokens"])
+    if train_batch_size > rows:
+        raise ValueError(f"train_batch_size={train_batch_size} exceeds workload rows={rows}")
+    usable_rows = rows - rows % train_batch_size
+    if usable_rows == 0:
+        raise ValueError("workload has no full learner batch")
+    columns = (
+        "tokens",
+        "loss_masks",
+        "rewards",
+        "response_lengths",
+        "rollout_log_probs",
+        "rollout_policy_versions",
+    )
+    batches = []
+    for start in range(0, usable_rows, train_batch_size):
+        batch = {name: workload[name][start : start + train_batch_size] for name in columns if name in workload}
+        batches.append(batch)
+    return batches
+
+
+def replay(
+    args, workload: dict[str, Any], updates: int, warmup: int, train_batch_size: int = 0
+) -> dict[str, Any]:
     import ray
 
     from mini_slime.learner_contract import validate_train_data
     from mini_slime.ray.placement_group import create_placement_groups, create_training_models
 
-    validate_train_data(workload)
+    batches = _fixed_batches(workload, train_batch_size)
+    for batch in batches:
+        validate_train_data(batch)
     create_placement_groups(args)
     group, _ = create_training_models(args)
     group.async_init(args)
     records = []
     try:
         for update in range(updates):
+            batch = batches[update % len(batches)]
             t0 = time.perf_counter()
-            metrics = ray.get(group.async_train(update, workload))[0]
+            metrics = ray.get(group.async_train(update, batch))[0]
             elapsed = time.perf_counter() - t0
-            records.append({"update": update, "wall_seconds": elapsed, **metrics})
+            records.append({
+                "update": update,
+                "wall_seconds": elapsed,
+                "model_tokens": sum(len(tokens) for tokens in batch["tokens"]),
+                "trainable_tokens": sum(sum(mask) for mask in batch["loss_masks"]),
+                **metrics,
+            })
     finally:
         ray.shutdown()
 
     steady = records[warmup:] if len(records) > warmup else records
-    trainable = sum(sum(mask) for mask in workload["loss_masks"])
-    model_tokens = sum(len(tokens) for tokens in workload["tokens"])
     steady_seconds = sum(record["wall_seconds"] for record in steady)
+    steady_trainable_tokens = sum(record["trainable_tokens"] for record in steady)
+    steady_model_tokens = sum(record["model_tokens"] for record in steady)
     return {
         "backend": args.train_backend,
         "megatron_dp": args.megatron_data_parallel_size if args.train_backend == "megatron" else 1,
         "updates": updates,
         "warmup_updates": warmup,
         "steady_updates": len(steady),
-        "model_tokens_per_update": model_tokens,
-        "trainable_tokens_per_update": trainable,
+        "workload_rows": len(workload["tokens"]),
+        "train_batch_size": train_batch_size or len(workload["tokens"]),
+        "batch_count": len(batches),
+        "model_tokens_per_update_median": statistics.median(record["model_tokens"] for record in steady),
+        "trainable_tokens_per_update_median": statistics.median(
+            record["trainable_tokens"] for record in steady
+        ),
         "median_step_seconds": statistics.median(record["wall_seconds"] for record in steady),
-        "trainable_tokens_per_second": trainable * len(steady) / steady_seconds if steady_seconds else 0.0,
-        "model_tokens_per_second": model_tokens * len(steady) / steady_seconds if steady_seconds else 0.0,
+        "trainable_tokens_per_second": steady_trainable_tokens / steady_seconds if steady_seconds else 0.0,
+        "model_tokens_per_second": steady_model_tokens / steady_seconds if steady_seconds else 0.0,
         "median_loss": statistics.median(record.get("loss", 0.0) for record in steady),
         "median_tflops": statistics.median(record.get("tflops", 0.0) for record in steady),
         "records": records,
@@ -337,6 +384,12 @@ def main() -> None:
     )
     parser.add_argument("--updates", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument(
+        "--train-batch-size",
+        type=int,
+        default=0,
+        help="rows per learner update during --replay; 0 replays the full workload",
+    )
     parser.add_argument("--require-active-grpo", action="store_true")
     parser.add_argument(
         "--collect-warmup-batches",
@@ -370,6 +423,7 @@ def main() -> None:
     if (
         cli.updates < 1
         or cli.warmup < 0
+        or cli.train_batch_size < 0
         or cli.collect_warmup_batches < 0
     ):
         parser.error("invalid workload or update size")
@@ -407,7 +461,7 @@ def main() -> None:
     if cli.replay:
         if workload is None:
             workload, metadata = load_workload(path)
-        result = replay(args, workload, cli.updates, cli.warmup)
+        result = replay(args, workload, cli.updates, cli.warmup, cli.train_batch_size)
         result["workload"] = str(path)
         result["workload_metadata"] = metadata
         result["cuda_visible_devices"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")

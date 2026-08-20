@@ -35,13 +35,16 @@ def create_placement_groups(args: Args) -> dict:
 
     偏离（见 v4.md）：源用 `PlacementGroupSchedulingStrategy` 把 actor/engine 钉到
     `{"GPU":1,"CPU":1}` bundle；nano fake/torch trainer 无需 Ray 调度 GPU，故 `ray.init(num_gpus=0)`。
-    V7.3 fsdp 后端需 Ray 给训练 actor 分卡 → `ray.init(num_gpus=fsdp_world_size)`（让 Ray 看得到卡，
-    每个 num_gpus=1 的 actor 独占一张；driver 侧用 CUDA_VISIBLE_DEVICES 限定到 SGLang 未占的空闲卡）。
+    V7.3 起 torch/fsdp/megatron 后端都需 Ray 给训练 actor 分卡（让 Ray 看得到卡，每个
+    num_gpus=1 的 actor 独占一张）；driver 侧用 CUDA_VISIBLE_DEVICES 限定到 SGLang 未占的空闲卡。
     """
     if not ray.is_initialized():
-        # fsdp/megatron 后端要 Ray 调度 GPU 给训练 actor；fake/torch 无 GPU 调度需求（=0）。
+        # 真训练后端要 Ray 调度 GPU 给训练 actor。Torch 也必须申请一张：否则 Ray 会把
+        # 无 GPU resource 的 actor 暴露给默认 CUDA 设备，可能撞上独立 SGLang 的 GPU。
         # megatron world_size = TP × PP × DP（对齐 actor_group.py）。
-        if args.train_backend == "fsdp":
+        if args.train_backend == "torch":
+            num_gpus = 1
+        elif args.train_backend == "fsdp":
             num_gpus = args.fsdp_world_size
         elif args.train_backend == "megatron":
             num_gpus = (
