@@ -48,10 +48,11 @@ def train(args: Args) -> list[dict]:
     actor_model.update_weights()
 
     metrics_log: list[dict] = []
+    traces: list = []
 
     # 预取 rollout 0（对齐 train_async.py:31 rollout_data_next_future = generate.remote(start_rollout_id)）。
     # 这一步就是异步的起手：主循环还没进，下一轮 rollout 已经在 rollout actor 进程里跑起来了。
-    rollout_data_next_future = rollout_manager.generate.remote(0)
+    rollout_data_next_future = rollout_manager.generate.remote(0, actor_model.weight_version())
 
     for rollout_id in range(args.num_rollout):
         # 1) sync 上一次已发起的 generation（对齐 train_async.py:34-36）
@@ -63,7 +64,14 @@ def train(args: Args) -> list[dict]:
         # 2) **提前发起下一轮 rollout**（对齐 train_async.py:38-40）——overlap 的核心。
         #    先把 gen(N+1) 丢到 rollout actor 进程跑起来，下面 train(N) 就能与它并行。
         if rollout_id + 1 < args.num_rollout:
-            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+            rollout_data_next_future = rollout_manager.generate.remote(
+                rollout_id + 1, actor_model.weight_version()
+            )
+
+        if getattr(args, "learner_contract_validate", False):
+            from mini_slime.learner_contract import validate_train_data
+
+            validate_train_data(rollout_data_curr)
 
         # 3) 训 train(N)：此刻 gen(N+1) 正在另一个进程跑（对齐 train_async.py:42-47 无 critic 分支）
         t0 = time.time()
@@ -88,11 +96,40 @@ def train(args: Args) -> list[dict]:
             "train_time": t_train,          # train(N) 的 ray.get 耗时（≈ fake_train_seconds + IPC）
             "sync_time": t_sync,
             "reward_mean": m["reward_mean"],
+            "raw_reward_mean": m.get("raw_reward_mean", m["reward_mean"]),
+            "trainable_tokens": m.get("trainable_tokens", 0),
+            "model_tokens": m.get("_trace", {}).get("model_tokens", sum(len(t) for t in rollout_data_curr["tokens"])),
+            "grpo_group_count": m.get("grpo_group_count", 0),
+            "grpo_active_group_count": m.get("grpo_active_group_count", 0),
+            "trained_samples": m.get("trained_samples", 0),
             "tokens_per_rollout": tokens,
             "weight_version": actor_model.weight_version(),
         }
         if "loss" in m:
             metrics["loss"] = m["loss"]
+        if "tflops" in m:
+            metrics["tflops"] = m["tflops"]
+        if getattr(args, "learner_trace", False) and m.get("_trace") is not None:
+            from mini_slime.learner_metrics import LearnerTrace
+
+            tr = m["_trace"]
+            rollout_pv = tr["rollout_policy_version"]
+            if rollout_pv is not None:
+                trace = LearnerTrace(
+                    rollout_id=rollout_id,
+                    rollout_policy_version=rollout_pv,
+                    trainer_policy_version=metrics["weight_version"],
+                    samples=m.get("trained_samples", 0),
+                    model_tokens=tr["model_tokens"],
+                    trainable_tokens=m["trainable_tokens"],
+                    batch_preparation_seconds=tr["batch_preparation_seconds"],
+                    log_prob_seconds=0.0,
+                    forward_backward_seconds=tr["forward_backward_seconds"],
+                    optimizer_seconds=0.0,
+                    weight_publish_seconds=t_sync,
+                )
+                traces.append(trace)
+                metrics["policy_version_gap"] = trace.to_dict()["policy_version_gap"]
         metrics_log.append(metrics)
         print(
             f"[rollout {rollout_id}] "
@@ -102,6 +139,10 @@ def train(args: Args) -> list[dict]:
             f"weight_v={metrics['weight_version']}"
         )
 
+    if getattr(args, "learner_trace", False) and traces:
+        from mini_slime.learner_metrics import summarize_learner_traces
+
+        print(f"[learner_trace] {summarize_learner_traces(traces)}")
     return metrics_log
 
 

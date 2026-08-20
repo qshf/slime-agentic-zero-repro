@@ -82,11 +82,19 @@ def train(args: Args) -> list[dict]:
             "train_time": t_train,
             "sync_time": t_sync,
             "reward_mean": m["reward_mean"],
+            "raw_reward_mean": m.get("raw_reward_mean", m["reward_mean"]),
+            "trainable_tokens": m.get("trainable_tokens", 0),
+            "model_tokens": m.get("_trace", {}).get("model_tokens", sum(len(t) for t in rollout_data["tokens"])),
+            "grpo_group_count": m.get("grpo_group_count", 0),
+            "grpo_active_group_count": m.get("grpo_active_group_count", 0),
+            "trained_samples": m.get("trained_samples", 0),
             "tokens_per_rollout": sum(rollout_data["response_lengths"]),
             "weight_version": actor_model.weight_version(),
         }
         if "loss" in m:  # V6.3 torch 后端：透传真训练 loss（fake 后端无此键）
             metrics["loss"] = m["loss"]
+        if "tflops" in m:
+            metrics["tflops"] = m["tflops"]
         # V7.4 learner_trace（opt-in）：用 trainer 回传的可测相位 + 主循环的 publish 计时组装 LearnerTrace。
         if getattr(args, "learner_trace", False) and m.get("_trace") is not None:
             from mini_slime.learner_metrics import LearnerTrace

@@ -159,10 +159,25 @@ class Trainer:
         t_prep = 0.0
 
         if self._torch_actor is not None:
+            # CUDA launch is asynchronous. Synchronize around the update so
+            # throughput reports device work, not Python launch latency.
+            if trace and self._torch_actor.device == "cuda":
+                self._torch_actor.torch.cuda.synchronize()
             t0 = time.perf_counter() if trace else 0.0
             metrics.update(self._torch_actor.train_step(rollout_data))
             if trace:
-                self._fill_trace(metrics, rollout_data, batch_prep=0.0, compute=time.perf_counter() - t0)
+                if self._torch_actor.device == "cuda":
+                    self._torch_actor.torch.cuda.synchronize()
+                compute = time.perf_counter() - t0
+                self._fill_trace(metrics, rollout_data, batch_prep=0.0, compute=compute)
+                from toy_rl.utils.flops_utils import calculate_fwd_flops
+
+                fwd_flops = calculate_fwd_flops(
+                    [len(tokens) for tokens in rollout_data["tokens"]],
+                    self._torch_actor.model.config,
+                )
+                metrics["fwd_flops"] = fwd_flops
+                metrics["tflops"] = 3 * fwd_flops / compute / 1e12 if compute > 0 else 0.0
             return metrics
 
         if self._megatron_trainer is not None:
